@@ -1,0 +1,31 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#ifndef PRIMS
+#define PRIMS 128
+#endif
+layout(local_size_x=32) in;
+layout(triangles,max_vertices=6,max_primitives=PRIMS) out;
+layout(location=0) perprimitiveEXT out vec3 color[];
+void main(){
+ SetMeshOutputsEXT(6,PRIMS);
+ uint lane=gl_LocalInvocationIndex;
+ if(lane==0){
+  gl_MeshVerticesEXT[0].gl_Position=vec4(4,4,0,1);
+  gl_MeshVerticesEXT[1].gl_Position=vec4(5,4,0,1);
+  gl_MeshVerticesEXT[2].gl_Position=vec4(4,5,0,1);
+  gl_MeshVerticesEXT[3].gl_Position=vec4(-0.7,-0.7,0,1);
+  gl_MeshVerticesEXT[4].gl_Position=vec4(0.7,-0.7,0,1);
+  gl_MeshVerticesEXT[5].gl_Position=vec4(0,0.7,0,1);
+ }
+ for(uint i=lane;i<PRIMS;i+=32){
+  uint h=i ^ gl_WorkGroupID.x;
+  h=(h ^ (h >> 16))*0x7feb352du;
+  h=(h ^ (h >> 15))*0x846ca68bu;
+  h=h ^ (h >> 16);
+  gl_PrimitiveTriangleIndicesEXT[i]=i==PRIMS-1?uvec3(3,4,5):uvec3(h & 1u,1,2);
+  color[i]=vec3(0.9+float(h & 255u)*(0.1/255.0),0,0);
+#ifdef CULL
+  gl_MeshPrimitivesEXT[i].gl_CullPrimitiveEXT=i!=PRIMS-1;
+#endif
+ }
+}

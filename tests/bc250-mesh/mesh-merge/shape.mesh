@@ -1,0 +1,115 @@
+#version 460
+/* RADV_BC250_MESH_MERGE test shape. Compile with -DWS=<local_size_x> -DNV=<vertices> -DNP=<primitives>
+ * and optionally:
+ *   -DWSY=<local_size_y> -DWSZ=<local_size_z>  3D API workgroup (L = WS*WSY*WSZ)
+ *   -DSUBGROUP=1  a subgroup operation (subgroupAdd) feeds the positions
+ *   -DSHARED=1    shared memory with dynamic indexing and two workgroup barriers
+ *   -DSHAREDCONST=1 a constant-index shared counter (nir_opt_shared_vars_to_subgroup turns it
+ *                 into subgroup operations for one-wave workgroups)
+ *   -DRUNTIME=1   runtime SetMeshOutputs counts smaller than declared (vary per workgroup)
+ *   -DWGID3D=1    uses gl_WorkGroupID.xyz and gl_NumWorkGroups (3D grids)
+ *   -DPERPRIM=1   per-primitive flat vec4 output (stage 2)
+ *   -DPERPRIM=2   Hellblade 2's small Nanite shape: per-vertex vec4 + flat uvec3 + flat ivec4 and one
+ *                 per-primitive uvec4 (stage 2)
+ *   -DPERPRIM=3   several per-primitive outputs: vec4, flat ivec2, uint and gl_PrimitiveID (stage 2)
+ *   -DPERPRIM=4   per-primitive gl_Layer (refused: consumed by the hardware, not an attribute)
+ *   -DCULL=1      CullPrimitive (stage 2: culled primitives become hole primitives)
+ *   -DCLIP=1      per-vertex gl_ClipDistance[2] (a compact output array) */
+#extension GL_EXT_mesh_shader : require
+#if CLIP
+out gl_MeshPerVertexEXT { vec4 gl_Position; float gl_ClipDistance[2]; } gl_MeshVerticesEXT[];
+#endif
+#if SUBGROUP
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#endif
+#ifndef WSY
+#define WSY 1
+#endif
+#ifndef WSZ
+#define WSZ 1
+#endif
+#define L (WS * WSY * WSZ)
+layout(local_size_x = WS, local_size_y = WSY, local_size_z = WSZ) in;
+layout(triangles, max_vertices = NV, max_primitives = NP) out;
+layout(location = 0) out vec4 col[];
+#if PERPRIM == 1
+layout(location = 1) perprimitiveEXT flat out vec4 pcol[];
+#elif PERPRIM == 2
+layout(location = 1) flat out uvec3 vtc1[];
+layout(location = 2) flat out ivec4 vtc2[];
+layout(location = 4) perprimitiveEXT out uvec4 ptc7[];
+#elif PERPRIM == 3
+layout(location = 1) perprimitiveEXT flat out vec4 pcol[];
+layout(location = 2) perprimitiveEXT flat out ivec2 pid2[];
+layout(location = 3) perprimitiveEXT flat out uint pid1[];
+#endif
+#if SHARED
+shared float sh[L];
+#endif
+#if SHAREDCONST
+shared uint cnt;
+#endif
+layout(push_constant) uniform PC { uint base; } pc;
+void main() {
+  uint i = gl_LocalInvocationIndex;
+#if WGID3D
+  uint g = (gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y) * gl_NumWorkGroups.x + gl_WorkGroupID.x + pc.base;
+#else
+  uint g = gl_WorkGroupID.x + pc.base + gl_DrawID;
+#endif
+#if SHARED
+  sh[(i * 7u + g) % L] = float(i + g);
+  barrier();
+  float s = sh[(i + 1u + g) % L];
+  barrier();
+#else
+  float s = 0.0;
+#endif
+#if SHAREDCONST
+  if (i == 0u) cnt = 0u;
+  barrier();
+  atomicAdd(cnt, i);
+  barrier();
+  s += float(cnt);
+#endif
+#if SUBGROUP
+  s += subgroupAdd(float(i));
+#endif
+#if RUNTIME
+  uint nv = NV - (g % 3u), np = NP - (g % 5u);
+#else
+  uint nv = NV, np = NP;
+#endif
+  SetMeshOutputsEXT(nv, np);
+  for (uint v = i; v < nv; v += L) {
+    float a = float(v) * 0.05 + float(g) + s;
+    gl_MeshVerticesEXT[v].gl_Position = vec4(cos(a), sin(a), 0.5, 1.0);
+#if CLIP
+    gl_MeshVerticesEXT[v].gl_ClipDistance[0] = sin(a * 3.0);
+    gl_MeshVerticesEXT[v].gl_ClipDistance[1] = cos(a * 5.0);
+#endif
+    col[v] = vec4(float(v) / float(NV), s, float(gl_LocalInvocationID.y), 1.0);
+#if PERPRIM == 2
+    vtc1[v] = uvec3(v, g, 7u);
+    vtc2[v] = ivec4(int(v), -int(g), 3, 4);
+#endif
+  }
+  for (uint p = i; p < np; p += L) {
+    gl_PrimitiveTriangleIndicesEXT[p] = uvec3(p % nv, (p + 1u) % nv, (p + 2u) % nv);
+#if PERPRIM == 1
+    pcol[p] = vec4(float(p), 1.0, 0.0, 1.0);
+#elif PERPRIM == 2
+    ptc7[p] = uvec4(g * 128u + p, p ^ g, floatBitsToUint(s), 0x5a5a5a5au);
+#elif PERPRIM == 3
+    pcol[p] = vec4(float(p), 1.0, 0.0, 1.0);
+    pid2[p] = ivec2(int(p), int(g));
+    pid1[p] = p * 3u + g;
+    gl_MeshPrimitivesEXT[p].gl_PrimitiveID = int(g * NP + p);
+#elif PERPRIM == 4
+    gl_MeshPrimitivesEXT[p].gl_Layer = int(p & 1u);
+#endif
+#if CULL
+    gl_MeshPrimitivesEXT[p].gl_CullPrimitiveEXT = (p & 7u) == 3u;
+#endif
+  }
+}

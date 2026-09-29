@@ -1,0 +1,10 @@
+#version 460
+#extension GL_EXT_nonuniform_qualifier : require
+/* Application compute on the compute bind point (its own heap offsets). */
+layout(local_size_x = 64) in;
+layout(push_constant) uniform PC { uint heap; uint tex; uint smp; uint base; } pc;
+layout(set = 0, binding = 0, std430) buffer SB { vec4 v[]; } sbufs[];
+layout(set = 3, binding = 0) uniform CB { vec4 c; } cb;
+void main() {
+  sbufs[pc.heap + 1u].v[gl_GlobalInvocationID.x & 15u] += sbufs[pc.heap].v[gl_LocalInvocationIndex & 15u] * cb.c;
+}

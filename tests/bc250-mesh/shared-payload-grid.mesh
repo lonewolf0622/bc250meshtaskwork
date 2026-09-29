@@ -1,0 +1,29 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#ifndef WG
+#define WG 64
+#endif
+#ifndef CULLMODE
+#define CULLMODE 0
+#endif
+layout(local_size_x=WG) in;
+layout(triangles,max_vertices=25,max_primitives=128) out;
+layout(location=0) perprimitiveEXT out vec3 color[];
+void main() {
+ SetMeshOutputsEXT(25,32);
+ uint lane=gl_LocalInvocationIndex;
+ if(lane<25) {
+   vec2 xy=vec2(lane%5,lane/5)*0.45-0.9;
+   gl_MeshVerticesEXT[lane].gl_Position=vec4(xy,0,1);
+ }
+ if(lane<32) {
+   uint cell=lane/2, v=(cell/4)*5+cell%4;
+   gl_PrimitiveTriangleIndicesEXT[lane]=(lane%2==0)?uvec3(v,v+1,v+6):uvec3(v,v+6,v+5);
+   color[lane]=(lane%2==0)?vec3(1,0,0):vec3(0,1,0);
+#if CULLMODE == 1
+   gl_MeshPrimitivesEXT[lane].gl_CullPrimitiveEXT=(lane%2!=0);
+#elif CULLMODE == 2
+   gl_MeshPrimitivesEXT[lane].gl_CullPrimitiveEXT=true;
+#endif
+ }
+}

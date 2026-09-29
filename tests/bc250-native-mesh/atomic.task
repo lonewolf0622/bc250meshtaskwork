@@ -1,0 +1,17 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x=64) in;
+struct Payload { uint sentinel; uint taskIndex; };
+taskPayloadSharedEXT Payload payload;
+void main() {
+    if (gl_LocalInvocationIndex==0) {
+        payload.sentinel=0;
+        payload.taskIndex=gl_WorkGroupID.x;
+    }
+    barrier();
+    atomicAdd(payload.sentinel,1);
+    barrier();
+    if (gl_LocalInvocationIndex==0 && payload.sentinel==64)
+        payload.sentinel=0x12345678u;
+    EmitMeshTasksEXT(1,1,1);
+}

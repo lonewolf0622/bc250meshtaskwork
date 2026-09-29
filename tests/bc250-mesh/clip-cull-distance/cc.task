@@ -1,0 +1,12 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+/* Hybrid Task replay fixture: every Task workgroup launches two Mesh workgroups. */
+layout(local_size_x = 32) in;
+struct P { uint base; };
+taskPayloadSharedEXT P payload;
+void main()
+{
+   if (gl_LocalInvocationIndex == 0u)
+      payload.base = gl_WorkGroupID.x * 3u;
+   EmitMeshTasksEXT(2u, 1u, 1u);
+}

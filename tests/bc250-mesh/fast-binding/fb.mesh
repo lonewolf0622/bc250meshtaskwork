@@ -1,0 +1,40 @@
+#version 460
+#extension GL_EXT_nonuniform_qualifier : require
+/* fast-binding Mesh shape: -DWS=<local size> -DNV=<vertices> -DNP=<primitives> [-DPERPRIM=1] [-DTASK=1].
+ * Reads a vkd3d-like descriptor heap (set 0 binding 0, mutable storage buffer / sampled image array),
+ * a root CBV (push descriptor, set 3) and root constants (push constants). */
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x = WS) in;
+layout(triangles, max_vertices = NV, max_primitives = NP) out;
+layout(location = 0) out vec4 col[];
+#if PERPRIM
+layout(location = 1) perprimitiveEXT flat out vec4 pcol[];
+#endif
+layout(push_constant) uniform PC { uint heap; uint tex; uint smp; uint base; } pc;
+layout(set = 0, binding = 0, std430) readonly buffer SB { vec4 v[]; } sbufs[];
+layout(set = 3, binding = 0) uniform CB { vec4 c; } cb;
+#if TASK
+struct P { uint g; uint n; };
+taskPayloadSharedEXT P payload;
+#endif
+void main() {
+  uint i = gl_LocalInvocationIndex;
+#if TASK
+  uint g = payload.g + gl_WorkGroupID.x + pc.base;
+#else
+  uint g = gl_WorkGroupID.x + pc.base + gl_DrawID;
+#endif
+  vec4 d = sbufs[pc.heap].v[g & 15u] * cb.c;
+  SetMeshOutputsEXT(NV, NP);
+  for (uint v = i; v < NV; v += WS) {
+    float a = float(v) * 0.05 + float(g) + d.x;
+    gl_MeshVerticesEXT[v].gl_Position = vec4(cos(a), sin(a), 0.5 + d.y, 1.0);
+    col[v] = vec4(float(v) / float(NV), d.z, 0.25, 1.0);
+  }
+  for (uint p = i; p < NP; p += WS) {
+    gl_PrimitiveTriangleIndicesEXT[p] = uvec3(p % NV, (p + 1u) % NV, (p + 2u) % NV);
+#if PERPRIM
+    pcol[p] = vec4(float(p), d.w, float(g & 3u), 1.0);
+#endif
+  }
+}

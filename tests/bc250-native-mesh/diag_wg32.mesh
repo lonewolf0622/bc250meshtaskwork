@@ -1,0 +1,15 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x=32) in;
+layout(triangles,max_vertices=3,max_primitives=1) out;
+void main() {
+    SetMeshOutputsEXT(3,1);
+    // Same single-invocation multi-vertex pattern as perprimitive.mesh (which
+    // renders correctly), but with a direct mesh draw and local_size_x=32.
+    if(gl_LocalInvocationIndex==0) {
+        gl_MeshVerticesEXT[0].gl_Position = vec4(-1.0,-1.0,0.0,1.0);
+        gl_MeshVerticesEXT[1].gl_Position = vec4( 1.0,-1.0,0.0,1.0);
+        gl_MeshVerticesEXT[2].gl_Position = vec4( 0.0, 1.0,0.0,1.0);
+        gl_PrimitiveTriangleIndicesEXT[0] = uvec3(0,1,2);
+    }
+}

@@ -1,0 +1,183 @@
+/* BC250 Mesh pipeline probe (drm-shim only, copy of direct-read/pipe.c): pipe MESH.spv FRAG.spv [TASK.spv|-] [attachments]
+ * PIPE_PROVOKING=first|last|dynamic selects the provoking vertex mode (VK_EXT_provoking_vertex; dynamic:
+ * VK_DYNAMIC_STATE_PROVOKING_VERTEX_MODE_EXT, set to last at record time).
+ * Creates one Mesh (+Task) + fragment graphics pipeline, records a direct, an indirect (2 records) and an
+ * indirect-count Mesh draw, submits them to the noop drm-shim queue and waits. Prints PIPELINE_RESULT and
+ * SUBMIT_OK. Refuses any device that is not the shim's GFX1013. */
+#include <vulkan/vulkan.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#define CK(x) do { VkResult r_ = (x); if (r_) { printf("FAIL %s = %d\n", #x, r_); return 1; } } while (0)
+static VkDevice dev;
+static VkShaderModule load(const char *p)
+{
+   FILE *f = fopen(p, "rb");
+   if (!f) { perror(p); exit(2); }
+   fseek(f, 0, SEEK_END); long n = ftell(f); rewind(f);
+   void *b = malloc(n);
+   if (fread(b, 1, n, f) != (size_t)n) exit(2);
+   fclose(f);
+   VkShaderModuleCreateInfo c = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, 0, 0, n, b};
+   VkShaderModule m;
+   if (vkCreateShaderModule(dev, &c, 0, &m)) exit(2);
+   return m;
+}
+static uint32_t memtype(VkPhysicalDevice pd, uint32_t bits, VkMemoryPropertyFlags want)
+{
+   VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(pd, &mp);
+   for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+      if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) return i;
+   return __builtin_ctz(bits);
+}
+int main(int argc, char **argv)
+{
+   const char *gpu = getenv("AMDGPU_GPU_ID"), *preload = getenv("LD_PRELOAD");
+   if (access("/dev/dri", F_OK) == 0 || !gpu || strcmp(gpu, "gfx1013") ||
+       !preload || !strstr(preload, "libamdgpu_noop_drm_shim.so")) {
+      fputs("REFUSE: use the bwrap/noop offline wrapper\n", stderr);
+      return 3;
+   }
+   if (argc < 3) { fprintf(stderr, "usage: pipe MESH.spv FRAG.spv [TASK.spv|-] [attachments]\n"); return 2; }
+   const char *task = argc > 3 && strcmp(argv[3], "-") ? argv[3] : NULL;
+   unsigned rts = argc > 4 ? (unsigned)atoi(argv[4]) : 1;
+   if (rts < 1 || rts > 8) rts = 1;
+   VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_3};
+   VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
+   VkInstance in;
+   if (vkCreateInstance(&ici, 0, &in)) { puts("NO_INSTANCE"); return 3; }
+   uint32_t n = 1; VkPhysicalDevice pd;
+   if (vkEnumeratePhysicalDevices(in, &n, &pd) < 0 || !n) { puts("NO_DEVICE"); return 3; }
+   VkPhysicalDeviceProperties pr; vkGetPhysicalDeviceProperties(pd, &pr);
+   if (!strstr(pr.deviceName, "GFX1013")) { puts("NOT_SHIM_GFX1013"); return 3; }
+   float q = 1;
+   VkDeviceQueueCreateInfo qc = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueCount = 1, .pQueuePriorities = &q};
+   const char *prov = getenv("PIPE_PROVOKING") ? getenv("PIPE_PROVOKING") : "first";
+   const int prov_last = !strcmp(prov, "last"), prov_dyn = (!strcmp(prov, "dynamic") || !strcmp(prov, "dynamic-first"));
+   VkPhysicalDeviceExtendedDynamicState3FeaturesEXT eds3 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT,
+      .extendedDynamicState3ProvokingVertexMode = 1};
+   VkPhysicalDeviceProvokingVertexFeaturesEXT pvf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT,
+      prov_dyn ? (void *)&eds3 : NULL, .provokingVertexLast = 1};
+   VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR bary = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR, &pvf, .fragmentShaderBarycentric = 1};
+   VkPhysicalDeviceMeshShaderFeaturesEXT en = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT, &bary, .meshShader = 1, .taskShader = 1, .meshShaderQueries = getenv("PIPE_MESH_QUERIES") != NULL};
+   VkPhysicalDeviceVulkan13Features f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &en, .maintenance4 = 1};
+   VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13, .drawIndirectCount = 1};
+   VkPhysicalDeviceVulkan11Features f11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f12, .shaderDrawParameters = 1};
+   VkPhysicalDeviceFeatures fe = {.multiDrawIndirect = 1, .vertexPipelineStoresAndAtomics = 1, .shaderClipDistance = 1, .shaderCullDistance = 1};
+   const char *ext[4] = {"VK_EXT_mesh_shader", "VK_EXT_provoking_vertex", "VK_KHR_fragment_shader_barycentric", "VK_EXT_extended_dynamic_state3"};
+   VkDeviceCreateInfo dc = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f11, 0, 1, &qc, 0, 0, prov_dyn ? 4 : 3, ext, &fe};
+   CK(vkCreateDevice(pd, &dc, 0, &dev));
+   VkQueue queue; vkGetDeviceQueue(dev, 0, 0, &queue);
+   VkDescriptorSetLayoutBinding sb = {.binding=0, .descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+      .descriptorCount=1, .stageFlags=VK_SHADER_STAGE_TASK_BIT_EXT|VK_SHADER_STAGE_MESH_BIT_EXT};
+   VkDescriptorSetLayoutCreateInfo sl = {.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+      .bindingCount=1, .pBindings=&sb};
+   VkDescriptorSetLayout set_layout; CK(vkCreateDescriptorSetLayout(dev,&sl,0,&set_layout));
+   VkPushConstantRange pc = {VK_SHADER_STAGE_ALL, 0, 16};
+   VkPipelineLayoutCreateInfo lc = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, 0, 0, 1, &set_layout, 1, &pc};
+   VkPipelineLayout lay; CK(vkCreatePipelineLayout(dev, &lc, 0, &lay));
+   VkAttachmentDescription at[8]; VkAttachmentReference ar[8]; VkPipelineColorBlendAttachmentState ba[8];
+   for (unsigned i = 0; i < 8; i++) {
+      at[i] = (VkAttachmentDescription){0, VK_FORMAT_R8G8B8A8_UNORM, 1, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE,
+                                       VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE, 0, VK_IMAGE_LAYOUT_GENERAL};
+      ar[i] = (VkAttachmentReference){i, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+      ba[i] = (VkPipelineColorBlendAttachmentState){.colorWriteMask = 15};
+   }
+   VkSubpassDescription sp = {0, 0, 0, 0, rts, ar};
+   VkRenderPassCreateInfo rc = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, 0, 0, rts, at, 1, &sp};
+   VkRenderPass rp; CK(vkCreateRenderPass(dev, &rc, 0, &rp));
+   VkPipelineShaderStageCreateInfo st[3] = {
+      {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, 0, 0, VK_SHADER_STAGE_MESH_BIT_EXT, load(argv[1]), "main"},
+      {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, 0, 0, VK_SHADER_STAGE_FRAGMENT_BIT, load(argv[2]), "main"}};
+   if (task)
+      st[2] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, 0, 0, VK_SHADER_STAGE_TASK_BIT_EXT, load(task), "main"};
+   VkViewport vp = {0, 0, 64, 64, 0, 1}; VkRect2D sc = {{0, 0}, {64, 64}};
+   VkPipelineViewportStateCreateInfo vs = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, 0, 0, 1, &vp, 1, &sc};
+   VkPipelineRasterizationProvokingVertexStateCreateInfoEXT pvs = {
+      VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT, 0,
+      prov_last ? VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT : VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT};
+   const char *cull = getenv("PIPE_CULL") ? getenv("PIPE_CULL") : "none";
+   VkCullModeFlags cull_mode = !strcmp(cull,"back") ? VK_CULL_MODE_BACK_BIT :
+      !strcmp(cull,"front") ? VK_CULL_MODE_FRONT_BIT : !strcmp(cull,"both") ? VK_CULL_MODE_FRONT_AND_BACK : 0;
+   VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, &pvs, .lineWidth = 1, .cullMode = cull_mode,
+      .frontFace = getenv("PIPE_CCW") ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE};
+   VkDynamicState dyn = VK_DYNAMIC_STATE_PROVOKING_VERTEX_MODE_EXT;
+   VkPipelineDynamicStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, 0, 0, 1, &dyn};
+   VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = 1};
+   VkPipelineColorBlendStateCreateInfo bs = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = rts, .pAttachments = ba};
+   VkGraphicsPipelineCreateInfo gp = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .flags = getenv("PIPE_NOOPT") ? VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT : 0,
+      .stageCount = task ? 3 : 2, .pStages = st,
+      .pViewportState = &vs, .pRasterizationState = &rs, .pMultisampleState = &ms, .pColorBlendState = &bs, .pDynamicState = prov_dyn ? &ds : NULL, .layout = lay, .renderPass = rp};
+   VkPipeline p; VkResult r = vkCreateGraphicsPipelines(dev, 0, 1, &gp, 0, &p);
+   printf("PIPELINE_RESULT=%d\n", r); fflush(stdout);
+   if (r) return 1;
+
+   /* Indirect records {x,y,z} at 0 and 16 (stride 16), count (=2) at 64. */
+   VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, 0, 0, 256, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT};
+   VkBuffer ib; CK(vkCreateBuffer(dev, &bci, 0, &ib));
+   VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev, ib, &mr);
+   VkMemoryAllocateInfo ma = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, 0, mr.size,
+      memtype(pd, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
+   VkDeviceMemory im; CK(vkAllocateMemory(dev, &ma, 0, &im)); CK(vkBindBufferMemory(dev, ib, im, 0));
+   uint32_t *rec; CK(vkMapMemory(dev, im, 0, 256, 0, (void **)&rec));
+   memset(rec, 0, 256);
+   rec[0] = 3; rec[1] = 1; rec[2] = 1; rec[4] = 2; rec[5] = 2; rec[6] = 1; rec[16] = 2;
+
+   VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1};
+   VkDescriptorPoolCreateInfo dpi = {.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+      .maxSets=1,.poolSizeCount=1,.pPoolSizes=&ps};
+   VkDescriptorPool descriptor_pool; CK(vkCreateDescriptorPool(dev,&dpi,0,&descriptor_pool));
+   VkDescriptorSetAllocateInfo dai = {.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+      .descriptorPool=descriptor_pool,.descriptorSetCount=1,.pSetLayouts=&set_layout};
+   VkDescriptorSet descriptor_set; CK(vkAllocateDescriptorSets(dev,&dai,&descriptor_set));
+   VkDescriptorBufferInfo dbi = {.buffer=ib,.offset=128,.range=128};
+   VkWriteDescriptorSet wd = {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+      .dstSet=descriptor_set,.dstBinding=0,.descriptorCount=1,
+      .descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi};
+   vkUpdateDescriptorSets(dev,1,&wd,0,0);
+
+   VkImageCreateInfo ic = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, 0, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, {64, 64, 1}, 1, 1, 1, 0,
+                           VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
+   VkImage img; CK(vkCreateImage(dev, &ic, 0, &img));
+   vkGetImageMemoryRequirements(dev, img, &mr);
+   VkMemoryAllocateInfo ma2 = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, 0, mr.size, memtype(pd, mr.memoryTypeBits, 0)};
+   VkDeviceMemory mem; CK(vkAllocateMemory(dev, &ma2, 0, &mem)); CK(vkBindImageMemory(dev, img, mem, 0));
+   VkImageViewCreateInfo iv = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, 0, 0, img, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, {0}, {1, 0, 1, 0, 1}};
+   VkImageView view[8];
+   for (unsigned i = 0; i < rts; i++) CK(vkCreateImageView(dev, &iv, 0, &view[i]));
+   VkFramebufferCreateInfo fc = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, 0, 0, rp, rts, view, 64, 64, 1};
+   VkFramebuffer fb; CK(vkCreateFramebuffer(dev, &fc, 0, &fb));
+
+   VkCommandPoolCreateInfo cp = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+   VkCommandPool pool; CK(vkCreateCommandPool(dev, &cp, 0, &pool));
+   VkCommandBufferAllocateInfo ca = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, 0, pool, 0, 1};
+   VkCommandBuffer cb; CK(vkAllocateCommandBuffers(dev, &ca, &cb));
+   VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+   CK(vkBeginCommandBuffer(cb, &bi));
+   VkClearValue cv[8] = {0};
+   VkRenderPassBeginInfo rb = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, 0, rp, fb, sc, rts, cv};
+   vkCmdBeginRenderPass(cb, &rb, 0);
+   vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+   vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_GRAPHICS,lay,0,1,&descriptor_set,0,0);
+   if (prov_dyn) {
+      PFN_vkCmdSetProvokingVertexModeEXT setProv = (void *)vkGetDeviceProcAddr(dev, "vkCmdSetProvokingVertexModeEXT");
+      setProv(cb, !strcmp(prov, "dynamic-first") ? VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT :
+                                                VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT);
+   }
+   uint32_t base = 5;
+   vkCmdPushConstants(cb, lay, VK_SHADER_STAGE_ALL, 0, 4, &base);
+   PFN_vkCmdDrawMeshTasksEXT drawMesh = (void *)vkGetDeviceProcAddr(dev, "vkCmdDrawMeshTasksEXT");
+   PFN_vkCmdDrawMeshTasksIndirectEXT drawInd = (void *)vkGetDeviceProcAddr(dev, "vkCmdDrawMeshTasksIndirectEXT");
+   PFN_vkCmdDrawMeshTasksIndirectCountEXT drawCnt = (void *)vkGetDeviceProcAddr(dev, "vkCmdDrawMeshTasksIndirectCountEXT");
+   drawMesh(cb, 7, 1, 1);
+   drawInd(cb, ib, 0, 2, 16);
+   drawCnt(cb, ib, 0, ib, 64, 2, 16);
+   vkCmdEndRenderPass(cb);
+   CK(vkEndCommandBuffer(cb));
+   VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, 0, 0, 0, 0, 1, &cb};
+   CK(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE));
+   CK(vkQueueWaitIdle(queue));
+   printf("SUBMIT_OK\n");
+   return 0;
+}

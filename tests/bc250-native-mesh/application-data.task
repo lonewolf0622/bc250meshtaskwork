@@ -1,0 +1,17 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x=32) in;
+struct Payload { uint sentinel; uint taskIndex; };
+taskPayloadSharedEXT Payload payload;
+#ifdef APP_DESCRIPTOR
+layout(set=0,binding=0) uniform ApplicationData { uint value; } app;
+#else
+layout(push_constant) uniform ApplicationData { uint value; } app;
+#endif
+void main() {
+    if (gl_LocalInvocationIndex==0) {
+        payload.sentinel=app.value;
+        payload.taskIndex=0;
+    }
+    EmitMeshTasksEXT(1,1,1);
+}

@@ -1,0 +1,241 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+/* Clip/cull distance fixtures (run.sh), one per set of -D options:
+ *   LANES/VERTS/PRIMS : workgroup size, max vertices, max primitives (defaults 64/64/64); with VERTS or
+ *                       PRIMS > LANES every lane writes its vertices / primitives in a loop.
+ *   NCLIP / NCULL     : gl_ClipDistance[NCLIP] / gl_CullDistance[NCULL] (NCLIP + NCULL <= 8), every element
+ *                       written for every vertex. Values: small signed steps (some triangles have one
+ *                       distance negative at all three corners), -0.0, and with SPECIAL a NaN and +-Inf.
+ *   DYN               : the distances are written in a loop with a dynamic element index.
+ *   SPARSE            : only the even elements are written (the odd ones stay undefined).
+ *   PSIZ              : also writes gl_PointSize (a triangle mesh: exported, ignored by the rasterizer).
+ *   LAYER / VIEWPORT  : per-primitive gl_Layer / gl_ViewportIndex (split: sliced like generic attributes).
+ *   PERPRIM           : a per-primitive flat vec4 (the expansion's flat attribute path).
+ *   CULLPRIM          : gl_CullPrimitiveEXT on every 5th primitive (the split's cull compaction).
+ *   PARTIAL           : fewer vertices/primitives than declared, from the workgroup id.
+ *   PC                : the workgroup base comes from a push constant.
+ *   TASK              : launched by cc.task (hybrid Task replay); reads the payload.
+ *   SKEW              : oracle self-check only: the last distance of vertex 5 is off by one.
+ *   CONSTCLIP / CONSTCULL : every ClipDistance / CullDistance element written is the constant CVAL
+ *                       (default 0.0, FINAL FANTASY VII REBIRTH's CullDistance) instead of dist():
+ *                       RADV_BC250_MESH_CLIPCULL_CONST removes it when CVAL >= 0 (not NaN, not +Inf).
+ * Primitive indices are always below the vertex count (the oracle's geometry mode compares the raw,
+ * unsplit shader with the split and expanded ones: both must see valid geometry). */
+#ifndef LANES
+#define LANES 64
+#endif
+#ifndef VERTS
+#define VERTS 64
+#endif
+#ifndef PRIMS
+#define PRIMS 64
+#endif
+#ifndef NCLIP
+#define NCLIP 0
+#endif
+#ifndef NCULL
+#define NCULL 0
+#endif
+#ifndef CVAL
+#define CVAL 0.0
+#endif
+layout(local_size_x = LANES) in;
+layout(max_vertices = VERTS, max_primitives = PRIMS, triangles) out;
+layout(push_constant) uniform PCB { uint base; uint n; uint m; uint k; } pc;
+
+out gl_MeshPerVertexEXT {
+   vec4 gl_Position;
+#if PSIZ
+   float gl_PointSize;
+#endif
+#if NCLIP
+   float gl_ClipDistance[NCLIP];
+#endif
+#if NCULL
+   float gl_CullDistance[NCULL];
+#endif
+} gl_MeshVerticesEXT[];
+
+#if LAYER || VIEWPORT || CULLPRIM
+perprimitiveEXT out gl_MeshPerPrimitiveEXT {
+#if LAYER
+   int gl_Layer;
+#endif
+#if VIEWPORT
+   int gl_ViewportIndex;
+#endif
+#if CULLPRIM
+   bool gl_CullPrimitiveEXT;
+#endif
+} gl_MeshPrimitivesEXT[];
+#endif
+
+#if TASK
+struct P { uint base; };
+taskPayloadSharedEXT P payload;
+#endif
+
+layout(location = 0) out vec4 v0[];
+layout(location = 1) flat out uint v1[];
+#if PERPRIM
+layout(location = 2) perprimitiveEXT flat out vec4 pp0[];
+#endif
+
+float dist(uint v, uint i, uint g)
+{
+   uint h = v * 5u + i * 3u + g;
+#if SPECIAL
+   if (h % 17u == 4u)
+      return uintBitsToFloat(0x7fc00000u);
+   if (h % 19u == 6u)
+      return uintBitsToFloat(i % 2u == 0u ? 0xff800000u : 0x7f800000u);
+#endif
+   if (h % 11u == 0u)
+      return -0.0;
+#if SKEW
+   if (v == 5u && i == uint(NCLIP + NCULL - 1))
+      return (float(h % 7u) - 3.0) * 0.5 + float(i) * 0.125;
+#endif
+   return (float(h % 7u) - 4.0) * 0.5 + float(i) * 0.125;
+}
+
+void main()
+{
+   uint i = gl_LocalInvocationIndex;
+   uint g = gl_WorkGroupID.x;
+#if PC
+   g += pc.base;
+#endif
+#if TASK
+   g += payload.base;
+#endif
+   uint nv = VERTS, np = PRIMS;
+#if PARTIAL
+   nv = VERTS - (g % 3u);
+   np = PRIMS - (g % 5u);
+#endif
+   SetMeshOutputsEXT(nv, np);
+
+#if VERTS > LANES
+   for (uint v = i; v < VERTS; v += LANES)
+#else
+   uint v = i;
+   if (v < VERTS)
+#endif
+   {
+      float f = float(v);
+      float x = fract(sin(f * 12.9898 + float(g) * 78.233) * 43758.5453) * 2.4 - 1.2;
+      float y = fract(sin(f * 39.3468 + float(g) * 11.135) * 24634.6345) * 2.4 - 1.2;
+      float w = (v % 23u == 7u) ? -0.5 : 1.0 + f / float(VERTS);
+      gl_MeshVerticesEXT[v].gl_Position = vec4(x * w, y * w, 0.5, w);
+#if PSIZ
+      gl_MeshVerticesEXT[v].gl_PointSize = 1.0 + f;
+#endif
+#if DYN
+      for (uint e = 0u; e < uint(NCLIP + NCULL); e++) {
+#if NCLIP
+         if (e < uint(NCLIP))
+            gl_MeshVerticesEXT[v].gl_ClipDistance[e] = dist(v, e, g);
+#endif
+#if NCULL
+         if (e >= uint(NCLIP))
+            gl_MeshVerticesEXT[v].gl_CullDistance[e - uint(NCLIP)] = dist(v, e, g);
+#endif
+      }
+#else
+#if NCLIP && CONSTCLIP
+      /* Constant element indices (no loop), as a compiler emits them for a fixed-size array. */
+#if NCLIP > 0
+      gl_MeshVerticesEXT[v].gl_ClipDistance[0] = CVAL;
+#endif
+#if NCLIP > 1 && !SPARSE
+      gl_MeshVerticesEXT[v].gl_ClipDistance[1] = CVAL;
+#endif
+#if NCLIP > 2
+      gl_MeshVerticesEXT[v].gl_ClipDistance[2] = CVAL;
+#endif
+#if NCLIP > 3 && !SPARSE
+      gl_MeshVerticesEXT[v].gl_ClipDistance[3] = CVAL;
+#endif
+#if NCLIP > 4
+      gl_MeshVerticesEXT[v].gl_ClipDistance[4] = CVAL;
+#endif
+#if NCLIP > 5 && !SPARSE
+      gl_MeshVerticesEXT[v].gl_ClipDistance[5] = CVAL;
+#endif
+#if NCLIP > 6
+      gl_MeshVerticesEXT[v].gl_ClipDistance[6] = CVAL;
+#endif
+#if NCLIP > 7 && !SPARSE
+      gl_MeshVerticesEXT[v].gl_ClipDistance[7] = CVAL;
+#endif
+#elif NCLIP
+      for (int e = 0; e < NCLIP; e++)
+#if SPARSE
+         if (e % 2 == 0)
+#endif
+         gl_MeshVerticesEXT[v].gl_ClipDistance[e] = dist(v, uint(e), g);
+#endif
+#if NCULL && CONSTCULL
+#if NCULL > 0
+      gl_MeshVerticesEXT[v].gl_CullDistance[0] = CVAL;
+#endif
+#if NCULL > 1 && !SPARSE
+      gl_MeshVerticesEXT[v].gl_CullDistance[1] = CVAL;
+#endif
+#if NCULL > 2
+      gl_MeshVerticesEXT[v].gl_CullDistance[2] = CVAL;
+#endif
+#if NCULL > 3 && !SPARSE
+      gl_MeshVerticesEXT[v].gl_CullDistance[3] = CVAL;
+#endif
+#if NCULL > 4
+      gl_MeshVerticesEXT[v].gl_CullDistance[4] = CVAL;
+#endif
+#if NCULL > 5 && !SPARSE
+      gl_MeshVerticesEXT[v].gl_CullDistance[5] = CVAL;
+#endif
+#if NCULL > 6
+      gl_MeshVerticesEXT[v].gl_CullDistance[6] = CVAL;
+#endif
+#if NCULL > 7 && !SPARSE
+      gl_MeshVerticesEXT[v].gl_CullDistance[7] = CVAL;
+#endif
+#elif NCULL
+      for (int e = 0; e < NCULL; e++)
+#if SPARSE
+         if (e % 2 == 0)
+#endif
+         gl_MeshVerticesEXT[v].gl_CullDistance[e] = dist(v, uint(e + NCLIP), g);
+#endif
+#endif
+      v0[v] = vec4(f, x, float(g), 1.0 + f);
+      v1[v] = v ^ g;
+   }
+
+#if PRIMS > LANES
+   for (uint p = i; p < PRIMS; p += LANES)
+#else
+   uint p = i;
+   if (p < PRIMS)
+#endif
+   {
+      uint lim = max(nv, 1u);
+      uint a = p % lim;
+      uint b = (p * 7u + g + 1u) % lim;
+      uint c = (lim - 1u) - ((p * 3u + g) % lim);
+      gl_PrimitiveTriangleIndicesEXT[p] = uvec3(a, b, c);
+#if LAYER
+      gl_MeshPrimitivesEXT[p].gl_Layer = int((p + g) % 4u);
+#endif
+#if VIEWPORT
+      gl_MeshPrimitivesEXT[p].gl_ViewportIndex = int((p * 3u + g) % 2u);
+#endif
+#if CULLPRIM
+      gl_MeshPrimitivesEXT[p].gl_CullPrimitiveEXT = (p % 5u) == 3u;
+#endif
+#if PERPRIM
+      pp0[p] = vec4(float(p), float(g), float(a), float(c));
+#endif
+   }
+}

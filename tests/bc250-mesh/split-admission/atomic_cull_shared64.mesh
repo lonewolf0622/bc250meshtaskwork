@@ -1,0 +1,21 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+// All three admitted classes together on the cull-compaction path:
+// application shared memory + barrier, NumWorkGroups, and a write-only
+// external atomic (result unused) that must run in the first piece only.
+layout(local_size_x=64) in;
+layout(triangles, max_vertices=64, max_primitives=64) out;
+layout(location=0) perprimitiveEXT flat out vec4 pcol[];
+layout(set=0,binding=0,std430) buffer S { uint count; uint data[]; } s;
+shared uint sh[64];
+
+void main(){
+ uint i=gl_LocalInvocationIndex;
+ sh[i]=i+gl_NumWorkGroups.x; barrier();
+ if(i==0u) atomicAdd(s.count,sh[5]);
+ SetMeshOutputsEXT(64,64);
+ gl_MeshVerticesEXT[i].gl_Position=vec4(float(i%16u)/8.0-1.0,float(i/16u)/8.0-1.0,0.5,1);
+ gl_PrimitiveTriangleIndicesEXT[i]=uvec3(i,(i+1u)%64u,(i+2u)%64u);
+ pcol[i]=vec4(float(sh[(i+1u)%64u])/255.0,0,1,1);
+ gl_MeshPrimitivesEXT[i].gl_CullPrimitiveEXT=(i%2u)==1u;
+}

@@ -1,0 +1,18 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+// tri64_cull_shared without the SSBO store: application shared memory,
+// a workgroup barrier, cull flags. The shared values reach the outputs.
+layout(local_size_x=64) in;
+layout(triangles, max_vertices=64, max_primitives=64) out;
+layout(location=0) perprimitiveEXT flat out vec4 pcol[];
+shared uint sh[64];
+
+void main(){
+ uint i=gl_LocalInvocationIndex;
+ sh[i]=i*3u+1u; barrier();
+ SetMeshOutputsEXT(64,64);
+ gl_MeshVerticesEXT[i].gl_Position=vec4(float(i%16u)/8.0-1.0,float(i/16u)/8.0-1.0,0.5,1);
+ gl_PrimitiveTriangleIndicesEXT[i]=uvec3(i,(i+1u)%64u,(i+2u)%64u);
+ pcol[i]=vec4(float(sh[(i+1u)%64u])/255.0,0,1,1);
+ gl_MeshPrimitivesEXT[i].gl_CullPrimitiveEXT=(sh[(i+5u)%64u]%2u)==1u;
+}

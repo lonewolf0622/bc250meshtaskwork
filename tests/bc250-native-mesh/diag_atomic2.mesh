@@ -1,0 +1,20 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x=32) in;
+layout(triangles,max_vertices=4,max_primitives=2) out;
+shared uint scratch[1024];
+void main() {
+    SetMeshOutputsEXT(4, 2);
+    uint lane=gl_LocalInvocationIndex;
+    // Stage B: seeded pattern + per-lane partial sums + atomicAdd + second
+    // barrier. Expected total 511. On-screen quad iff exact.
+    if(lane==0){ for(uint i=1;i<1024;i++) scratch[i]=i&1; scratch[0]=0; }
+    barrier();
+    uint partial=0; for(uint i=lane+1;i<1024;i+=32) partial+=scratch[i];
+    atomicAdd(scratch[0],partial);
+    barrier();
+    bool ok=(scratch[0]==511);
+    vec2 p[4]=vec2[4](vec2(-0.7,-0.7),vec2(0.7,-0.7),vec2(0.7,0.7),vec2(-0.7,0.7));
+    for(uint i=lane;i<4;i+=32) gl_MeshVerticesEXT[i].gl_Position=ok?vec4(p[i],0,1):vec4(4,4,0,1);
+    if(lane<2) gl_PrimitiveTriangleIndicesEXT[lane]=(lane==0?uvec3(0,1,2):uvec3(0,2,3));
+}

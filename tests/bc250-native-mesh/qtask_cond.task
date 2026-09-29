@@ -1,0 +1,11 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x=1) in;
+void main() {
+   /* Culling-style conditional emission, alternating per indirect record via
+    * DrawID so consecutive records write disjoint slot subsets of the shared
+    * scratch. Non-emitting workgroups must leave zero records (driver-side),
+    * otherwise the next record's mesh draw consumes stale data. */
+   if ((gl_WorkGroupID.x + gl_DrawID) % 2 == 0)
+      EmitMeshTasksEXT(2,1,1);
+}

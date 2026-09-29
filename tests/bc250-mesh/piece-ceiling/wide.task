@@ -1,0 +1,12 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+/* Trivial application Task stage for wide.mesh -DTASK=1: one Mesh workgroup per Task workgroup. */
+layout(local_size_x = 32) in;
+struct P { uint base; };
+taskPayloadSharedEXT P payload;
+void main()
+{
+   if (gl_LocalInvocationIndex == 0)
+      payload.base = gl_WorkGroupID.x;
+   EmitMeshTasksEXT(1, 1, 1);
+}

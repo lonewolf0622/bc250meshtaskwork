@@ -1,0 +1,62 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#ifndef LANES
+#define LANES 32
+#endif
+#ifndef VERTS
+#define VERTS 32
+#endif
+#ifndef PRIMS
+#define PRIMS 32
+#endif
+layout(local_size_x=LANES) in;
+layout(triangles,max_vertices=VERTS,max_primitives=PRIMS) out;
+layout(push_constant) uniform PC { uint base; uint n; uint m; uint k; } pc;
+layout(location=0) out vec4 v0[];
+layout(location=1) flat out uint v1[];
+#if SHARED
+shared uint values[LANES];
+#endif
+#if EFFECTS
+layout(set=0,binding=0,std430) buffer Counters { uint calls; uint pad[63]; } counters;
+#endif
+void main()
+{
+   uint i=gl_LocalInvocationIndex;
+   uint nv=uint(VERTS),np=uint(PRIMS);
+#if COUNTS
+   nv=pc.n%uint(VERTS+1);
+   np=nv==0u ? 0u : pc.m%uint(PRIMS+1);
+#endif
+#if OVERCOUNT
+   nv=uint(VERTS)+(pc.n&7u);
+   np=uint(PRIMS)+(pc.m&7u);
+#endif
+   SetMeshOutputsEXT(nv,np);
+#if EFFECTS
+   if (i==0u) atomicAdd(counters.calls,1u);
+#endif
+#if EARLY
+   if (nv==0u || np==0u) return;
+#endif
+#if SHARED
+   values[i]=i+pc.base;
+   barrier();
+   uint value=values[(i+1u)%uint(LANES)];
+   barrier();
+   values[i]=value^7u;
+   barrier();
+#endif
+   for(uint v=i;v<min(nv,uint(VERTS));v+=uint(LANES)) {
+      gl_MeshVerticesEXT[v].gl_Position=vec4(float(v&15u)/16.0-0.5,float(v>>4)/16.0-0.5,0.5,1.0);
+      uint x=v^pc.base;
+#if SHARED
+      x+=values[v%uint(LANES)];
+#endif
+      v0[v]=vec4(float(x&255u)/256.0,float(v)/float(VERTS),float(v%3u)/3.0,1.0);
+      v1[v]=x;
+   }
+   if (nv>0u)
+      for(uint p=i;p<min(np,uint(PRIMS));p+=uint(LANES))
+         gl_PrimitiveTriangleIndicesEXT[p]=uvec3((3u*p)%nv,(3u*p+1u)%nv,(3u*p+2u)%nv);
+}

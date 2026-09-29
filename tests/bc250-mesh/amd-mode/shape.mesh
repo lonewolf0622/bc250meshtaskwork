@@ -1,0 +1,42 @@
+#version 460
+/* RADV_BC250_MESH_AMD test shape. Compile with -DWS=<threads> -DNV=<vertices> -DNP=<primitives>
+ * and optionally -DPERPRIM=1 (per-primitive generic output), -DCULL=1 (CullPrimitive),
+ * -DSHARED=1 (shared memory + workgroup barriers, exercises the extra non-API waves). */
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x = WS) in;
+layout(triangles, max_vertices = NV, max_primitives = NP) out;
+layout(location = 0) out vec4 col[];
+#if PERPRIM
+layout(location = 1) perprimitiveEXT flat out vec4 pcol[];
+#endif
+#if SHARED
+shared float sh[WS];
+#endif
+layout(push_constant) uniform PC { uint base; } pc;
+void main() {
+  uint i = gl_LocalInvocationIndex;
+  uint g = gl_WorkGroupID.x + pc.base + gl_DrawID;
+#if SHARED
+  sh[i] = float(i + g);
+  barrier();
+  float s = sh[(i + 1) % WS];
+  barrier();
+#else
+  float s = 0.0;
+#endif
+  SetMeshOutputsEXT(NV, NP);
+  for (uint v = i; v < NV; v += WS) {
+    float a = float(v) * 0.05 + float(g) + s;
+    gl_MeshVerticesEXT[v].gl_Position = vec4(cos(a), sin(a), 0.5, 1.0);
+    col[v] = vec4(float(v) / float(NV), s, 1.0, 1.0);
+  }
+  for (uint p = i; p < NP; p += WS) {
+    gl_PrimitiveTriangleIndicesEXT[p] = uvec3(p % NV, (p + 1) % NV, (p + 2) % NV);
+#if PERPRIM
+    pcol[p] = vec4(float(p), 1.0, 0.0, 1.0);
+#endif
+#if CULL
+    gl_MeshPrimitivesEXT[p].gl_CullPrimitiveEXT = (p & 7u) == 3u;
+#endif
+  }
+}

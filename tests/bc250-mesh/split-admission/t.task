@@ -1,0 +1,5 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x=32) in;
+struct P { uint base; }; taskPayloadSharedEXT P pl;
+void main(){ pl.base=gl_WorkGroupID.x; EmitMeshTasksEXT(gl_WorkGroupID.x&1u,1,1); }

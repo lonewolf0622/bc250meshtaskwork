@@ -1,0 +1,20 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x=32) in;
+layout(triangles,max_vertices=32,max_primitives=32) out;
+layout(location=0) out vec4 v0[];
+layout(location=1) flat out uint v1[];
+void main()
+{
+   uint i=gl_LocalInvocationIndex;
+   SetMeshOutputsEXT(32,32);
+   // Vertex 31 is initialized and counted, but deliberately never referenced.
+   float angle=float(i)*6.28318530718/30.0;
+   vec2 xy=i==0u ? vec2(0) : vec2(cos(angle),sin(angle))*0.75;
+   gl_MeshVerticesEXT[i].gl_Position=vec4(xy,0.5,1.0);
+   float f=float(i)/32.0;
+   v0[i]=vec4(f,f*0.5,f*0.25,1.0+f);
+   v1[i]=i;
+   uint p=i<29u ? i : i-29u;
+   gl_PrimitiveTriangleIndicesEXT[i]=uvec3(0,p+1u,p+2u);
+}

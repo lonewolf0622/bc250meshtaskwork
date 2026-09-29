@@ -1,0 +1,19 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x=32) in;
+layout(set=0,binding=0) uniform UniformData { uint value; } ub;
+layout(set=1,binding=0) readonly buffer StorageData { uint value; } sb;
+layout(push_constant) uniform Constants { layout(offset=240) uint challenge; uint side; uint magic; uint reserved; } pc;
+struct Payload { uint sentinel; uint taskIndex; };
+taskPayloadSharedEXT Payload payload;
+void main() {
+    if(gl_LocalInvocationIndex==0) {
+        payload.sentinel=ub.value^sb.value^pc.challenge;
+        #ifdef GPU_INDIRECT
+        payload.taskIndex=gl_DrawID;
+#else
+        payload.taskIndex=pc.side;
+#endif
+    }
+    EmitMeshTasksEXT(1,1,1);
+}

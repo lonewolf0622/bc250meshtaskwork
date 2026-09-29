@@ -1,0 +1,41 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#ifndef CASE
+#define CASE 0
+#endif
+#ifndef LOCAL_SIZE
+#define LOCAL_SIZE 32
+#endif
+layout(local_size_x=LOCAL_SIZE) in;
+layout(triangles,max_vertices=3,max_primitives=1) out;
+struct Payload { uint sentinel; uint taskIndex; };
+taskPayloadSharedEXT Payload payload;
+layout(location=0) perprimitiveEXT out vec3 color[];
+void main() {
+#if CASE == 4
+    // Launch both mesh groups, but make the first group emit nothing.
+    bool emptyGroup = payload.taskIndex == 0;
+    SetMeshOutputsEXT(emptyGroup ? 0 : 3, emptyGroup ? 0 : 1);
+    if (emptyGroup) return;
+#else
+    SetMeshOutputsEXT(3,1);
+#endif
+    if(gl_LocalInvocationIndex==0) {
+#if CASE == 3
+        uint index=gl_WorkGroupID.x;
+#else
+        uint index=payload.taskIndex;
+#endif
+        float shift=index==0?-0.48:0.48;
+        gl_MeshVerticesEXT[0].gl_Position=vec4(-0.35+shift,-0.7,0,1);
+        gl_MeshVerticesEXT[1].gl_Position=vec4(0.35+shift,-0.7,0,1);
+        gl_MeshVerticesEXT[2].gl_Position=vec4(shift,0.7,0,1);
+        gl_PrimitiveTriangleIndicesEXT[0]=uvec3(0,1,2);
+        bool valid=payload.sentinel==0x12345678u && gl_NumWorkGroups==uvec3(CASE==3?2:1,1,1);
+#ifdef CHECK_DRAW_ID
+        valid=valid && uint(gl_DrawID)==index;
+#endif
+        vec3 c=valid?(index==0?vec3(1,0,0):vec3(0,1,0)):vec3(0,0,1);
+        color[0]=c;
+    }
+}

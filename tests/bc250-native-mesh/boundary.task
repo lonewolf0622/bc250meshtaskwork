@@ -1,0 +1,12 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x=32) in;
+struct Payload { uvec3 id; uvec3 size; uint draw; uint sentinel; };
+taskPayloadSharedEXT Payload p;
+void main() {
+    if(gl_LocalInvocationIndex==0) {
+        p.id=gl_WorkGroupID; p.size=gl_NumWorkGroups; p.draw=gl_DrawID;
+        p.sentinel=0x12345678u;
+    }
+    EmitMeshTasksEXT(2,1,1);
+}

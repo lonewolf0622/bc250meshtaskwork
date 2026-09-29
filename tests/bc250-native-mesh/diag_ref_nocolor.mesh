@@ -1,0 +1,19 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#ifndef LOCAL_SIZE
+#define LOCAL_SIZE 32
+#endif
+layout(local_size_x=LOCAL_SIZE) in;
+layout(triangles,max_vertices=6,max_primitives=2) out;
+void main() {
+    SetMeshOutputsEXT(6, 2);
+    uint lane=gl_LocalInvocationIndex;
+    vec2 p[4]=vec2[4](vec2(-0.7,-0.7),vec2(0.7,-0.7),vec2(0.7,0.7),vec2(-0.7,0.7));
+    uint map[6]=uint[6](0,1,2,0,2,3);
+    for(uint i=lane;i<6;i+=LOCAL_SIZE) {
+        gl_MeshVerticesEXT[i].gl_Position=vec4(p[map[i]],0,1);
+    }
+    if(lane<2) {
+        gl_PrimitiveTriangleIndicesEXT[lane]=(lane==0?uvec3(0,1,2):uvec3(0,2,3));
+    }
+}

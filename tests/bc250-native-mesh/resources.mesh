@@ -1,0 +1,30 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x=32) in;
+layout(triangles,max_vertices=3,max_primitives=1) out;
+layout(set=0,binding=0) uniform UniformData { uint value; } ub;
+layout(set=1,binding=0) readonly buffer StorageData { uint value; } sb;
+layout(push_constant) uniform Constants { layout(offset=240) uint challenge; uint side; uint magic; uint reserved; } pc;
+struct Payload { uint sentinel; uint taskIndex; };
+taskPayloadSharedEXT Payload payload;
+layout(location=0) out vec3 color[];
+void main() {
+    SetMeshOutputsEXT(3,1);
+    if(gl_LocalInvocationIndex==0) {
+        uint side=payload.taskIndex;
+        float shift=side==0?-0.48:0.48;
+        gl_MeshVerticesEXT[0].gl_Position=vec4(-0.35+shift,-0.7,0,1);
+        gl_MeshVerticesEXT[1].gl_Position=vec4(0.35+shift,-0.7,0,1);
+        gl_MeshVerticesEXT[2].gl_Position=vec4(shift,0.7,0,1);
+        gl_PrimitiveTriangleIndicesEXT[0]=uvec3(0,1,2);
+        bool valid=ub.value==77 && sb.value==99 &&
+#ifdef GPU_INDIRECT
+          side < 2u && pc.challenge==0x11111111u
+#else
+          pc.side==side && pc.challenge==(side==0?0x11111111u:0x22222222u)
+#endif
+          &&
+          payload.sentinel==(ub.value^sb.value^pc.challenge);
+        color[0]=color[1]=color[2]=valid?(side==0?vec3(1,0,0):vec3(0,1,0)):vec3(0,0,1);
+    }
+}

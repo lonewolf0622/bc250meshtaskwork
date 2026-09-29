@@ -1,0 +1,59 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+/* Mirrors the output interface of Control Resonant's G-buffer Mesh shaders (vkd3d-proton SPIR-V):
+ * 64 invocations, 64 vertices, 64 triangles, shared vertices, no per-primitive output.
+ *   default   : 8 generic outputs (flat uint, vec3, vec3, vec4, vec2, vec4, vec4, vec3; locations 0-4, 6-8):
+ *               expanded to 192 vertices it does not fit in LDS.
+ *   -DFIT=1   : 7 generic outputs (locations 0-6): fits expanded and unsplit.
+ *   -DPRIMID=1: also writes gl_PrimitiveID (read by the fragment shader, which the split refuses). */
+layout(local_size_x = 64) in;
+layout(max_vertices = 64, max_primitives = 64, triangles) out;
+layout(location = 0) flat out uint a0[];
+layout(location = 1) out vec3 a1[];
+layout(location = 2) out vec3 a2[];
+layout(location = 3) out vec4 a3[];
+layout(location = 4) out vec2 a4[];
+#if FIT
+layout(location = 5) out vec4 a5[];
+layout(location = 6) out vec4 a6[];
+#else
+layout(location = 6) out vec4 a6[];
+layout(location = 7) out vec4 a7[];
+layout(location = 8) out vec3 a8[];
+#endif
+#if PRIMID
+perprimitiveEXT out gl_MeshPerPrimitiveEXT { int gl_PrimitiveID; } gl_MeshPrimitivesEXT[];
+#endif
+layout(push_constant) uniform PC { uint base; } pc;
+#if TASK
+struct P { uint base; };
+taskPayloadSharedEXT P payload;
+#endif
+void main()
+{
+   uint i = gl_LocalInvocationIndex;
+   uint g = gl_WorkGroupID.x + pc.base;
+#if TASK
+   g += payload.base;
+#endif
+   SetMeshOutputsEXT(64, 64);
+   float f = float(i);
+   gl_MeshVerticesEXT[i].gl_Position = vec4(cos(f * 0.1), sin(f * 0.1), float(g & 15u) / 16.0, 1.0);
+   a0[i] = i ^ g;
+   a1[i] = vec3(f, f + 1.0, f + 2.0);
+   a2[i] = vec3(f * 2.0);
+   a3[i] = vec4(f, 0.0, 1.0, f);
+   a4[i] = vec2(f, -f);
+#if FIT
+   a5[i] = vec4(f * 3.0);
+   a6[i] = vec4(f * 4.0);
+#else
+   a6[i] = vec4(f * 4.0);
+   a7[i] = vec4(f * 5.0);
+   a8[i] = vec3(f * 6.0);
+#endif
+   gl_PrimitiveTriangleIndicesEXT[i] = uvec3(i, (i + 1u) & 63u, (i + 2u) & 63u);
+#if PRIMID
+   gl_MeshPrimitivesEXT[i].gl_PrimitiveID = int(i + g * 64u);
+#endif
+}

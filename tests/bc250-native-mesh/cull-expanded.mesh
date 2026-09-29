@@ -1,0 +1,35 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x=32) in;
+layout(triangles, max_vertices=12, max_primitives=4) out;
+layout(location=0) perprimitiveEXT out vec3 color[];
+void main() {
+    SetMeshOutputsEXT(12, 4);
+    if (gl_LocalInvocationIndex == 0) {
+        for(uint i=0;i<4;i++) color[i]=vec3(1,0,0);
+        // Four triangles, one per quadrant of the NDC square. Primitives 0-1
+        // sit in the top half and must rasterize; primitives 2-3 sit in the
+        // bottom half and are culled below. Vertex data for all four is still
+        // written, as required: culling happens at the rasterizer.
+        gl_MeshVerticesEXT[0].gl_Position = vec4(-0.9, -0.9, 0.0, 1.0);
+        gl_MeshVerticesEXT[1].gl_Position = vec4(-0.1, -0.9, 0.0, 1.0);
+        gl_MeshVerticesEXT[2].gl_Position = vec4(-0.5, -0.3, 0.0, 1.0);
+        gl_MeshVerticesEXT[3].gl_Position = vec4( 0.1, -0.9, 0.0, 1.0);
+        gl_MeshVerticesEXT[4].gl_Position = vec4( 0.9, -0.9, 0.0, 1.0);
+        gl_MeshVerticesEXT[5].gl_Position = vec4( 0.5, -0.3, 0.0, 1.0);
+        gl_MeshVerticesEXT[6].gl_Position = vec4(-0.9,  0.9, 0.0, 1.0);
+        gl_MeshVerticesEXT[7].gl_Position = vec4(-0.1,  0.9, 0.0, 1.0);
+        gl_MeshVerticesEXT[8].gl_Position = vec4(-0.5,  0.3, 0.0, 1.0);
+        gl_MeshVerticesEXT[9].gl_Position = vec4( 0.1,  0.9, 0.0, 1.0);
+        gl_MeshVerticesEXT[10].gl_Position = vec4( 0.9,  0.9, 0.0, 1.0);
+        gl_MeshVerticesEXT[11].gl_Position = vec4( 0.5,  0.3, 0.0, 1.0);
+        gl_PrimitiveTriangleIndicesEXT[0] = uvec3(0u, 1u, 2u);
+        gl_PrimitiveTriangleIndicesEXT[1] = uvec3(3u, 4u, 5u);
+        gl_PrimitiveTriangleIndicesEXT[2] = uvec3(6u, 7u, 8u);
+        gl_PrimitiveTriangleIndicesEXT[3] = uvec3(9u, 10u, 11u);
+        gl_MeshPrimitivesEXT[0].gl_CullPrimitiveEXT = false;
+        gl_MeshPrimitivesEXT[1].gl_CullPrimitiveEXT = false;
+        gl_MeshPrimitivesEXT[2].gl_CullPrimitiveEXT = true;
+        gl_MeshPrimitivesEXT[3].gl_CullPrimitiveEXT = true;
+    }
+}

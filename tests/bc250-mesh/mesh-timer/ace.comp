@@ -1,0 +1,6 @@
+#version 450
+// mesh-timer/ace.c: a trivial compute dispatch for the compute-queue timer case.
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer B { uint v[]; } b;
+layout(push_constant) uniform P { uint base; } p;
+void main() { b.v[gl_GlobalInvocationID.x] = p.base + gl_GlobalInvocationID.x; }

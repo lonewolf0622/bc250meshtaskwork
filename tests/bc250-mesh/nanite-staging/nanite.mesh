@@ -1,0 +1,22 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+// Hellblade 2 Nanite Mesh output interface (captured module 1b31cc3e0f633526).
+layout(local_size_x = 128) in;
+layout(max_vertices = 256, max_primitives = 128, triangles) out;
+layout(location = 0) out vec4 tc0[];
+layout(location = 1) flat out uvec3 tc1[];
+layout(location = 2) flat out ivec4 tc2[];
+layout(location = 4) perprimitiveEXT out uvec4 tc7[];
+void main()
+{
+   SetMeshOutputsEXT(256, 128);
+   for (uint i = gl_LocalInvocationIndex; i < 256; i += 128) {
+      gl_MeshVerticesEXT[i].gl_Position = vec4(float(i), 0.0, 0.0, 1.0);
+      tc0[i] = vec4(float(i));
+      tc1[i] = uvec3(i);
+      tc2[i] = ivec4(i);
+   }
+   uint t = gl_LocalInvocationIndex;
+   gl_PrimitiveTriangleIndicesEXT[t] = uvec3(t, t + 1, t + 2);
+   tc7[t] = uvec4(t);
+}

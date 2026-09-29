@@ -1,0 +1,17 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x=32) in;
+layout(triangles,max_vertices=4,max_primitives=2) out;
+shared uint scratch[16];
+void main() {
+    SetMeshOutputsEXT(4, 2);
+    uint lane=gl_LocalInvocationIndex;
+    // Stage A: lane 0 seeds two known values; after ONE barrier every lane
+    // must read them back correctly. On-screen quad iff both are correct.
+    if(lane==0){ scratch[5]=1; scratch[6]=0; }
+    barrier();
+    bool ok=(scratch[5]==1)&&(scratch[6]==0);
+    vec2 p[4]=vec2[4](vec2(-0.7,-0.7),vec2(0.7,-0.7),vec2(0.7,0.7),vec2(-0.7,0.7));
+    for(uint i=lane;i<4;i+=32) gl_MeshVerticesEXT[i].gl_Position=ok?vec4(p[i],0,1):vec4(4,4,0,1);
+    if(lane<2) gl_PrimitiveTriangleIndicesEXT[lane]=(lane==0?uvec3(0,1,2):uvec3(0,2,3));
+}

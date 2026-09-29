@@ -1,0 +1,17 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+// External atomic whose result reaches an output: the value each piece gets
+// depends on how many pieces ran before it. Must stay refused.
+layout(local_size_x=128) in;
+layout(triangles, max_vertices=128, max_primitives=128) out;
+layout(location=0) perprimitiveEXT flat out vec4 pcol[];
+layout(set=0,binding=0,std430) buffer S { uint count; uint data[]; } s;
+
+void main(){
+ uint i=gl_LocalInvocationIndex;
+ uint ticket=0u; if(i==0u) ticket=atomicAdd(s.count,1u);
+ SetMeshOutputsEXT(128,128);
+ gl_MeshVerticesEXT[i].gl_Position=vec4(float(i%16u)/8.0-1.0,float(i/16u)/8.0-1.0,0.5,1);
+ gl_PrimitiveTriangleIndicesEXT[i]=uvec3(i,(i+1u)%128u,(i+2u)%128u);
+ pcol[i]=vec4(float(ticket),0,1,1);
+}

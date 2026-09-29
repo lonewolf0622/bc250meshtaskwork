@@ -1,0 +1,19 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#extension GL_EXT_shared_memory_block : require
+// Application shared memory with an explicit (block) layout. Blocks alias and
+// are placed by nir_assign_shared_var_locations, which cannot lay out the
+// split's own (non-block) variables: the split must stay refused.
+layout(local_size_x=128) in;
+layout(triangles, max_vertices=128, max_primitives=128) out;
+layout(location=0) perprimitiveEXT flat out vec4 pcol[];
+shared B { uint sh[128]; } blk;
+
+void main(){
+ uint i=gl_LocalInvocationIndex;
+ blk.sh[i]=i*5u; barrier();
+ SetMeshOutputsEXT(128,128);
+ gl_MeshVerticesEXT[i].gl_Position=vec4(float(i%16u)/8.0-1.0,float(i/16u)/8.0-1.0,0.5,1);
+ gl_PrimitiveTriangleIndicesEXT[i]=uvec3(i,(i+1u)%128u,(i+2u)%128u);
+ pcol[i]=vec4(float(blk.sh[(i+3u)%128u])/255.0,0,1,1);
+}

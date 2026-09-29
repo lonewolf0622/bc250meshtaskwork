@@ -1,0 +1,17 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+// NumWorkGroups on the single-piece path: 128 declared primitives, at most
+// 40 written (proven bound <= 63), native grid kept.
+layout(local_size_x=64) in;
+layout(triangles, max_vertices=64, max_primitives=128) out;
+layout(location=0) perprimitiveEXT flat out vec4 pcol[];
+
+void main(){
+ uint i=gl_LocalInvocationIndex;
+ SetMeshOutputsEXT(64,40);
+ gl_MeshVerticesEXT[i].gl_Position=vec4(float(i%16u)/8.0-1.0,float(i/16u)/8.0-1.0,0.5,1);
+ if(i<40u){
+  gl_PrimitiveTriangleIndicesEXT[i]=uvec3(i,(i+1u)%64u,(i+2u)%64u);
+  pcol[i]=vec4(float(gl_NumWorkGroups.x),float(gl_NumWorkGroups.y),float(gl_NumWorkGroups.z),float(gl_WorkGroupID.x));
+ }
+}

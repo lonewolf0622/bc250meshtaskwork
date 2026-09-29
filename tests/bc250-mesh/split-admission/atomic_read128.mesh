@@ -1,0 +1,17 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+// Write-only external atomic, but the body also reads the buffer: a later
+// piece may or may not observe the first piece's write. Must stay refused.
+layout(local_size_x=128) in;
+layout(triangles, max_vertices=128, max_primitives=128) out;
+layout(location=0) perprimitiveEXT flat out vec4 pcol[];
+layout(set=0,binding=0,std430) buffer S { uint count; uint data[]; } s;
+
+void main(){
+ uint i=gl_LocalInvocationIndex;
+ if(i==0u) atomicAdd(s.count,1u);
+ SetMeshOutputsEXT(128,128);
+ gl_MeshVerticesEXT[i].gl_Position=vec4(float(i%16u)/8.0-1.0,float(i/16u)/8.0-1.0,0.5,1);
+ gl_PrimitiveTriangleIndicesEXT[i]=uvec3(i,(i+1u)%128u,(i+2u)%128u);
+ pcol[i]=vec4(float(s.data[i]),0,1,1);
+}

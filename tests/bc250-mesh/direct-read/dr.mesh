@@ -1,0 +1,220 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#if VRS
+#extension GL_EXT_fragment_shading_rate : require
+#endif
+/* RADV_BC250_MESH_DIRECT_READ fixtures, one per set of -D options (run.sh):
+ *   LANES/VERTS/PRIMS : workgroup size, max vertices, max primitives (defaults 64/64/64); with
+ *                       VERTS or PRIMS > LANES every lane writes its vertices / primitives in a loop.
+ *   LINES / POINTS    : primitive type (default triangles).
+ *   UNIFORM           : workgroup-uniform outputs (one scalar, one vec4 written per component, one
+ *                       per-primitive uvec4) that the uniform part stages in one cell each, and
+ *                       uniform-valued outputs it must keep as arrays (two stores of different
+ *                       uniform values, a store inside a loop).
+ *   PARTIAL           : output counts from push constants (0 included), only half of the vertices and
+ *                       only .xy of one vec4 written.
+ *   ARRAYED           : an arrayed output (float[3]) written with a dynamic element index: its
+ *                       locations keep the expanded layout (per-location fallback).
+ *   PERPRIM           : per-primitive flat vec4 and CullPrimitive (not with NOCULL: CullPrimitive makes
+ *                       the split take the shader, which refuses a fragment shader reading PrimitiveID);
+ *                       PRIMID also writes gl_PrimitiveID (the varying linker packs it with a generic flat
+ *                       output).
+ *   CLIP              : writes gl_ClipDistance[0] (the clip/cull slot is exported directly too).
+ *   MULTISTORE        : an output stored twice (the second after barriers and reads of shared
+ *                       memory), a store to another invocation's vertex, application shared memory.
+ *   IDXCOMP           : primitive indices written one component at a time and read back.
+ *   ZERO              : odd workgroups output nothing (SetMeshOutputsEXT(0, 0)).
+ *   TASK              : reads an application Task payload.
+ *   VRS               : also writes gl_PrimitiveShadingRateEXT per primitive (../vrs-noop: with the
+ *                       GFX1013 no-op VRS the output is stripped, the code must equal the plain one).
+ * Primitive indices always include 0 and VERTS - 1. */
+#ifndef LANES
+#define LANES 64
+#endif
+#ifndef VERTS
+#define VERTS 64
+#endif
+#ifndef PRIMS
+#define PRIMS 64
+#endif
+layout(local_size_x = LANES) in;
+#if LINES
+layout(max_vertices = VERTS, max_primitives = PRIMS, lines) out;
+#elif POINTS
+layout(max_vertices = VERTS, max_primitives = PRIMS, points) out;
+#else
+layout(max_vertices = VERTS, max_primitives = PRIMS, triangles) out;
+#endif
+layout(push_constant) uniform PC { uint base; uint n; uint m; uint k; } pc;
+
+#if CLIP
+out gl_MeshPerVertexEXT {
+   vec4 gl_Position;
+   float gl_ClipDistance[1];
+} gl_MeshVerticesEXT[];
+#endif
+layout(location = 0) out vec4 v0[];
+layout(location = 1) flat out uint v1[];
+#if UNIFORM
+layout(location = 2) flat out uint u0[];
+layout(location = 3) out vec4 u1[];
+layout(location = 4) flat out uint u2[];
+layout(location = 5) flat out uint u3[];
+layout(location = 6) perprimitiveEXT flat out uvec4 u4[];
+#endif
+#if PARTIAL
+layout(location = 2) out vec4 p0[];
+#endif
+#if ARRAYED
+layout(location = 2) out float ar[][3];
+#endif
+#if PERPRIM
+layout(location = 2) perprimitiveEXT flat out vec4 pp0[];
+#if PRIMID || !NOCULL
+perprimitiveEXT out gl_MeshPerPrimitiveEXT {
+#if PRIMID
+   int gl_PrimitiveID;
+#endif
+#if !NOCULL
+   bool gl_CullPrimitiveEXT;
+#endif
+#if VRS
+   int gl_PrimitiveShadingRateEXT;
+#endif
+} gl_MeshPrimitivesEXT[];
+#endif
+#endif
+#if MULTISTORE
+layout(location = 2) flat out uint ms0[];
+shared uint sh[LANES];
+#endif
+#if TASK
+struct P { uint base; };
+taskPayloadSharedEXT P payload;
+#endif
+
+void main()
+{
+   uint i = gl_LocalInvocationIndex;
+   uint g = gl_WorkGroupID.x + pc.base;
+#if TASK
+   g += payload.base;
+#endif
+   uint nv = VERTS, np = PRIMS;
+#if PARTIAL
+   nv = min(pc.n, uint(VERTS));
+   np = min(pc.m, uint(PRIMS));
+#endif
+#if ZERO
+   if ((g & 1u) != 0u) {
+      nv = 0u;
+      np = 0u;
+   }
+#endif
+   SetMeshOutputsEXT(nv, np);
+
+#if MULTISTORE
+   sh[i] = i * 3u + g;
+#endif
+
+#if VERTS > LANES
+   for (uint v = i; v < VERTS; v += LANES)
+#else
+   uint v = i;
+   if (v < VERTS)
+#endif
+   {
+      float f = float(v);
+#if PARTIAL
+      if (v < nv / 2u) {
+#endif
+      gl_MeshVerticesEXT[v].gl_Position = vec4(cos(f * 0.1) + float(g & 7u), sin(f * 0.1), f / float(VERTS), 1.0);
+#if POINTS
+      gl_MeshVerticesEXT[v].gl_PointSize = 1.0;
+#endif
+#if CLIP
+      gl_MeshVerticesEXT[v].gl_ClipDistance[0] = f - 3.0;
+#endif
+      v0[v] = vec4(f, f * 0.5, float(g), 1.0 + f);
+      v1[v] = v ^ g;
+#if PARTIAL
+      p0[v].xy = vec2(f, float(g));
+      }
+#endif
+#if UNIFORM
+      u0[v] = pc.base;
+      u1[v].x = float(pc.n);
+      u1[v].y = float(pc.m);
+      u1[v].z = uintBitsToFloat(pc.k);
+      u1[v].w = 2.0;
+      if (v < VERTS / 2u)
+         u2[v] = pc.m;
+      else
+         u2[v] = pc.k;
+      for (uint r = 0u; r <= (pc.n & 1u); r++)
+         u3[v] = pc.base + r;
+#endif
+#if ARRAYED
+      ar[v][0] = f;
+      ar[v][1] = f * 2.0;
+      ar[v][2] = f * 3.0;
+      ar[v][pc.k % 3u] = -f;
+#endif
+#if MULTISTORE
+      ms0[v] = v;
+#endif
+   }
+
+#if MULTISTORE
+   barrier();
+   ms0[i % VERTS] = sh[(i + 1u) % LANES] + ms0[i % VERTS];
+   v1[(i + 1u) % VERTS] = sh[i] ^ 0x55u;
+   barrier();
+#endif
+
+#if PRIMS > LANES
+   for (uint p = i; p < PRIMS; p += LANES)
+#else
+   uint p = i;
+   if (p < PRIMS)
+#endif
+   {
+      uint lim = max(nv, 1u);
+      uint a = p % lim;
+      uint b = (p * 7u + g) % lim;
+      uint c = (lim - 1u) - (p % lim);
+#if LINES
+      gl_PrimitiveLineIndicesEXT[p] = uvec2(a, c);
+#elif POINTS
+      gl_PrimitivePointIndicesEXT[p] = c;
+#elif IDXCOMP
+      gl_PrimitiveTriangleIndicesEXT[p].x = a;
+      gl_PrimitiveTriangleIndicesEXT[p].z = c;
+      gl_PrimitiveTriangleIndicesEXT[p].y = b;
+#else
+      gl_PrimitiveTriangleIndicesEXT[p] = uvec3(a, b, c);
+#endif
+#if UNIFORM
+      u4[p] = uvec4(pc.base, pc.n, 7u, pc.m);
+#endif
+#if VRS
+      gl_MeshPrimitivesEXT[p].gl_PrimitiveShadingRateEXT = int((p + g) & 15u);
+#endif
+#if PERPRIM
+      pp0[p] = vec4(float(p), float(g), float(a), float(c));
+#if !NOCULL
+      gl_MeshPrimitivesEXT[p].gl_CullPrimitiveEXT = (p % 5u) == 3u;
+#endif
+#if PRIMID
+      gl_MeshPrimitivesEXT[p].gl_PrimitiveID = int(p + g * 64u);
+#endif
+#endif
+   }
+#if IDXCOMP
+   barrier();
+   if (i < PRIMS) {
+      uvec3 t = gl_PrimitiveTriangleIndicesEXT[i];
+      gl_PrimitiveTriangleIndicesEXT[i] = t.zyx;
+   }
+#endif
+}

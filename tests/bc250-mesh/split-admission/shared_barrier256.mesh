@@ -1,0 +1,21 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+// tri256_barrier without the SSBO store: 128 invocations, 256 primitives,
+// application shared memory written, barrier, then reduced by every lane
+// into the per-primitive colour and the vertex positions.
+layout(local_size_x=128) in;
+layout(triangles, max_vertices=256, max_primitives=256) out;
+layout(location=0) perprimitiveEXT flat out vec4 pcol[];
+shared uint sh[128];
+
+void main(){
+ uint i=gl_LocalInvocationIndex;
+ sh[i]=i*7u+gl_WorkGroupID.x; barrier();
+ uint t=0u; for(uint k=0u;k<128u;k++) t+=sh[k];
+ SetMeshOutputsEXT(256,256);
+ for(uint v=i; v<256u; v+=128u) gl_MeshVerticesEXT[v].gl_Position=vec4(float(v%16u)/8.0-1.0,float(v/16u)/8.0-1.0,float(t&255u)/255.0,1);
+ for(uint p=i; p<256u; p+=128u) {
+   gl_PrimitiveTriangleIndicesEXT[p]=uvec3(p,(p+1u)%256u,(p+2u)%256u);
+   pcol[p]=vec4(float(sh[(p+1u)%128u])/255.0,0,1,1);
+ }
+}

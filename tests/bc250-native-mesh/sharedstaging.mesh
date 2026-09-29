@@ -1,0 +1,37 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#ifndef LOCAL_SIZE
+#define LOCAL_SIZE 32
+#endif
+#ifndef SCRATCH
+#define SCRATCH 1024
+#endif
+layout(local_size_x=LOCAL_SIZE) in;
+layout(triangles,max_vertices=4,max_primitives=2) out;
+shared uint scratch[SCRATCH];
+layout(location=0) perprimitiveEXT out vec3 color[];
+void main() {
+    SetMeshOutputsEXT(4, 2);
+    uint lane=gl_LocalInvocationIndex;
+    // Mesh shared memory used alongside the expansion staging arrays: seed a
+    // checksum pattern, reduce it workgroup-wide. A broken shared path yields
+    // the wrong total and blue (invalid) color instead of red/green.
+    if(lane==0) { for(uint i=1;i<SCRATCH;i++) scratch[i]=i&1; scratch[0]=0; }
+    barrier();
+    uint sum=0; for(uint i=lane+1;i<SCRATCH;i+=LOCAL_SIZE) sum+=scratch[i];
+    atomicAdd(scratch[0],sum);
+    barrier();
+    // scratch[i]=i&1 for i in [1,SCRATCH-1]; the workgroup-wide sum is the
+    // count of odd indices = SCRATCH/2 (for even SCRATCH). The earlier
+    // (SCRATCH-1)/2 was off by one and forced ok=false -> blue regardless of
+    // whether shared memory actually worked. No cast: scratch[0] is uint and
+    // SCRATCH/2 is an int constant; the mixed comparison is legal (as in the
+    // original) and avoids requiring GL_NV_explicit_typecast.
+    bool ok=(scratch[0]==SCRATCH/2);
+    vec2 p[4]=vec2[4](vec2(-0.7,-0.7),vec2(0.7,-0.7),vec2(0.7,0.7),vec2(-0.7,0.7));
+    for(uint i=lane;i<4;i+=LOCAL_SIZE) gl_MeshVerticesEXT[i].gl_Position=vec4(p[i],0,1);
+    if(lane<2) {
+        gl_PrimitiveTriangleIndicesEXT[lane]=(lane==0?uvec3(0,1,2):uvec3(0,2,3));
+        color[lane]=ok?(lane==0?vec3(1,0,0):vec3(0,1,0)):vec3(0,0,1);
+    }
+}

@@ -1,0 +1,37 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+/* Mirrors the output interface of Hellblade 2's two 128-primitive Nanite Mesh shaders (vkd3d-proton
+ * SPIR-V): 128 invocations, 256 vertices, 128 triangles, per-vertex vec4 / flat uvec3 / flat ivec4,
+ * a per-primitive uvec4 written one component at a time (as the game's SPIR-V does, which keeps the
+ * split's staging of the whole primitive arrays), no shared memory.
+ * -DEXTRA=1 adds one more per-vertex vec4 (location 3): does not fit in 2 or 3 expanded pieces. */
+layout(local_size_x = 128) in;
+layout(max_vertices = 256, max_primitives = 128, triangles) out;
+layout(location = 0) out vec4 tc0[];
+layout(location = 1) flat out uvec3 tc1[];
+layout(location = 2) flat out ivec4 tc2[];
+#if EXTRA
+layout(location = 3) out vec4 tc3[];
+#endif
+layout(location = 4) perprimitiveEXT out uvec4 tc7[];
+layout(push_constant) uniform PC { uint base; } pc;
+void main()
+{
+   uint g = gl_WorkGroupID.x + pc.base;
+   SetMeshOutputsEXT(256, 128);
+   for (uint i = gl_LocalInvocationIndex; i < 256; i += 128) {
+      gl_MeshVerticesEXT[i].gl_Position = vec4(float(i) / 256.0, float(g & 7u) / 8.0, 0.5, 1.0);
+      tc0[i] = vec4(float(i), float(g), 0.0, 1.0);
+      tc1[i] = uvec3(i, g, 7u);
+      tc2[i] = ivec4(int(i), int(g), -1, 1);
+#if EXTRA
+      tc3[i] = vec4(float(i) * 0.5);
+#endif
+   }
+   uint t = gl_LocalInvocationIndex;
+   gl_PrimitiveTriangleIndicesEXT[t] = uvec3(t, t + 1u, t + 2u);
+   tc7[t].x = g;
+   tc7[t].y = t;
+   tc7[t].z = 3u;
+   tc7[t].w = 4u;
+}

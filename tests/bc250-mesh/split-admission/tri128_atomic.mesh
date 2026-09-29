@@ -1,0 +1,20 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x=128) in;
+layout(triangles, max_vertices=128, max_primitives=128) out;
+layout(location=0) perprimitiveEXT flat out vec4 pcol[];
+layout(set=0,binding=0,std430) buffer S { uint count; uint data[]; } s;
+shared uint sh[128];
+
+void main(){
+ uint i=gl_LocalInvocationIndex;
+ SetMeshOutputsEXT(128,128);
+ for(uint v=i; v<128; v+=128) gl_MeshVerticesEXT[v].gl_Position=vec4(float(v%16)/8.0-1.0,float(v/16)/8.0-1.0,0.5,1);
+ for(uint p=i; p<128; p+=128) {
+   gl_PrimitiveTriangleIndicesEXT[p]=uvec3(p%128,(p+1)%128,(p+2)%128);
+   
+   
+   pcol[p]=vec4(float(p)/255.0,0,1,1);
+ }
+ if(i==0u) atomicAdd(s.count,1u);
+}

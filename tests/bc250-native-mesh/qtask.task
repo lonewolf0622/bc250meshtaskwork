@@ -1,0 +1,12 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#ifndef LOCAL_X
+#define LOCAL_X 1
+#define LOCAL_Y 1
+#define LOCAL_Z 1
+#endif
+layout(local_size_x=LOCAL_X,local_size_y=LOCAL_Y,local_size_z=LOCAL_Z) in;
+void main() {
+   /* One record of (2,1,1): exactly two mesh workgroups per task invocation. */
+   EmitMeshTasksEXT(2,1,1);
+}

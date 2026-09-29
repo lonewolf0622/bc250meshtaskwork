@@ -1,0 +1,5 @@
+#version 460
+/* Task shader for the non-candidate "task" case: launches 3 Mesh workgroups. */
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x = 32) in;
+void main() { EmitMeshTasksEXT(3, 1, 1); }

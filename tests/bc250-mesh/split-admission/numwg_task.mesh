@@ -1,0 +1,16 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+// NumWorkGroups behind an application Task shader (hybrid Task path): the
+// split multiplies the launch's x by the piece count.
+layout(local_size_x=128) in;
+layout(triangles, max_vertices=128, max_primitives=128) out;
+layout(location=0) perprimitiveEXT flat out vec4 pcol[];
+struct P { uint base; }; taskPayloadSharedEXT P pl;
+
+void main(){
+ uint i=gl_LocalInvocationIndex;
+ SetMeshOutputsEXT(128,128);
+ gl_MeshVerticesEXT[i].gl_Position=vec4(float(i%16u)/8.0-1.0,float(i/16u)/8.0-1.0,0.5,1);
+ gl_PrimitiveTriangleIndicesEXT[i]=uvec3(i,(i+1u)%128u,(i+2u)%128u);
+ pcol[i]=vec4(float(gl_NumWorkGroups.x),float(gl_NumWorkGroups.y),float(pl.base),float(gl_WorkGroupID.x));
+}

@@ -1,0 +1,19 @@
+#version 460
+#extension GL_EXT_nonuniform_qualifier : require
+/* fast-binding Task shader: reads the descriptor heap and the root CBV, launches 1..4 Mesh groups. */
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x = 32) in;
+layout(push_constant) uniform PC { uint heap; uint tex; uint smp; uint base; } pc;
+layout(set = 0, binding = 0, std430) readonly buffer SB { vec4 v[]; } sbufs[];
+layout(set = 3, binding = 0) uniform CB { vec4 c; } cb;
+struct P { uint g; uint n; };
+taskPayloadSharedEXT P payload;
+void main() {
+  vec4 d = sbufs[pc.heap].v[gl_WorkGroupID.x & 15u] * cb.c;
+  uint n = 1u + (uint(d.x) & 3u);
+  if (gl_LocalInvocationIndex == 0u) {
+    payload.g = gl_WorkGroupID.x * 4u;
+    payload.n = n;
+  }
+  EmitMeshTasksEXT(n, 1, 1);
+}

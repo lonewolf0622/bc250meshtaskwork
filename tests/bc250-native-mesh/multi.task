@@ -1,0 +1,21 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#ifndef CASE
+#define CASE 0
+#endif
+layout(local_size_x=32) in;
+struct Payload { uint sentinel; uint taskIndex; };
+taskPayloadSharedEXT Payload payload;
+void main() {
+    if (gl_LocalInvocationIndex==0) {
+        payload.sentinel=0x12345678u;
+        payload.taskIndex=gl_WorkGroupID.x+gl_NumWorkGroups.x*(gl_WorkGroupID.y+gl_NumWorkGroups.y*gl_WorkGroupID.z);
+    }
+#if CASE == 2
+    EmitMeshTasksEXT(gl_WorkGroupID.x==0?0:1,1,1);
+#elif CASE == 3
+    EmitMeshTasksEXT(2,1,1);
+#else
+    EmitMeshTasksEXT(1,1,1);
+#endif
+}

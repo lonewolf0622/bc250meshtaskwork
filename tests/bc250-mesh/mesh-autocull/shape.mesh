@@ -1,0 +1,90 @@
+#version 460
+/* RADV_BC250_MESH_AUTOCULL test shape. Compile with -DWS=<local_size_x> -DNV=<vertices> -DNP=<primitives>
+ * and optionally:
+ *   -DPRIVATE=1   every primitive has its own 3 vertices (NV must be 3*NP): alternate winding
+ *                 (odd primitives are back-facing for CCW front faces) and every 4th primitive
+ *                 lies completely off-screen (x > 2)
+ *                 otherwise the indices are shared (p, p+1, p+2) mod nv on a circle
+ *   -DPERPRIM=1   per-primitive generic output (flat vec4), read by the fragment shader
+ *   -DCULL=1      application CullPrimitive on every 8th primitive (p & 7 == 5)
+ *   -DCLIP=1      writes gl_ClipDistance[0] (autocull also culls with it)
+ *   -DVIEWPORT=1  writes gl_ViewportIndex per primitive (autocull skips the shader)
+ *   -DRUNTIME=1   runtime SetMeshOutputs counts below the declared ones (vary per workgroup)
+ *   -DBEHIND=1    every 3rd primitive has one vertex with w < 0 (must never be culled by the w test)
+ *   -DSUBGROUP=1  a subgroup operation feeds the positions */
+#extension GL_EXT_mesh_shader : require
+#if SUBGROUP
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#endif
+layout(local_size_x = WS) in;
+layout(triangles, max_vertices = NV, max_primitives = NP) out;
+layout(location = 0) out vec4 col[];
+#if PERPRIM
+layout(location = 1) perprimitiveEXT flat out vec4 pcol[];
+#endif
+#if VIEWPORT
+perprimitiveEXT out gl_MeshPerPrimitiveEXT { int gl_ViewportIndex; } gl_MeshPrimitivesEXT[];
+#endif
+#if CLIP
+out gl_MeshPerVertexEXT { vec4 gl_Position; float gl_ClipDistance[1]; } gl_MeshVerticesEXT[];
+#endif
+layout(push_constant) uniform PC { uint base; } pc;
+void main() {
+  uint i = gl_LocalInvocationIndex;
+  uint g = gl_WorkGroupID.x + pc.base + gl_DrawID;
+  float s = 0.0;
+#if SUBGROUP
+  s += subgroupAdd(float(i)) * 1e-6;
+#endif
+#if RUNTIME
+  uint np = NP - (g % 5u);
+#if PRIVATE
+  uint nv = 3u * np;
+#else
+  uint nv = NV - (g % 3u);
+#endif
+#else
+  uint nv = NV, np = NP;
+#endif
+  SetMeshOutputsEXT(nv, np);
+  for (uint v = i; v < nv; v += WS) {
+#if PRIVATE
+    uint p = v / 3u, c = v % 3u;
+    /* cell of primitive p on a 16-wide grid inside [-0.9, 0.9] */
+    float x = -0.9 + 0.1 * float(p % 16u), y = -0.9 + 0.1 * float((p / 16u) % 16u) + 0.01 * float(g % 8u);
+    /* CCW corner order (front) for even p, CW (back) for odd p */
+    vec2 o = c == 0u ? vec2(0.0) : ((c == 1u) == ((p & 1u) == 0u) ? vec2(0.08, 0.0) : vec2(0.0, 0.08));
+    if ((p & 3u) == 3u)
+      x += 3.0; /* completely off-screen */
+    float w = 1.0;
+#if BEHIND
+    if (p % 3u == 1u && c == 2u)
+      w = -0.5;
+#endif
+    gl_MeshVerticesEXT[v].gl_Position = vec4((x + o.x + s) * w, (y + o.y) * w, 0.5, w);
+#else
+    float a = float(v) * 0.05 + float(g) + s;
+    gl_MeshVerticesEXT[v].gl_Position = vec4(cos(a), sin(a), 0.5, 1.0);
+#endif
+#if CLIP
+    gl_MeshVerticesEXT[v].gl_ClipDistance[0] = float(v & 1u) - 0.25;
+#endif
+    col[v] = vec4(float(v) / float(NV), float(g & 7u), 0.25, 1.0);
+  }
+  for (uint p = i; p < np; p += WS) {
+#if PRIVATE
+    gl_PrimitiveTriangleIndicesEXT[p] = uvec3(3u * p, 3u * p + 1u, 3u * p + 2u);
+#else
+    gl_PrimitiveTriangleIndicesEXT[p] = uvec3(p % nv, (p + 1u) % nv, (p + 2u) % nv);
+#endif
+#if PERPRIM
+    pcol[p] = vec4(float(p), 1.0, float(g & 3u), 1.0);
+#endif
+#if CULL
+    gl_MeshPrimitivesEXT[p].gl_CullPrimitiveEXT = (p & 7u) == 5u;
+#endif
+#if VIEWPORT
+    gl_MeshPrimitivesEXT[p].gl_ViewportIndex = int(p & 1u);
+#endif
+  }
+}

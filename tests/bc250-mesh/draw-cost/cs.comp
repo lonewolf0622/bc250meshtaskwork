@@ -1,0 +1,5 @@
+#version 460
+layout(local_size_x = 64) in;
+layout(push_constant) uniform PC { uint base; } pc;
+layout(set = 0, binding = 0) buffer V { uint v[]; } vis;
+void main() { vis.v[512u + (gl_GlobalInvocationID.x & 255u)] = pc.base; }
