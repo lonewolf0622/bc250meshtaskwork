@@ -8,7 +8,7 @@
 /* Separate from radv_shader_info: the switch-off shader binary layout and
  * compiler keys must remain unchanged. Executable shaders remain ordinary
  * cache objects; a plan references its two private compute shaders last. */
-#define RADV_BC250_PIPELINE_PLAN_VERSION 2u
+#define RADV_BC250_PIPELINE_PLAN_VERSION 3u
 #define RADV_BC250_PLAN_TASK (1u << 0)
 #define RADV_BC250_PLAN_ORDERED (1u << 1)
 #define RADV_BC250_PLAN_ORDER_FREE (1u << 2)
@@ -26,6 +26,8 @@ struct radv_bc250_pipeline_plan {
    /* Actual varying slots, each encoded as slot+1; zero means absent.
     * One raw slot and no flat slot is the private CORNER_ID representation. */
    uint32_t bary_slots;
+   /* Exact compiler policy bytes, including adaptive in the primitive ceiling byte. */
+   uint8_t route_key[24];
    uint64_t reserved;
 };
 

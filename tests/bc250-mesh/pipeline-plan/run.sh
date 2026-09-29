@@ -2,7 +2,7 @@
 set -euo pipefail
 here=$(cd -- "$(dirname -- "$0")" && pwd)
 : "${ICD:?set ICD to the candidate ICD}"
-SHIM=${SHIM:-/home/deck/mesh-test/mesa-bc250-claude-rdna1-auditfix-build/src/amd/drm-shim/libamdgpu_noop_drm_shim.so}
+: "${SHIM:?set SHIM to the noop drm-shim library}"
 work=${KEEP:-$(mktemp -d)}
 mkdir -p "$work"
 work=$(realpath "$work")

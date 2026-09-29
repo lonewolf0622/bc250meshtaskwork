@@ -431,7 +431,7 @@ radv_create_pipeline_binary_from_pipeline(struct radv_device *device, const VkAl
          VK_FROM_HANDLE(radv_pipeline, setup, graphics->bc250_setup_pipeline);
          result = radv_create_pipeline_binary_from_bc250_plan(device, pAllocator, &graphics->bc250_plan,
                      producer ? producer->shaders[MESA_SHADER_COMPUTE] : NULL,
-                     setup ? setup->shaders[MESA_SHADER_COMPUTE] : NULL, pipeline_binaries, num_binaries);
+                     producer && setup ? setup->shaders[MESA_SHADER_COMPUTE] : NULL, pipeline_binaries, num_binaries);
       }
    }
 

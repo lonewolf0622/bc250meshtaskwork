@@ -3705,6 +3705,9 @@ radv_graphics_pipeline_compile(struct radv_graphics_pipeline *pipeline, const Vk
             (stages[MESA_SHADER_MESH].bc250_bary_raw_slot + 1) |
             ((stages[MESA_SHADER_MESH].bc250_bary_flat_slot + 1) << 8) : 0,
       };
+      static_assert(sizeof(compiler_info->key) == sizeof(pipeline->bc250_plan.route_key),
+                    "BC250 route policy must retain the complete 24-byte compiler key");
+      memcpy(pipeline->bc250_plan.route_key, &compiler_info->key, sizeof(compiler_info->key));
    }
 
    if (!skip_shaders_cache) {

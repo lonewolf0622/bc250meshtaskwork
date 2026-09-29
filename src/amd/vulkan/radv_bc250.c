@@ -5449,7 +5449,9 @@ radv_bc250_restore_cached_plan(struct radv_device *device, struct radv_graphics_
                                const struct radv_bc250_pipeline_plan *plan,
                                struct radv_shader *producer, struct radv_shader *setup)
 {
-   if (!radv_bc250_pipeline_plan_valid(plan) || pipeline->bc250_task_pipeline ||
+   if (!radv_bc250_pipeline_plan_valid(plan) ||
+       memcmp(plan->route_key, &device->compiler_info.key, sizeof(plan->route_key)) ||
+       pipeline->bc250_task_pipeline ||
        pipeline->bc250_setup_pipeline || pipeline->bc250_task_layout)
       return VK_ERROR_FEATURE_NOT_PRESENT;
 
