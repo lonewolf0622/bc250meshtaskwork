@@ -4,6 +4,10 @@ Mesh shader support for the AMD BC-250 (GFX1013, RDNA1-based) in Mesa's RADV Vul
 a **safe direct path**: no split/replay, one launch per Mesh workgroup, and built-in protection against the index
 patterns that hang this chip.
 
+**Download:** [patch against stock Mesa 26.2.1](https://github.com/lonewolf0622/bc250meshtaskwork/releases/download/directmesh-v1.0/bc250-directmesh-mesa-26.2.1.patch)
+(also in [`patches/`](patches/) and on the [release page](https://github.com/lonewolf0622/bc250meshtaskwork/releases/tag/directmesh-v1.0)),
+or build this repository directly (see Build).
+
 Turn it on with one switch:
 
 ```
