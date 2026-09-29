@@ -10,6 +10,7 @@
 #include "nir/radv_nir.h"
 #include "radv_pipeline_graphics.h"
 #include "radv_pipeline_cache.h"
+#include "radv_pipeline_compute.h"
 #include "radv_constants.h"
 #include "radv_cs.h"
 #include "tools/radv_rmv.h"
@@ -26,6 +27,8 @@ void
 radv_bc250_device_env_init(struct radv_device *device, const struct radv_physical_device *pdev)
 {
    struct radv_bc250_device_env *env = &device->bc250_env;
+   env->pipeline_plan = pdev->bc250_native_mesh && !pdev->bc250_native_task &&
+      pdev->info.family == CHIP_GFX1013 && debug_get_bool_option("RADV_BC250_PIPELINE_PLAN", false);
    env->chain_trace = pdev->info.family == CHIP_GFX1013 && debug_get_bool_option("BC250_CHAIN_TRACE", false);
    env->chain_shader_only = debug_get_bool_option("BC250_CHAIN_SHADER_ONLY", false);
    env->chain_arguments_only = debug_get_bool_option("BC250_CHAIN_ARGUMENTS_ONLY", false);
@@ -4158,6 +4161,8 @@ bc250_refused_create_flags(const struct radv_device *device)
    VkPipelineCreateFlags2 flags = VK_PIPELINE_CREATE_2_INDIRECT_BINDABLE_BIT_EXT |
                                   VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR |
                                   VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR;
+   if (device->bc250_env.pipeline_plan)
+      flags &= ~VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR;
    if (!radv_device_physical(device)->bc250_fast_binding)
       flags |= VK_PIPELINE_CREATE_2_DESCRIPTOR_BUFFER_BIT_EXT;
    return flags;
@@ -5432,6 +5437,80 @@ radv_bc250_prepare_task(struct radv_device *device,
    stages[MESA_SHADER_MESH].key.has_task_shader = false;
    stages[MESA_SHADER_MESH].bc250_task_replay = true;
    pipeline->active_stages &= ~VK_SHADER_STAGE_TASK_BIT_EXT;
+   return VK_SUCCESS;
+}
+
+/* Restore private compute executables from cache references, never from an
+ * application Task shader or native task rings. Publish handles only after
+ * the complete plan has been validated and reconstructed. */
+VkResult
+radv_bc250_restore_cached_plan(struct radv_device *device, struct radv_graphics_pipeline *pipeline,
+                               const struct radv_pipeline_layout *layout,
+                               const struct radv_bc250_pipeline_plan *plan,
+                               struct radv_shader *producer, struct radv_shader *setup)
+{
+   if (!radv_bc250_pipeline_plan_valid(plan) || pipeline->bc250_task_pipeline ||
+       pipeline->bc250_setup_pipeline || pipeline->bc250_task_layout)
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+
+   if (!(plan->flags & RADV_BC250_PLAN_TASK)) {
+      if (producer || setup)
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+      if (plan->direct_pieces) {
+         VkResult result = radv_bc250_prepare_direct_split(device, pipeline);
+         if (result != VK_SUCCESS)
+            return result;
+      }
+   } else {
+      if (!layout || !producer || !setup || producer->info.stage != MESA_SHADER_COMPUTE ||
+          setup->info.stage != MESA_SHADER_COMPUTE)
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+      VkPushConstantRange range = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                                  .size = sizeof(struct bc250_constants)};
+      VkDescriptorSetLayout sets[MAX_SETS];
+      for (unsigned i = 0; i < layout->num_sets; i++)
+         sets[i] = radv_descriptor_set_layout_to_handle(layout->set[i].layout);
+      VkPipelineLayoutCreateInfo info = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+         .setLayoutCount = layout->num_sets,
+         .pSetLayouts = sets,
+         .pushConstantRangeCount = 1,
+         .pPushConstantRanges = &range,
+      };
+      VkPipelineLayout private_layout;
+      VkResult result = radv_CreatePipelineLayout(radv_device_to_handle(device), &info, NULL, &private_layout);
+      if (result != VK_SUCCESS)
+         return result;
+      VK_FROM_HANDLE(radv_pipeline_layout, compute_layout, private_layout);
+      if (compute_layout->dynamic_shader_stages & VK_SHADER_STAGE_TASK_BIT_EXT)
+         compute_layout->dynamic_shader_stages |= VK_SHADER_STAGE_COMPUTE_BIT;
+
+      struct radv_compute_pipeline *compute[2] = {NULL, NULL};
+      struct radv_shader *shaders[2] = {producer, setup};
+      for (unsigned i = 0; i < 2; i++) {
+         compute[i] = vk_zalloc(&device->vk.alloc, sizeof(*compute[i]), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+         if (!compute[i]) {
+            if (compute[0])
+               radv_DestroyPipeline(radv_device_to_handle(device), radv_pipeline_to_handle(&compute[0]->base), NULL);
+            radv_DestroyPipelineLayout(radv_device_to_handle(device), private_layout, NULL);
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+         }
+         radv_pipeline_init(device, &compute[i]->base, RADV_PIPELINE_COMPUTE);
+         compute[i]->base.is_internal = true;
+         compute[i]->base.shaders[MESA_SHADER_COMPUTE] = radv_shader_ref(shaders[i]);
+         radv_compute_pipeline_init(compute[i], compute_layout, shaders[i]);
+      }
+      pipeline->bc250_task_pipeline = radv_pipeline_to_handle(&compute[0]->base);
+      pipeline->bc250_setup_pipeline = radv_pipeline_to_handle(&compute[1]->base);
+      pipeline->bc250_task_layout = private_layout;
+      pipeline->active_stages &= ~VK_SHADER_STAGE_TASK_BIT_EXT;
+   }
+
+   pipeline->bc250_payload_stride = plan->payload_stride;
+   pipeline->bc250_ordered = plan->flags & RADV_BC250_PLAN_ORDERED;
+   pipeline->bc250_split_order_free = plan->flags & RADV_BC250_PLAN_ORDER_FREE;
+   pipeline->bc250_direct_split_pieces = plan->direct_pieces;
+   pipeline->bc250_plan = *plan;
    return VK_SUCCESS;
 }
 

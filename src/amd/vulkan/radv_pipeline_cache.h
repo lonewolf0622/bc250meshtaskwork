@@ -39,8 +39,11 @@ struct radv_shader *radv_shader_create(struct radv_device *device, struct vk_pip
                                        const struct radv_shader_binary *binary, bool skip_cache,
                                        struct radv_shader_debug_info *dbg);
 
+struct radv_pipeline_layout;
 bool radv_graphics_pipeline_cache_search(struct radv_device *device, struct vk_pipeline_cache *cache,
-                                         struct radv_graphics_pipeline *pipeline, bool *found_in_application_cache);
+                                         struct radv_graphics_pipeline *pipeline,
+                                         const struct radv_pipeline_layout *layout,
+                                         bool *found_in_application_cache);
 
 bool radv_compute_pipeline_cache_search(struct radv_device *device, struct vk_pipeline_cache *cache,
                                         struct radv_compute_pipeline *pipeline, bool *found_in_application_cache);

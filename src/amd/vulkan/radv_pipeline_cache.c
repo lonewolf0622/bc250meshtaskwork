@@ -453,8 +453,8 @@ radv_pipeline_cache_object_search(struct radv_device *device, struct vk_pipeline
    return container_of(object, struct radv_pipeline_cache_object, base);
 }
 
-/* Fixed-width, pointer-free preparation record. Executables retain their own
- * interface, bounds and ABI; hybrid TASK remains excluded from this cache. */
+/* Legacy switch-off plan. The opt-in version additionally retains producer
+ * executables and the full private draw state. */
 struct radv_bc250_cached_plan {
    uint32_t version;
    uint32_t direct_pieces;
@@ -463,7 +463,8 @@ struct radv_bc250_cached_plan {
 
 bool
 radv_graphics_pipeline_cache_search(struct radv_device *device, struct vk_pipeline_cache *cache,
-                                    struct radv_graphics_pipeline *pipeline, bool *found_in_application_cache)
+                                    struct radv_graphics_pipeline *pipeline, const struct radv_pipeline_layout *layout,
+                                    bool *found_in_application_cache)
 {
    struct radv_pipeline_cache_object *pipeline_obj;
 
@@ -471,7 +472,37 @@ radv_graphics_pipeline_cache_search(struct radv_device *device, struct vk_pipeli
    if (!pipeline_obj)
       return false;
 
-   if (device->compiler_info.key.bc250_cache_plan &&
+   unsigned graphics_shaders = pipeline_obj->num_shaders;
+   if (device->bc250_env.pipeline_plan && pipeline->base.type == RADV_PIPELINE_GRAPHICS &&
+       (pipeline->active_stages & VK_SHADER_STAGE_MESH_BIT_EXT)) {
+      const struct radv_bc250_pipeline_plan *plan = pipeline_obj->data;
+      if (pipeline_obj->data_size != sizeof(*plan) || !radv_bc250_pipeline_plan_valid(plan))
+         goto invalid_plan;
+      const unsigned private_shaders = (plan->flags & RADV_BC250_PLAN_TASK) ? 2 : 0;
+      if (graphics_shaders <= private_shaders)
+         goto invalid_plan;
+      graphics_shaders -= private_shaders;
+      /* Validate before reconstructing helpers or publishing shader references. */
+      bool mesh = false;
+      uint32_t stages = 0;
+      for (unsigned i = 0; i < graphics_shaders; i++) {
+         const struct radv_shader *shader = pipeline_obj->shaders[i];
+         if (!shader || shader->info.stage >= MESA_VULKAN_SHADER_STAGES ||
+             shader->info.stage == MESA_SHADER_COMPUTE || shader->info.stage == MESA_SHADER_TASK)
+            goto invalid_plan;
+         const uint32_t stage = 1u << shader->info.stage;
+         if (stages & stage)
+            goto invalid_plan;
+         stages |= stage;
+         mesh |= shader->info.stage == MESA_SHADER_MESH;
+      }
+      if (!mesh)
+         goto invalid_plan;
+      struct radv_shader *producer = private_shaders ? pipeline_obj->shaders[graphics_shaders] : NULL;
+      struct radv_shader *setup = private_shaders ? pipeline_obj->shaders[graphics_shaders + 1] : NULL;
+      if (radv_bc250_restore_cached_plan(device, pipeline, layout, plan, producer, setup) != VK_SUCCESS)
+         goto invalid_plan;
+   } else if (device->compiler_info.key.bc250_cache_plan &&
        pipeline->base.type == RADV_PIPELINE_GRAPHICS &&
        (pipeline->active_stages & VK_SHADER_STAGE_MESH_BIT_EXT)) {
       const struct radv_bc250_cached_plan *plan = pipeline_obj->data;
@@ -487,7 +518,7 @@ radv_graphics_pipeline_cache_search(struct radv_device *device, struct vk_pipeli
       pipeline->bc250_direct_split_pieces = plan->direct_pieces;
    }
 
-   for (unsigned i = 0; i < pipeline_obj->num_shaders; i++) {
+   for (unsigned i = 0; i < graphics_shaders; i++) {
       mesa_shader_stage s = pipeline_obj->shaders[i]->info.stage;
       if (s == MESA_SHADER_VERTEX && i > 0) {
          /* The GS copy-shader is a VS placed after all other stages */
@@ -500,6 +531,10 @@ radv_graphics_pipeline_cache_search(struct radv_device *device, struct vk_pipeli
 
    pipeline->base.cache_object = &pipeline_obj->base;
    return true;
+
+invalid_plan:
+   vk_pipeline_cache_object_unref(&device->vk, &pipeline_obj->base);
+   return false;
 }
 
 bool
@@ -534,16 +569,30 @@ radv_pipeline_cache_insert(struct radv_device *device, struct vk_pipeline_cache 
       num_shaders += pipeline->shaders[i] ? 1 : 0;
    num_shaders += pipeline->gs_copy_shader ? 1 : 0;
 
+   const struct radv_graphics_pipeline *graphics = pipeline->type == RADV_PIPELINE_GRAPHICS ?
+      container_of(pipeline, struct radv_graphics_pipeline, base) : NULL;
+   const bool portable_plan = device->bc250_env.pipeline_plan && graphics &&
+                              (graphics->active_stages & VK_SHADER_STAGE_MESH_BIT_EXT);
+   if (portable_plan && !radv_bc250_pipeline_plan_valid(&graphics->bc250_plan))
+      return;
+   const bool private_shaders = portable_plan && (graphics->bc250_plan.flags & RADV_BC250_PLAN_TASK);
+   if (private_shaders && (!graphics->bc250_task_pipeline || !graphics->bc250_setup_pipeline))
+      return;
+   num_shaders += private_shaders ? 2 : 0;
+
    struct radv_pipeline_cache_object *pipeline_obj;
    const bool store_plan = device->compiler_info.key.bc250_cache_plan &&
                            pipeline->type == RADV_PIPELINE_GRAPHICS &&
                            (container_of(pipeline, struct radv_graphics_pipeline, base)->active_stages & VK_SHADER_STAGE_MESH_BIT_EXT);
    pipeline_obj = radv_pipeline_cache_object_create(&device->vk, num_shaders, pipeline->blake3,
+                                                    portable_plan ? sizeof(struct radv_bc250_pipeline_plan) :
                                                     store_plan ? sizeof(struct radv_bc250_cached_plan) : 0);
 
    if (!pipeline_obj)
       return;
-   if (store_plan) {
+   if (portable_plan) {
+      memcpy(pipeline_obj->data, &graphics->bc250_plan, sizeof(graphics->bc250_plan));
+   } else if (store_plan) {
       struct radv_bc250_cached_plan *plan = pipeline_obj->data;
       plan->version = RADV_BC250_PLAN_VERSION;
       plan->direct_pieces = container_of(pipeline, struct radv_graphics_pipeline, base)->bc250_direct_split_pieces;
@@ -557,6 +606,19 @@ radv_pipeline_cache_insert(struct radv_device *device, struct vk_pipeline_cache 
    /* Place the GS copy-shader after all other stages */
    if (pipeline->gs_copy_shader)
       pipeline_obj->shaders[idx++] = radv_shader_ref(pipeline->gs_copy_shader);
+
+   if (private_shaders) {
+      VK_FROM_HANDLE(radv_pipeline, producer, graphics->bc250_task_pipeline);
+      VK_FROM_HANDLE(radv_pipeline, setup, graphics->bc250_setup_pipeline);
+      /* A pipeline reference alone does not serialize a shader into an
+       * application cache: these shaders were created in the meta cache. */
+      struct radv_shader *shaders[2] = {producer->shaders[MESA_SHADER_COMPUTE], setup->shaders[MESA_SHADER_COMPUTE]};
+      for (unsigned i = 0; i < 2; i++) {
+         struct vk_pipeline_cache_object *object =
+            vk_pipeline_cache_add_object(cache, &radv_shader_ref(shaders[i])->base);
+         pipeline_obj->shaders[idx++] = container_of(object, struct radv_shader, base);
+      }
+   }
 
    assert(idx == num_shaders);
 
@@ -875,8 +937,16 @@ radv_pipeline_cache_get_binaries(struct radv_device *device, const VkAllocationC
       }
    } else {
       struct radv_shader *gs_copy_shader = NULL;
+      const struct radv_bc250_pipeline_plan *plan = device->bc250_env.pipeline_plan &&
+         pipeline_obj->data_size == sizeof(struct radv_bc250_pipeline_plan) ? pipeline_obj->data : NULL;
+      const unsigned private_shaders = plan && (plan->flags & RADV_BC250_PLAN_TASK) ? 2 : 0;
+      if (plan && (!radv_bc250_pipeline_plan_valid(plan) || pipeline_obj->num_shaders <= private_shaders)) {
+         result = VK_ERROR_FEATURE_NOT_PRESENT;
+         goto fail;
+      }
+      const unsigned graphics_shaders = pipeline_obj->num_shaders - private_shaders;
 
-      for (unsigned i = 0; i < pipeline_obj->num_shaders; i++) {
+      for (unsigned i = 0; i < graphics_shaders; i++) {
          struct radv_shader *shader = pipeline_obj->shaders[i];
          mesa_shader_stage s = shader->info.stage;
 
@@ -894,6 +964,14 @@ radv_pipeline_cache_get_binaries(struct radv_device *device, const VkAllocationC
       if (gs_copy_shader) {
          result = radv_create_pipeline_binary_from_shader(device, pAllocator, gs_copy_shader, pipeline_binaries,
                                                           num_binaries);
+         if (result != VK_SUCCESS)
+            goto fail;
+      }
+      if (plan) {
+         result = radv_create_pipeline_binary_from_bc250_plan(device, pAllocator, plan,
+            private_shaders ? pipeline_obj->shaders[graphics_shaders] : NULL,
+            private_shaders ? pipeline_obj->shaders[graphics_shaders + 1] : NULL,
+            pipeline_binaries, num_binaries);
          if (result != VK_SUCCESS)
             goto fail;
       }

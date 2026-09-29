@@ -915,6 +915,10 @@ radv_device_init_cache_key(struct radv_device *device)
    memcpy(&bc250x, &device->compiler_info.bc250x, sizeof(bc250x));
    if (bc250x)
       _mesa_blake3_update(&ctx, &bc250x, sizeof(bc250x));
+   if (device->bc250_env.pipeline_plan) {
+      static const char tag[] = "bc250-pipeline-plan-v2";
+      _mesa_blake3_update(&ctx, tag, sizeof(tag));
+   }
    _mesa_blake3_final(&ctx, device->cache_hash);
    if (debug_get_bool_option("BC250_CAPTURE_POLICY_SHADERS", false)) {
       fprintf(stderr, "BC250POLICYCACHE cu=%u hash=", device->compiler_info.key.bc250_compute_cu_mode);

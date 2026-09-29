@@ -17,6 +17,7 @@
 #include "radv_pipeline.h"
 #include "radv_pipeline_layout.h"
 #include "radv_shader.h"
+#include "radv_bc250_pipeline_plan.h"
 
 #include "vk_graphics_state.h"
 
@@ -141,6 +142,7 @@ struct radv_graphics_pipeline {
    /* RADV_BC250_SPLIT_PREP_FREE: the fragment shader's effects do not depend
     * on the order of its primitives (radv_bc250.c, bc250_fs_order_independent). */
    bool bc250_split_order_free;
+   struct radv_bc250_pipeline_plan bc250_plan;
 
    struct radv_dynamic_state dynamic_state;
 

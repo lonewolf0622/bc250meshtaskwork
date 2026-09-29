@@ -146,6 +146,7 @@ struct radv_shader_abort_data {
  * ~150 variables). Same values as the per-call reads as long as the process
  * environment does not change after device creation. */
 struct radv_bc250_device_env {
+   bool pipeline_plan; /* RADV_BC250_PIPELINE_PLAN: opt-in portable cache plan. */
    bool chain_trace;          /* BC250_CHAIN_TRACE on GFX1013 (radv_bc250_chain_enabled) */
    bool chain_shader_only;    /* BC250_CHAIN_SHADER_ONLY */
    bool chain_arguments_only; /* BC250_CHAIN_ARGUMENTS_ONLY */
