@@ -6518,6 +6518,8 @@ radv_bc250_directmesh_env(void)
       /* More shapes admitted to the safe routes (gates PP1, TG1, PX1). */
       {"RADV_BC250_MESH_DEAD_PAYLOAD", "1"}, {"RADV_BC250_MESH_PIECE_PRIMID", "1"},
       {"RADV_BC250_MESH_SAFE_PIECES_EXT", "1"}, {"RADV_BC250_TASK_GRID_FOLD", "1"},
+      /* Renumbered referenced vertices after culling instead of private corners (gate CM1). */
+      {"RADV_BC250_MESH_SAFE_COMPACT", "1"},
    };
    for (unsigned i = 0; i < ARRAY_SIZE(settings); i++)
       setenv(settings[i][0], settings[i][1], 0);
