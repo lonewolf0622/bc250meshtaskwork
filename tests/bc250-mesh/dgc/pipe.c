@@ -216,6 +216,14 @@ static void dgc_draw(VkCommandBuffer cb, int count)
    VkGeneratedCommandsMemoryRequirementsInfoEXT mi={.sType=VK_STRUCTURE_TYPE_GENERATED_COMMANDS_MEMORY_REQUIREMENTS_INFO_EXT,
       .pNext=&pi,.indirectCommandsLayout=layout,.maxSequenceCount=sequences,.maxDrawCount=draws};
    VkMemoryRequirements2 mr={.sType=VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2}; requirements(dgc_device,&mi,&mr);
+   if(getenv("DGC_SEQUENCE_REQUIREMENTS")) {
+      const unsigned bounds[]={0,1,4096,5000,1048576,1048577};
+      for(unsigned b=0;b<sizeof(bounds)/sizeof(bounds[0]);b++) {
+         mi.maxSequenceCount=bounds[b];requirements(dgc_device,&mi,&mr);
+         printf("DGC_SEQUENCE_BOUND count=%d sequences=%u bytes=%llu\n",count,bounds[b],(unsigned long long)mr.memoryRequirements.size);
+      }
+      return;
+   }
    if(getenv("DGC_REQUIREMENTS_ONLY")) {
       const unsigned bounds[]={1,3,4,8,64,128,256,511,512,4096,4097};
       mi.maxSequenceCount=1;

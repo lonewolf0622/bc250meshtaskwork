@@ -6852,7 +6852,8 @@ radv_flush_constants(struct radv_cmd_buffer *cmd_buffer, VkShaderStageFlags stag
    const struct radv_push_constant_state *push_constants = radv_get_push_constants_state(cmd_buffer, bind_point);
    uint64_t va = 0;
    uint32_t internal_stages = stages;
-   uint64_t dgc_va = !cmd_buffer->bc250_inside_mesh_draw && !cmd_buffer->state.meta.inside_meta_op
+   uint64_t dgc_va = (!cmd_buffer->bc250_inside_mesh_draw || cmd_buffer->bc250_dgc_merged_constants) &&
+                       !cmd_buffer->state.meta.inside_meta_op
                        ? cmd_buffer->bc250_dgc_application_va : 0;
 
    switch (bind_point) {

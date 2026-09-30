@@ -48,7 +48,7 @@ bc250_dgc_shape(const struct radv_indirect_command_layout *layout, const void *n
 {
    const VkGeneratedCommandsPipelineInfoEXT *pi = vk_find_struct_const(next, GENERATED_COMMANDS_PIPELINE_INFO_EXT);
    const VkGeneratedCommandsShaderInfoEXT *si = vk_find_struct_const(next, GENERATED_COMMANDS_SHADER_INFO_EXT);
-   if (!pi || si || !pi->pipeline || sequences > 4096 ||
+   if (!pi || si || !pi->pipeline || sequences > 1048576 ||
        (layout->vk.dgc_info & ~(BITFIELD_BIT(MESA_VK_DGC_DRAW_MESH) |
           BITFIELD_BIT(MESA_VK_DGC_PC) | BITFIELD_BIT(MESA_VK_DGC_SI))))
       return false;
@@ -63,14 +63,14 @@ bc250_dgc_shape(const struct radv_indirect_command_layout *layout, const void *n
           ms->info.ms.bc250_expanded, ms->info.ms.bc250_merge_k,
           p->bc250_plan.flags & RADV_BC250_PLAN_EMPTY))
       return false;
-   /* Merged indirect helpers keep ordinary inlined application constants;
-    * dynamic token constants on that route are not yet an admitted ABI. */
-   if (ms->info.ms.bc250_merge_k > 1 && layout->push_constant_mask)
+   /* Hybrid Task requires its private producer/consumer constants. A merged
+    * Mesh-only helper instead retains the application's ordinary ABI. */
+   if (p->bc250_task_pipeline && ms->info.ms.bc250_merge_k > 1)
       return false;
    memset(s, 0, sizeof(*s));
    s->task = !!p->bc250_task_pipeline;
    s->records = layout->vk.draw_count ? max_draws : MAX2(sequences, 1);
-   if (!s->records || s->records > 4096)
+   if (!s->records || (layout->vk.draw_count && s->records > 4096))
       return false;
    uint64_t draws = layout->vk.draw_count ? s->records : 1;
    bool reuse = s->task && layout->vk.draw_count;
@@ -221,6 +221,8 @@ static bool
 bc250_dgc_state_valid(const struct radv_cmd_buffer *state, const VkGeneratedCommandsInfoEXT *info)
 {
    const struct radv_device *device = radv_cmd_buffer_device(state);
+   if (!radv_device_physical(device)->bc250_expose_dgc)
+      return false;
    const VkGeneratedCommandsPipelineInfoEXT *pi = vk_find_struct_const(info->pNext, GENERATED_COMMANDS_PIPELINE_INFO_EXT);
    VK_FROM_HANDLE(radv_pipeline, p, pi ? pi->pipeline : VK_NULL_HANDLE);
    const struct radv_cmd_state *s = &state->state;
@@ -282,6 +284,7 @@ bc250_dgc_capture(struct radv_cmd_buffer *owner, const struct radv_cmd_buffer *s
    if (!cmd)
       return false;
    *cmd = *state;
+   cmd->bc250_dgc_merged_constants = cmd->state.graphics_pipeline->base.shaders[MESA_SHADER_MESH]->info.ms.bc250_merge_k > 1;
    cmd->bc250_dgc_upload_va = info->preprocessAddress + (uint64_t)seq * shape->stride + shape->code;
    memset(&cmd->upload, 0, sizeof(cmd->upload));
    list_inithead(&cmd->upload.list);
