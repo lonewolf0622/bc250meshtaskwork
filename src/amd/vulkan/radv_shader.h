@@ -630,7 +630,11 @@ struct radv_compiler_info {
       /* RADV_BC250_MESH_PIECE_PRIMID: the safe direct pieces accept a fragment shader reading
        * PrimitiveId when the Mesh shader writes it per primitive (each piece keeps the written value). */
       uint32_t bc250_mesh_piece_primid : 1;
-      uint32_t padding : 2;
+      /* RADV_BC250_MESH_FAIL_CLOSED: a Mesh pipeline that ends up on no protected route (not safe direct,
+       * ordered, split or expanded) is refused instead of drawing the raw API connectivity; the
+       * refused-pipeline retry may still split it (radv_pipeline_graphics.c). */
+      uint32_t bc250_mesh_fail_closed : 1;
+      uint32_t padding : 1;
    } hw;
 
    /* Misc values included as part of the cache key */

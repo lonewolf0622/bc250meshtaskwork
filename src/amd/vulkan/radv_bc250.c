@@ -6429,6 +6429,8 @@ radv_bc250_directmesh_env(void)
       {"RADV_BC250_MESH_ALLOW_POS1", "1"}, {"RADV_BC250_MESH_SPLIT_ANY", "1"},
       {"RADV_BC250_MESH_NESTED_SLICE", "1"}, {"RADV_BC250_MESH_SAFE_SPLIT_PIECES", "1"},
       {"RADV_BC250_MESH_SAFE_ADAPTIVE", "1"},
+      /* Never the raw route: a Mesh pipeline without a protected route is refused. */
+      {"RADV_BC250_MESH_FAIL_CLOSED", "1"},
    };
    for (unsigned i = 0; i < ARRAY_SIZE(settings); i++)
       setenv(settings[i][0], settings[i][1], 0);

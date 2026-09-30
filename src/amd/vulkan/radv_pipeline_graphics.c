@@ -2910,6 +2910,21 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
       }
    }
 
+   /* RADV_BC250_MESH_FAIL_CLOSED: every protected route has been decided by now. A Mesh shader on
+    * none of them would draw the API connectivity unchecked (the route the hang rules forbid):
+    * refuse it. The refused-pipeline retry may still split it; otherwise pipeline creation fails. */
+   if (compiler_info->hw.bc250_mesh_fail_closed && stages[MESA_SHADER_MESH].nir &&
+       !stages[MESA_SHADER_MESH].bc250_safe_direct && !stages[MESA_SHADER_MESH].bc250_ordered_export &&
+       !stages[MESA_SHADER_MESH].bc250_split_mesh && !stages[MESA_SHADER_MESH].bc250_expanded &&
+       stages[MESA_SHADER_MESH].bc250_merge_k <= 1) {
+      if (getenv("BC250_TRACE_COMPILE"))
+         fprintf(stderr, "BC250 MESH FAIL CLOSED: no protected route (V=%u P=%u prim=%u), refused\n",
+                 stages[MESA_SHADER_MESH].nir->info.mesh.max_vertices_out,
+                 stages[MESA_SHADER_MESH].nir->info.mesh.max_primitives_out,
+                 stages[MESA_SHADER_MESH].nir->info.mesh.primitive_type);
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
+
    /* RADV_BC250_MESH_AMD size and reuse parts: they apply to AMD-route Mesh
     * shaders and, switched on alone, to the other native mesh-only shaders
     * that the base driver did not split (expanded or not), with T taken from the final

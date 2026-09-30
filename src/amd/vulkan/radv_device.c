@@ -1253,6 +1253,8 @@ radv_device_init_compiler_info(struct radv_device *device)
                debug_get_bool_option("RADV_BC250_MESH_DEAD_PAYLOAD", false),
             .bc250_mesh_piece_primid = pdev->bc250_native_mesh && pdev->info.family == CHIP_GFX1013 &&
                debug_get_bool_option("RADV_BC250_MESH_PIECE_PRIMID", false),
+            .bc250_mesh_fail_closed = pdev->bc250_native_mesh && pdev->info.family == CHIP_GFX1013 &&
+               debug_get_bool_option("RADV_BC250_MESH_FAIL_CLOSED", false),
          },
       /* Misc values included as part of the cache key */
       .key =
