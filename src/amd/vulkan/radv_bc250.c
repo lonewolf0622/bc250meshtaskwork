@@ -5145,9 +5145,14 @@ radv_bc250_prepare_task(struct radv_device *device,
                   nir_metadata_control_flow, pipeline);
          NIR_PASS(_, fs->nir, nir_shader_intrinsics_pass, bc250_lower_application_constants,
                   nir_metadata_control_flow, pipeline);
-         if (!radv_bc250_split_mesh(mesh_only, NULL, fs->nir, true,
+         /* RADV_BC250_MESH_PIECE_PRIMID also for the direct split fallback: the same slicing keeps the
+          * application's PrimitiveId values. */
+         radv_bc250_split_piece_primid = device->compiler_info.hw.bc250_mesh_piece_primid;
+         const bool split_ok = radv_bc250_split_mesh(mesh_only, NULL, fs->nir, true,
                                     device->compiler_info.key.bc250_split_prep_free, device->compiler_info.key.bc250_balanced_slices, device->compiler_info.key.bc250_parallel_cull, device->compiler_info.key.bc250_output_regions,
-                                    device->compiler_info.key.bc250_mesh_compact_lds, device->compiler_info.key.bc250_piece_prims, ms->bc250_fit_min_pieces, &pieces))
+                                    device->compiler_info.key.bc250_mesh_compact_lds, device->compiler_info.key.bc250_piece_prims, ms->bc250_fit_min_pieces, &pieces);
+         radv_bc250_split_piece_primid = false;
+         if (!split_ok)
             return VK_ERROR_FEATURE_NOT_PRESENT;
          stages[MESA_SHADER_MESH].bc250_split_mesh = true;
          stages[MESA_SHADER_MESH].bc250_split_pieces = pieces;
