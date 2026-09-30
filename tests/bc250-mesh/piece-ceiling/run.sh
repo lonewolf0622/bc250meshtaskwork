@@ -117,7 +117,8 @@ wide_compact|wide|wide|-|5|RADV_BC250_MESH_COMPACT_LDS=1|0|V=192 P=64 api_shared
 # Control interface that fits: unsplit, unchanged.
 wide_fit|wide_fit|wide_fit|-|5||0|V=192 P=64;!Mesh LDS fit;!split
 # The fragment shader reads PrimitiveID: the split refuses it, so the pipeline stays refused.
-wide_primid|wide_primid|wide_primid|-|5||-8|expanded Mesh rejected;min_pieces=2;split rejected: fragment primitive;refused after 1 retries
+wide_primid|wide_primid|wide_primid|-|5|RADV_BC250_MESH_PIECE_PRIMID=0|-8|expanded Mesh rejected;min_pieces=2;split rejected: fragment primitive;refused after 1 retries
+wide_primid_allowed|wide_primid|wide_primid|-|5|RADV_BC250_MESH_PIECE_PRIMID=1|0|expanded Mesh rejected;min_pieces=2;!split rejected: fragment primitive
 EOF
 
 # Shader cache: the retried pipeline is found again with its split plan (BC250_CACHE_PLAN=true, the
