@@ -627,7 +627,10 @@ struct radv_compiler_info {
       /* RADV_BC250_MESH_DEAD_PAYLOAD: a Mesh shader that declares a task payload but never accesses
        * it drops the declaration, so it is not treated as a payload consumer (radv_shader.c). */
       uint32_t bc250_mesh_dead_payload : 1;
-      uint32_t padding : 3;
+      /* RADV_BC250_MESH_PIECE_PRIMID: the safe direct pieces accept a fragment shader reading
+       * PrimitiveId when the Mesh shader writes it per primitive (each piece keeps the written value). */
+      uint32_t bc250_mesh_piece_primid : 1;
+      uint32_t padding : 2;
    } hw;
 
    /* Misc values included as part of the cache key */

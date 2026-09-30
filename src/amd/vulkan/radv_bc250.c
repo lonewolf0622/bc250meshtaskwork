@@ -2945,6 +2945,28 @@ bc250_slice_rebuild_deref(nir_builder *b, nir_deref_instr *d, nir_variable *targ
 }
 
 __thread bool radv_bc250_split_refused_retry;
+__thread bool radv_bc250_split_piece_primid;
+
+/* RADV_BC250_MESH_PIECE_PRIMID: the Mesh shader writes PrimitiveId as one scalar 32-bit integer per
+ * primitive. The split slices it like any other per-primitive output, so each piece exports the value
+ * the application wrote. */
+static bool
+bc250_split_primid_sliceable(const nir_shader *mesh)
+{
+   if (!(mesh->info.outputs_written & mesh->info.per_primitive_outputs & VARYING_BIT_PRIMITIVE_ID))
+      return false;
+   unsigned found = 0;
+   nir_foreach_shader_out_variable(var, mesh) {
+      if (var->data.location != VARYING_SLOT_PRIMITIVE_ID)
+         continue;
+      const struct glsl_type *elem = glsl_type_is_array(var->type) ? glsl_get_array_element(var->type) : NULL;
+      if (!var->data.per_primitive || !elem || !glsl_type_is_scalar(elem) || !glsl_type_is_32bit(elem) ||
+          !glsl_type_is_integer(elem) || glsl_get_length(var->type) != mesh->info.mesh.max_primitives_out)
+         return false;
+      found++;
+   }
+   return found == 1;
+}
 
 bool
 radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool direct_split, bool piece_select,
@@ -2984,7 +3006,14 @@ radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool d
    if (!topo_ok || mesh->info.mesh.nv ||
        mesh->info.mesh.max_primitives_out > 256 || pieces < 1 || pieces > 5 || (!fs && !split_any))
       return bc250_split_reject("topology/capacity/stage");
-   if (fs && fs->info.inputs_read & (VARYING_BIT_PRIMITIVE_ID | VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT))
+   uint64_t primitive_inputs = VARYING_BIT_PRIMITIVE_ID | VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT;
+   if (radv_bc250_split_piece_primid && direct_split && !task && fs &&
+       (fs->info.inputs_read & VARYING_BIT_PRIMITIVE_ID) && bc250_split_primid_sliceable(mesh)) {
+      primitive_inputs &= ~VARYING_BIT_PRIMITIVE_ID;
+      if (getenv("BC250_TRACE_COMPILE"))
+         fprintf(stderr, "BC250 MESH PIECE PRIMID: written PrimitiveId sliced with the pieces\n");
+   }
+   if (fs && fs->info.inputs_read & primitive_inputs)
       return bc250_split_reject("fragment primitive system input");
 
    /* SPIR-V PrimitiveId inputs are system values, not ordinary varyings. */
@@ -4541,9 +4570,13 @@ bc250_prepare_safe_pieces(struct radv_device *device, struct radv_graphics_pipel
    }
    uint32_t staged[4] = {0};
    uint64_t payload = 0;
-   if ((!plain && !owned_corners) || !radv_bc250_split_mesh(mesh, NULL, fragment, true, false, true, false,
-                                        device->compiler_info.key.bc250_output_regions, true, 64,
-                                        ms->bc250_fit_min_pieces, &pieces) ||
+   radv_bc250_split_piece_primid = device->compiler_info.hw.bc250_mesh_piece_primid && owned_corners;
+   const bool piece_split = (plain || owned_corners) &&
+      radv_bc250_split_mesh(mesh, NULL, fragment, true, false, true, false,
+                            device->compiler_info.key.bc250_output_regions, true, 64,
+                            ms->bc250_fit_min_pieces, &pieces);
+   radv_bc250_split_piece_primid = false;
+   if (!piece_split ||
        pieces < 2 || (owned_corners ?
           !radv_bc250_mesh_safe_owned(&mesh, &fragment, true, bary, ordinary_piece, ordinary_piece,
              device->compiler_info.key.bc250_bary_io16, ordinary_piece,

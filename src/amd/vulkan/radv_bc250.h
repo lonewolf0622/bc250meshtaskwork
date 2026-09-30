@@ -125,6 +125,8 @@ const char *radv_bc250_merge_fs_refusal(struct nir_shader *fs);
 /* Set only while radv_graphics_pipeline_init retries a pipeline every other route refused
  * (RADV_BC250_MESH_SPLIT_ANY): Mesh-only lines/points may then split. */
 extern __thread bool radv_bc250_split_refused_retry;
+/* RADV_BC250_MESH_PIECE_PRIMID: set only around the safe direct pieces split. */
+extern __thread bool radv_bc250_split_piece_primid;
 void radv_bc250_directmesh_env(void);
 bool radv_bc250_bary_cid_slot(const struct nir_shader *producer, const struct nir_shader *fs, int *slot);
 bool radv_bc250_split_mesh(struct nir_shader *mesh, struct nir_shader *task, struct nir_shader *fs, bool direct_split,
