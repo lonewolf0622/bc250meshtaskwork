@@ -231,16 +231,8 @@ bc250_dgc_state_valid(const struct radv_cmd_buffer *state, const VkGeneratedComm
        radv_bc250_chain_enabled(device) || device->bc250_split_batch_prep)
       return false;
    for (unsigned i = 0; i < MAX_BIND_POINTS; i++) {
-      if (state->descriptors[i].push_set.set.size || state->descriptors[i].valid_heaps ||
-          state->descriptors[i].dynamic_offset_count)
+      if (state->descriptors[i].valid_heaps || state->descriptors[i].dynamic_offset_count)
          return false;
-   }
-   for (unsigned i = 0; i < MAX_SETS; i++) {
-      if (state->descriptor_buffers[i])
-         return false;
-      for (unsigned j = 0; j < MAX_BIND_POINTS; j++)
-         if (state->descriptors[j].descriptor_buffers[i])
-            return false;
    }
    return true;
 }
@@ -272,6 +264,27 @@ bc250_dgc_capture(struct radv_cmd_buffer *owner, const struct radv_cmd_buffer *s
    cmd->gfx9_fence_idx = 0;
    cmd->gfx9_eop_bug_va = 0;
    cmd->upload.offset = fence_offset + 8;
+   /* Descriptor-buffer addresses are application-owned and copied with the
+    * descriptor state. Push sets instead point inside the source command
+    * buffer, and their VA normally points at that buffer's upload BO. Copy
+    * their bytes into the final arena and rebase every bound header pointer.
+    * The hybrid producer receives this same graphics state, so both compute
+    * and graphics bind the frozen push-set upload, not a preparation lifetime. */
+   bool descriptors_ok = true;
+   for (unsigned bp = 0; bp < MAX_BIND_POINTS && descriptors_ok; bp++) {
+      struct radv_descriptor_state *ds = &cmd->descriptors[bp];
+      const struct radv_descriptor_set_header *original = &state->descriptors[bp].push_set.set;
+      if (!original->size)
+         continue;
+      unsigned offset;
+      descriptors_ok = radv_cmd_buffer_upload_data(cmd, original->size, original->mapped_ptr, &offset);
+      if (!descriptors_ok)
+         break;
+      ds->push_set.set.va = cmd->bc250_dgc_upload_va + offset;
+      for (unsigned set = 0; set < MAX_SETS; set++)
+         if ((void *)ds->sets[set] == (const void *)original)
+            ds->sets[set] = (struct radv_descriptor_set *)&ds->push_set.set;
+   }
    cmd->bc250_small_arena = NULL;
    cmd->bc250_ordered_arena = 0;
    cmd->bc250_ordered_arena_size = 0;
@@ -299,7 +312,7 @@ bc250_dgc_capture(struct radv_cmd_buffer *owner, const struct radv_cmd_buffer *s
    }
    cmd->push_constant_stages = VK_SHADER_STAGE_ALL;
    cmd->cs = NULL;
-   bool ok = radv_create_cmd_stream(device, AMD_IP_GFX, false, &cmd->cs) == VK_SUCCESS;
+   bool ok = descriptors_ok && radv_create_cmd_stream(device, AMD_IP_GFX, false, &cmd->cs) == VK_SUCCESS;
    if (ok) {
       /* A capture is a single flat program. Reserve the entire bound before
        * emission; any larger program is rejected before it can be published. */
@@ -311,6 +324,34 @@ bc250_dgc_capture(struct radv_cmd_buffer *owner, const struct radv_cmd_buffer *s
       cmd->state.active_stages &= ~RADV_GRAPHICS_STAGE_BITS;
       radv_CmdBindPipeline(radv_cmd_buffer_to_handle(cmd), VK_PIPELINE_BIND_POINT_GRAPHICS,
                           radv_pipeline_to_handle(&pipeline->base));
+      const char *dump = debug_get_option("BC250_DGC_DUMP", NULL);
+      if (dump) {
+         char path[4096];
+         snprintf(path, sizeof(path), "%s/bindings-%u-%u.json", dump, layout->vk.draw_count, seq);
+         FILE *f = fopen(path, "w");
+         if (f) {
+            const struct radv_descriptor_state *ds = radv_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+            VK_FROM_HANDLE(radv_pipeline, producer, pipeline->bc250_task_pipeline);
+            const struct radv_shader *shaders[] = {pipeline->base.shaders[MESA_SHADER_MESH],
+               pipeline->base.shaders[MESA_SHADER_FRAGMENT], producer ? producer->shaders[MESA_SHADER_COMPUTE] : NULL};
+            fprintf(f, "[");
+            bool first = true;
+            for (unsigned stage = 0; stage < ARRAY_SIZE(shaders); stage++) {
+               const struct radv_shader *shader = shaders[stage];
+               if (!shader)
+                  continue;
+               u_foreach_bit(set, shader->info.user_sgprs_locs.descriptor_sets_enabled & ds->valid) {
+                  uint64_t va = ds->sets[set] ? ds->sets[set]->header.va : ds->descriptor_buffers[set];
+                  unsigned reg = shader->info.user_data_0 + shader->info.user_sgprs_locs.descriptor_sets[set].sgpr_idx * 4;
+                  fprintf(f, "%s{\"stage\":%u,\"set\":%u,\"reg\":%u,\"va\":%llu}",
+                     first ? "" : ",", stage, set, reg, (unsigned long long)va);
+                  first = false;
+               }
+            }
+            fprintf(f, "]\n");
+            fclose(f);
+         }
+      }
       const uint32_t *capture_buf = cmd->cs->b->buf;
       uint64_t records = cmd->bc250_dgc_upload_va + 4;
       uint64_t count = cmd->bc250_dgc_upload_va;

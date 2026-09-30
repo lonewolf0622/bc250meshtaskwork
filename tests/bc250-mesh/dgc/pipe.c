@@ -9,11 +9,41 @@ static VkDevice dgc_device;
 static VkPhysicalDevice dgc_physical;
 static VkPipeline dgc_pipeline;
 static int dgc_task;
+static struct {VkPipeline pipeline;VkPipelineLayout layout;int task;} dgc_pipelines[32];
+static unsigned dgc_pipeline_count;
+
 static int dgc_failed;
 static VkPipelineLayout dgc_pipeline_layout;
+static void dgc_bind_pipeline(VkCommandBuffer cb,VkPipelineBindPoint bp,VkPipeline pipeline)
+{
+   vkCmdBindPipeline(cb,bp,pipeline);
+   if(bp==VK_PIPELINE_BIND_POINT_GRAPHICS)
+      for(unsigned i=0;i<dgc_pipeline_count;i++)if(dgc_pipelines[i].pipeline==pipeline) {
+         dgc_pipeline=pipeline;dgc_pipeline_layout=dgc_pipelines[i].layout;dgc_task=dgc_pipelines[i].task;
+      }
+}
 static VkCommandBuffer dgc_preprocess[4];
 static VkCommandPool dgc_preprocess_pool[4];
 static unsigned dgc_preprocess_count;
+static VkIndirectCommandsLayoutEXT dgc_layouts[32];
+static unsigned dgc_layout_count;
+static VkPipeline dgc_compute[8];
+static unsigned dgc_compute_count;
+static VkResult dgc_create_compute(VkDevice device,VkPipelineCache cache,uint32_t n,
+   const VkComputePipelineCreateInfo *ci,const VkAllocationCallbacks *alloc,VkPipeline *pipelines)
+{
+   VkResult r=vkCreateComputePipelines(device,cache,n,ci,alloc,pipelines);
+   if(!r)for(unsigned i=0;i<n;i++){if(dgc_compute_count==8)return VK_ERROR_OUT_OF_HOST_MEMORY;dgc_compute[dgc_compute_count++]=pipelines[i];}
+   return r;
+}
+static void dgc_destroy_device(VkDevice device,const VkAllocationCallbacks *alloc)
+{
+   PFN_vkDestroyIndirectCommandsLayoutEXT destroy=(void *)vkGetDeviceProcAddr(device,"vkDestroyIndirectCommandsLayoutEXT");
+   for(unsigned i=0;i<dgc_layout_count;i++)destroy(device,dgc_layouts[i],NULL);
+   for(unsigned i=0;i<dgc_pipeline_count;i++)vkDestroyPipeline(device,dgc_pipelines[i].pipeline,NULL);
+   for(unsigned i=0;i<dgc_compute_count;i++)vkDestroyPipeline(device,dgc_compute[i],NULL);
+   vkDestroyDevice(device,alloc);
+}
 static VkResult dgc_create_device(VkPhysicalDevice pd, const VkDeviceCreateInfo *info,
                                  const VkAllocationCallbacks *alloc, VkDevice *device)
 {
@@ -43,10 +73,12 @@ static VkResult dgc_create_pipeline(VkDevice d, VkPipelineCache c, uint32_t n,
                                     const VkGraphicsPipelineCreateInfo *i, const VkAllocationCallbacks *a, VkPipeline *p)
 {
    VkResult r = vkCreateGraphicsPipelines(d,c,n,i,a,p);
-   if (!r) {
-      dgc_pipeline = p[0];dgc_pipeline_layout=i[0].layout;
-      for (unsigned stage=0;stage<i[0].stageCount;stage++)
-         dgc_task |= i[0].pStages[stage].stage == VK_SHADER_STAGE_TASK_BIT_EXT;
+   if (!r) for(unsigned index=0;index<n;index++) {
+      if(dgc_pipeline_count==32)return VK_ERROR_OUT_OF_HOST_MEMORY;
+      unsigned entry=dgc_pipeline_count++;dgc_pipelines[entry].pipeline=p[index];
+      dgc_pipelines[entry].layout=i[index].layout;
+      for (unsigned stage=0;stage<i[index].stageCount;stage++)
+         dgc_pipelines[entry].task |= i[index].pStages[stage].stage == VK_SHADER_STAGE_TASK_BIT_EXT;
    }
    return r;
 }
@@ -115,6 +147,8 @@ static void dgc_draw(VkCommandBuffer cb, int count)
       .pipelineLayout=dgc_pipeline_layout,.tokenCount=pcs?3:1,.pTokens=pcs?tokens:&token,
       .flags=getenv("DGC_PREPROCESS") ? VK_INDIRECT_COMMANDS_LAYOUT_USAGE_EXPLICIT_PREPROCESS_BIT_EXT : 0};
    VkIndirectCommandsLayoutEXT layout; CHECK(create(dgc_device,&ci,NULL,&layout));
+   if(dgc_layout_count==32){dgc_failed=1;return;}
+   dgc_layouts[dgc_layout_count++]=layout;
    VkGeneratedCommandsPipelineInfoEXT pi={.sType=VK_STRUCTURE_TYPE_GENERATED_COMMANDS_PIPELINE_INFO_EXT,.pipeline=dgc_pipeline};
    VkGeneratedCommandsMemoryRequirementsInfoEXT mi={.sType=VK_STRUCTURE_TYPE_GENERATED_COMMANDS_MEMORY_REQUIREMENTS_INFO_EXT,
       .pNext=&pi,.indirectCommandsLayout=layout,.maxSequenceCount=2,.maxDrawCount=2};
@@ -135,7 +169,13 @@ static void dgc_draw(VkCommandBuffer cb, int count)
    } else {
       words[0]=7;words[1]=1;words[2]=1;words[8]=2;words[9]=2;words[10]=1;
    }
-   if(pcs) {words[4]=11;words[12]=23;}
+   if(pcs) {
+#ifdef DGC_BINDING_FIXTURE
+      words[4]=0;words[12]=1;
+#else
+      words[4]=11;words[12]=23;
+#endif
+   }
    words[60]=2;
    VkGeneratedCommandsInfoEXT info={.sType=VK_STRUCTURE_TYPE_GENERATED_COMMANDS_INFO_EXT,.pNext=&pi,
       .shaderStages=ci.shaderStages,.indirectCommandsLayout=layout,.indirectAddress=dgc_address(stream),
@@ -183,6 +223,9 @@ static VkResult dgc_submit(VkQueue q,uint32_t n,const VkSubmitInfo *infos,VkFenc
    }
    return vkQueueSubmit(q,n,infos,f);
 }
+#define vkCreateComputePipelines dgc_create_compute
+#define vkDestroyDevice dgc_destroy_device
+#define vkCmdBindPipeline dgc_bind_pipeline
 #define vkBeginCommandBuffer dgc_begin
 #define vkQueueSubmit dgc_submit
 #define vkCreateDevice dgc_create_device
@@ -191,6 +234,10 @@ static VkResult dgc_submit(VkQueue q,uint32_t n,const VkSubmitInfo *infos,VkFenc
 #define vkAllocateMemory dgc_alloc
 #define vkGetDeviceProcAddr dgc_get_proc
 #define main ordinary_fixture
+#ifdef DGC_BINDING_FIXTURE
+#include "../fast-binding/fb.c"
+#else
 #include "../safe-direct/pipe.c"
+#endif
 #undef main
 int main(int argc,char **argv) { int r=ordinary_fixture(argc,argv);return r ? r : dgc_failed; }
