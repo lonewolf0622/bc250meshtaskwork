@@ -6903,9 +6903,10 @@ radv_flush_constants(struct radv_cmd_buffer *cmd_buffer, VkShaderStageFlags stag
             if (!fragment_va && stage == MESA_SHADER_FRAGMENT && pdev->bc250_expose_dgc &&
                 cmd_buffer->bc250_inside_mesh_draw && !cmd_buffer->state.meta.inside_meta_op) {
                const struct radv_graphics_pipeline *p = radv_bc250_mesh_pipeline(cmd_buffer);
-               if (p && p->base.shaders[MESA_SHADER_MESH]->info.ms.bc250_merge_k <= 1 &&
-                   (p->bc250_task_pipeline || p->bc250_ordered || p->bc250_direct_split_pieces ||
-                         (p->bc250_plan.flags & RADV_BC250_PLAN_SPLIT)))
+               if (p && (p->bc250_task_pipeline || p->bc250_ordered || p->bc250_direct_split_pieces ||
+                          (p->bc250_plan.flags & RADV_BC250_PLAN_SPLIT)) &&
+                   (!p->base.shaders[MESA_SHADER_MESH] ||
+                    p->base.shaders[MESA_SHADER_MESH]->info.ms.bc250_merge_k <= 1))
                   memcpy(&fragment_va, cmd_buffer->push_constants + 24, sizeof(fragment_va));
             }
             radv_emit_push_constants_per_stage(device, cs, shader, (uint32_t *)cmd_buffer->push_constants,
