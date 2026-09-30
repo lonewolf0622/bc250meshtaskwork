@@ -1247,6 +1247,10 @@ radv_device_init_compiler_info(struct radv_device *device)
             /* On by default: exact barrier total for waves without API invocations (radv_shader.h). */
             .bc250_mesh_wave_sync = pdev->bc250_native_mesh &&
                debug_get_bool_option("RADV_BC250_MESH_WAVE_SYNC", true),
+            .bc250_mesh_safe_compact = pdev->bc250_native_mesh && pdev->info.family == CHIP_GFX1013 &&
+               debug_get_bool_option("RADV_BC250_MESH_SAFE_COMPACT", false),
+            .bc250_mesh_dead_payload = pdev->bc250_native_mesh && pdev->info.family == CHIP_GFX1013 &&
+               debug_get_bool_option("RADV_BC250_MESH_DEAD_PAYLOAD", false),
          },
       /* Misc values included as part of the cache key */
       .key =

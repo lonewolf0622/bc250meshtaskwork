@@ -620,7 +620,14 @@ struct radv_compiler_info {
        * one barrier early; the extra wave then runs one barrier ahead, reads the output counts before
        * wave 0 wrote them and skips a barrier the API waves wait at (FF7 Rebirth hang, live dump). */
       uint32_t bc250_mesh_wave_sync : 1;
-      uint32_t padding : 5;
+      /* RADV_BC250_MESH_SAFE_COMPACT (with RADV_BC250_MESH_SAFE_ADAPTIVE): a workgroup whose surviving
+       * triangles, after deleting the vertices they do not reference, keep backjump <= 31 exports only
+       * those vertices, renumbered in order, and its survivors in order (ac_nir_lower_ngg_mesh). */
+      uint32_t bc250_mesh_safe_compact : 1;
+      /* RADV_BC250_MESH_DEAD_PAYLOAD: a Mesh shader that declares a task payload but never accesses
+       * it drops the declaration, so it is not treated as a payload consumer (radv_shader.c). */
+      uint32_t bc250_mesh_dead_payload : 1;
+      uint32_t padding : 3;
    } hw;
 
    /* Misc values included as part of the cache key */

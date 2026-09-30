@@ -294,6 +294,10 @@ typedef struct {
     * workgroup whose API connectivity references every vertex with backjump <= 31 exports its shared vertices and
     * every primitive without shader culling; any other workgroup exports the private corners. */
    bool bc250_safe_adaptive;
+   /* RADV_BC250_MESH_SAFE_COMPACT (with bc250_safe_adaptive): before the shared-plus-all and corner
+    * cases, a workgroup whose survivors keep backjump <= 31 once the vertices they do not reference
+    * are deleted exports only the referenced vertices, renumbered in increasing order. */
+   bool bc250_safe_compact;
    bool bc250_safe_bary;
    bool bc250_safe_stats;
    bool bc250_safe_parallel;

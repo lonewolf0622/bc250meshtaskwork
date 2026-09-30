@@ -837,6 +837,34 @@ radv_shader_spirv_to_nir(const struct radv_compiler_info *compiler_info, struct 
       if (nir->info.stage == MESA_SHADER_TASK || nir->info.stage == MESA_SHADER_MESH)
          var_modes |= nir_var_mem_task_payload;
 
+      /* RADV_BC250_MESH_DEAD_PAYLOAD: with no access at all, the payload declaration has no effect.
+       * Dropping only some unused variables would move the others, so it is all or nothing. */
+      bool declared = false;
+      nir_foreach_variable_with_modes (var, nir, nir_var_mem_task_payload)
+         declared = true;
+      if (compiler_info->hw.bc250_mesh_dead_payload && nir->info.stage == MESA_SHADER_MESH && declared) {
+         bool accessed = false;
+         nir_foreach_function_impl (impl, nir) {
+            nir_foreach_block (block, impl) {
+               nir_foreach_instr (instr, block) {
+                  if (instr->type == nir_instr_type_deref &&
+                      nir_deref_mode_may_be(nir_instr_as_deref(instr), nir_var_mem_task_payload))
+                     accessed = true;
+                  else if (instr->type == nir_instr_type_intrinsic &&
+                           (nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_task_payload ||
+                            nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_store_task_payload))
+                     accessed = true;
+               }
+            }
+         }
+         if (!accessed) {
+            nir_foreach_variable_with_modes_safe (var, nir, nir_var_mem_task_payload)
+               exec_node_remove(&var->node);
+            if (getenv("BC250_TRACE_COMPILE"))
+               fprintf(stderr, "BC250 MESH DEAD PAYLOAD: unused task payload declaration dropped\n");
+         }
+      }
+
       NIR_PASS(_, nir, nir_opt_shared_vars_to_subgroup, 1, nir->info.max_subgroup_size);
 
       NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, var_modes, shared_var_info);
@@ -1090,6 +1118,7 @@ radv_lower_ngg(const struct radv_compiler_info *compiler_info, struct radv_shade
        * it needs neither coverage checks nor the general W31 planner. */
       options.bc250_safe_adaptive = options.bc250_safe_corners && compiler_info->key.bc250_mesh_safe_adaptive &&
          !ngg_stage->bc250_safe_owned;
+      options.bc250_safe_compact = options.bc250_safe_adaptive && compiler_info->hw.bc250_mesh_safe_compact;
       options.bc250_safe_fast |= options.bc250_safe_corners;
       options.bc250_safe_local = options.bc250_safe_fast &&
          ((compiler_info->key.bc250_mesh_direct_read & RADV_BC250_MESH_SAFE_LOCAL_KEY) || options.bc250_safe_corners);
@@ -1139,6 +1168,7 @@ radv_lower_ngg(const struct radv_compiler_info *compiler_info, struct radv_shade
          options.bc250_safe_check = false;
          options.bc250_safe_corners = false;
          options.bc250_safe_adaptive = false;
+         options.bc250_safe_compact = false;
          options.bc250_safe_parallel = false;
          if (getenv("BC250_TRACE_COMPILE"))
             fprintf(stderr, "BC250 MESH SAFE BARY TINY: proven private connectivity, no remap\n");
