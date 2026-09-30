@@ -14,8 +14,11 @@ def run(args,log,env=base):
 run(['cc','-O1','-Wall','-DDGC_BINDING_FIXTURE','-o',out/'binding-pipe',src/'tests/bc250-mesh/dgc/pipe.c','-lvulkan'],'binding-build.log')
 run(['python3',src/'tests/bc250-mesh/dgc/build_oracle.py',out/'oracle'],'binding-oracle-build.log')
 fb=src/'tests/bc250-mesh/fast-binding'
+mesh_source=out/'binding.mesh'
+mesh_source.write_text((fb/'fb.mesh').read_text().replace('uint g = gl_WorkGroupID.x + pc.base + gl_DrawID;',
+ '#if TASK\n  uint g = gl_WorkGroupID.x + pc.base;\n#else\n  uint g = gl_WorkGroupID.x + pc.base + gl_DrawID;\n#endif'))
 for name,defs in [('small',{'WS':64,'NV':64,'NP':64}),('nanite',{'WS':128,'NV':256,'NP':128,'PERPRIM':1}),('tsmall',{'WS':64,'NV':64,'NP':64,'TASK':1}),('tnanite',{'WS':128,'NV':256,'NP':128,'PERPRIM':1,'TASK':1})]:
- run(['glslangValidator','--target-env','vulkan1.3','-S','mesh',*[f'-D{k}={v}' for k,v in defs.items()],'-o',out/(name+'.mesh.spv'),fb/'fb.mesh'],name+'-build.log')
+ run(['glslangValidator','--target-env','vulkan1.3','-S','mesh',*[f'-D{k}={v}' for k,v in defs.items()],'-o',out/(name+'.mesh.spv'),mesh_source],name+'-build.log')
 for stage in ('frag','task','comp','vert'):
  run(['glslangValidator','--target-env','vulkan1.3','-S',stage,'-o',out/('fb.'+stage+'.spv'),fb/('fb.'+stage)],stage+'-build.log')
 run(['glslangValidator','--target-env','vulkan1.3','-S','frag','-DPERPRIM=1','-o',out/'fbpp.frag.spv',fb/'fb.frag'],'frag-perprim-build.log')

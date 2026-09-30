@@ -124,7 +124,7 @@ int main(int argc,char **argv)
       for(unsigned seq_count : {0u,1u,p.sequences,p.sequences+7}) {
          set(token,p.count-p.stream,seq_count);
          for(unsigned draw_count : {0u,1u,p.records,p.records+7}) {
-            if(count){set(token,12,draw_count);set(token,44,draw_count);}
+            if(count){set(token,pcs?20:12,draw_count);set(token,pcs?52:44,draw_count);}
             std::vector<uint8_t> dst(src.size()+256,0xA5);
             bc250_dgc_nir_interpreter interp(s);
             interp.push_constants.resize(sizeof(p));memcpy(interp.push_constants.data(),&p,sizeof(p));
@@ -141,14 +141,14 @@ int main(int argc,char **argv)
                check(get(dst,base+p.code)==(active?n:0),"count or sequence clamp differs");
                for(unsigned record=0;record<p.records;record++)for(unsigned c=0;c<3;c++) {
                   bool valid=active && (count ? record<n : record==seq);
-                  uint32_t expected=valid ? get(token,(count?64+record*16:seq*32)+c*4):0;
+                  uint32_t expected=valid ? get(token,(count?64+record*16:seq*32+(pcs?8:0))+c*4):0;
                   check(get(dst,base+p.code+4+record*12+c*4)==expected,"DrawID/grid record differs");
                }
                size_t skip=4+p.records*12;
                if(pcs) {
                   size_t app=(skip+15)&~15u;
                   for(unsigned word=0;word<64;word++) {
-                     uint32_t expected=word==0 ? get(token,seq*32+16) : word==1 ? seq : get(src,base+p.code+app+word*4);
+                     uint32_t expected=word==0 ? get(token,seq*32) : word==1 ? seq : get(src,base+p.code+app+word*4);
                      check(get(dst,base+p.code+app+word*4)==expected,"push constant/sequence index differs");
                   }
                   skip=app+256;

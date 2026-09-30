@@ -73,8 +73,13 @@ static VkResult dgc_create_device(VkPhysicalDevice pd, const VkDeviceCreateInfo 
    const char *extensions[16];
    for (uint32_t i = 0; i < ci.enabledExtensionCount; i++) extensions[i] = ci.ppEnabledExtensionNames[i];
    extensions[ci.enabledExtensionCount++] = VK_EXT_DEVICE_GENERATED_COMMANDS_EXTENSION_NAME;
+   int has_maintenance5=0;
+   for(uint32_t i=0;i<ci.enabledExtensionCount;i++)has_maintenance5|=!strcmp(extensions[i],VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+   if(!has_maintenance5)extensions[ci.enabledExtensionCount++]=VK_KHR_MAINTENANCE_5_EXTENSION_NAME;
    if(getenv("DGC_CONDITIONAL"))extensions[ci.enabledExtensionCount++]=VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
    ci.ppEnabledExtensionNames = extensions;
+   VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR,
+      .pNext=feature.pNext,.maintenance5=1};feature.pNext=&maintenance5;
    ci.pNext = &feature;
    VkPhysicalDeviceConditionalRenderingFeaturesEXT conditional={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT,
       .pNext=&feature,.conditionalRendering=1};
@@ -193,14 +198,15 @@ static void dgc_draw(VkCommandBuffer cb, int count)
    PFN_vkCmdExecuteGeneratedCommandsEXT execute=(void *)vkGetDeviceProcAddr(dgc_device,"vkCmdExecuteGeneratedCommandsEXT");
    if(!create||!requirements||!execute) {dgc_failed=1;return;}
    VkIndirectCommandsLayoutTokenEXT token={.sType=VK_STRUCTURE_TYPE_INDIRECT_COMMANDS_LAYOUT_TOKEN_EXT,
-      .type=count ? VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_MESH_TASKS_COUNT_EXT : VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_MESH_TASKS_EXT};
+      .type=count ? VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_MESH_TASKS_COUNT_EXT : VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_MESH_TASKS_EXT,
+      .offset=getenv("DGC_PUSH_CONSTANTS")?8:0};
    VkIndirectCommandsPushConstantTokenEXT pc={.updateRange={VK_SHADER_STAGE_ALL,0,4}};
    VkIndirectCommandsPushConstantTokenEXT sequence={.updateRange={VK_SHADER_STAGE_ALL,4,4}};
    VkIndirectCommandsLayoutTokenEXT tokens[3]={
       {.sType=VK_STRUCTURE_TYPE_INDIRECT_COMMANDS_LAYOUT_TOKEN_EXT,.type=VK_INDIRECT_COMMANDS_TOKEN_TYPE_PUSH_CONSTANT_EXT,
-       .offset=16,.data.pPushConstant=&pc},
+       .offset=0,.data.pPushConstant=&pc},
       {.sType=VK_STRUCTURE_TYPE_INDIRECT_COMMANDS_LAYOUT_TOKEN_EXT,.type=VK_INDIRECT_COMMANDS_TOKEN_TYPE_SEQUENCE_INDEX_EXT,
-       .offset=20,.data.pPushConstant=&sequence}, token};
+       .offset=4,.data.pPushConstant=&sequence}, token};
    int pcs=getenv("DGC_PUSH_CONSTANTS")!=NULL;
    VkIndirectCommandsLayoutCreateInfoEXT ci={.sType=VK_STRUCTURE_TYPE_INDIRECT_COMMANDS_LAYOUT_CREATE_INFO_EXT,
       .shaderStages=VK_SHADER_STAGE_MESH_BIT_EXT|VK_SHADER_STAGE_FRAGMENT_BIT|
@@ -243,20 +249,21 @@ static void dgc_draw(VkCommandBuffer cb, int count)
    dgc_buffer(mr.memoryRequirements.size,mr.memoryRequirements.memoryTypeBits,&output,&om,&out); if(dgc_failed)return;
    memset(map,0,stream_bytes);
    uint32_t *words=map;
+   unsigned draw_offset=pcs?2:0;
    if(count) {
       for(unsigned seq=0;seq<2;seq++) {
          uint64_t va=dgc_address(stream)+64;
-         memcpy(words+seq*8,&va,8);words[seq*8+2]=16;words[seq*8+3]=draws;
+         memcpy(words+seq*8+draw_offset,&va,8);words[seq*8+draw_offset+2]=16;words[seq*8+draw_offset+3]=draws;
       }
       for(unsigned draw=0;draw<draws;draw++){words[16+draw*4]=3+draw;words[17+draw*4]=1;words[18+draw*4]=1;}
    } else {
-      words[0]=7;words[1]=1;words[2]=1;words[8]=2;words[9]=2;words[10]=1;
+      words[draw_offset]=7;words[draw_offset+1]=1;words[draw_offset+2]=1;words[draw_offset+8]=2;words[draw_offset+9]=2;words[draw_offset+10]=1;
    }
    if(pcs) {
 #ifdef DGC_BINDING_FIXTURE
-      words[4]=0;words[12]=1;
+      words[0]=0;words[8]=1;
 #else
-      words[4]=11;words[12]=23;
+      words[0]=11;words[8]=23;
 #endif
    }
    words[count_offset/4]=sequences;

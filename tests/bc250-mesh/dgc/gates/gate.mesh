@@ -1,0 +1,35 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x=32) in;
+layout(triangles,max_vertices=3,max_primitives=1) out;
+#if DB
+layout(set=0,binding=0,std430) readonly buffer Resource { uint words[]; } heap_data;
+layout(set=1,binding=0,std140) uniform Root { uint value; } root;
+layout(push_constant) uniform Constants { uint value; } constants;
+#endif
+#if TASK
+struct Payload { uint marker; uint draw; };
+taskPayloadSharedEXT Payload payload;
+#endif
+void main() {
+ SetMeshOutputsEXT(3,1);
+ uint i=gl_LocalInvocationIndex;
+ if(i<3) {
+  vec2 p[3]=vec2[](vec2(-0.7,-0.7),vec2(0.7,-0.7),vec2(0,0.7));
+  vec2 position=p[i];
+#if MANY
+  uint draw=payload.draw;
+  position=position/8.0+vec2(float(draw%8u)+0.5,float(draw/8u)+0.5)/4.0-1.0;
+#endif
+  gl_MeshVerticesEXT[i].gl_Position=vec4(position,0,1);
+#if TASK
+#if DB
+  if(payload.marker!=31u+payload.draw || heap_data.words[0]+root.value+constants.value!=31u)
+#else
+  if(payload.marker!=1u+payload.draw)
+#endif
+   gl_MeshVerticesEXT[i].gl_Position=vec4(2,2,0,1);
+#endif
+ }
+ if(i==0) gl_PrimitiveTriangleIndicesEXT[0]=uvec3(0,1,2);
+}
