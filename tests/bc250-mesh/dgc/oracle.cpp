@@ -32,7 +32,10 @@ static void pm4(const std::vector<uint8_t> &v,size_t begin,size_t bytes,bool tas
       uint32_t h=get(v,off);check((h>>30)==3 || (h>>30)==2,"invalid PM4 header");
       unsigned len=(h==PKT3_NOP_PAD || (h>>30)==2) ? 1 : ((h>>16)&0x3fff)+2;
       check(off+len*4<=begin+bytes,"packet crosses program boundary");
+      if(task)check((off-begin)%1048576+len*4<=1048576,"packet crosses Task IB boundary");
       unsigned op=(h>>8)&255;
+      if(task && op==PKT3_COND_EXEC)
+         check((off-begin)%1048576+(len+get(v,off+(len-1)*4))*4<=1048576,"conditional execution crosses Task IB boundary");
       if(op==PKT3_DISPATCH_INDIRECT || op==PKT3_DISPATCH_DIRECT) {
          dispatch++;producer=true;producer_flush=false;producer_acquire=false;
       }
@@ -56,6 +59,43 @@ static void pm4(const std::vector<uint8_t> &v,size_t begin,size_t bytes,bool tas
       check(flush>=1024*draws,"missing producer/consumer flushes");
    }
 }
+static void task_count(const std::vector<uint8_t> &v,const params &p,unsigned seq,const std::string &dir)
+{
+   size_t base=size_t(seq)*p.stride, templ=p.code-1048576;
+   check(templ==size_t(p.records)*131072,"incorrect reusable Task shape");
+   auto sites=read(dir+"/task-uploads-"+std::to_string(seq)+".bin");
+   check(sites.size() && sites.size()%4==0 && sites.size()/4<=2050,"invalid typed Task upload list");
+   for(unsigned draw=0;draw<p.records;draw++) {
+      unsigned writes=0,calls=0;bool drain=false,acquire=false,sync=false;
+      for(size_t off=base+size_t(draw)*131072;off<base+size_t(draw+1)*131072;) {
+         uint32_t h=get(v,off);unsigned len=(h==PKT3_NOP_PAD || h>>30==2)?1:((h>>16)&0x3fff)+2;
+         check(off+len*4<=base+size_t(draw+1)*131072,"patch crosses IB boundary");unsigned op=h>>8&255;
+         if(op==PKT3_EVENT_WRITE && (get(v,off+4)&63)==V_028A90_CS_PARTIAL_FLUSH)drain=true;
+         if(op==PKT3_WRITE_DATA) {
+            check(drain && len==9,"constant write lacks drain or wrong size");
+            check(writes<sites.size()/4,"unexpected private write");
+            uint64_t va=uint64_t(get(v,off+8))|(uint64_t(get(v,off+12))<<32);
+            unsigned offset=get(sites,writes*4);
+            check(va==p.output+base+p.code+offset+20,"patch writes outside typed constants");
+            check(get(v,off+16)==draw,"patched DrawID differs");
+            check(get(v,off+20)==get(v,base+p.code+offset+24) && get(v,off+24)==get(v,base+p.code+offset+28),"application constants pointer changed");
+            uint64_t input=uint64_t(get(v,off+28))|(uint64_t(get(v,off+32))<<32);
+            check(input==p.output+base+p.code+4+draw*12,"patched input differs");writes++;
+         }
+         if(op==PKT3_ACQUIRE_MEM && writes==sites.size()/4)acquire=true;
+         if(op==PKT3_PFP_SYNC_ME && acquire)sync=true;
+         if(op==PKT3_INDIRECT_BUFFER) {
+            check(writes==sites.size()/4 && drain && acquire && sync,"template call precedes publication");
+            uint64_t va=uint64_t(get(v,off+4))|(uint64_t(get(v,off+8))<<32);
+            check(va==p.output+base+templ && (get(v,off+12)&0xfffff)==1048576/4,"wrong template IB");calls++;
+            check(get(v,off+12)&S_3F3_CHAIN(1),"template nests an unsupported IB3");
+         }
+         off+=len*4;
+      }
+      check(calls==1 && writes==sites.size()/4,"incomplete Task patch/call");
+   }
+   pm4(v,base+templ,1048576,true,1);
+}
 int main(int argc,char **argv)
 {
    try {
@@ -76,7 +116,7 @@ int main(int argc,char **argv)
       nir_lower_vars_to_ssa(s);nir_opt_dce(s);nir_index_ssa_defs(nir_shader_get_entrypoint(s));
       nir_validate_shader(s,"DGC CPU oracle input");
       for(unsigned seq_count : {0u,1u,p.sequences,p.sequences+7}) {
-         set(token,240,seq_count);
+         set(token,p.count-p.stream,seq_count);
          for(unsigned draw_count : {0u,1u,p.records,p.records+7}) {
             if(count){set(token,12,draw_count);set(token,44,draw_count);}
             std::vector<uint8_t> dst(src.size()+256,0xA5);
@@ -88,7 +128,8 @@ int main(int argc,char **argv)
                size_t base=size_t(seq)*p.stride;bool active=seq<std::min(seq_count,p.sequences);
                if(active) {
                   check(!memcmp(dst.data()+base,src.data()+base,p.code),"generated PM4 differs from ordinary capture");
-                  pm4(dst,base,p.code,task,count?p.records:1);
+                  if(task && count)task_count(dst,p,seq,dir);
+                  else pm4(dst,base,p.code,task,1);
                } else for(size_t i=0;i<p.code;i+=4)check(get(dst,base+i)==PKT3_NOP_PAD,"inactive sequence executes commands");
                unsigned n=count ? std::min(draw_count,p.records) : seq+1;
                check(get(dst,base+p.code)==(active?n:0),"count or sequence clamp differs");

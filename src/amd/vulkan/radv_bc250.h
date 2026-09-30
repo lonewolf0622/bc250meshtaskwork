@@ -12,7 +12,7 @@ VkResult radv_bc250_prepare_task(struct radv_device *device,
                                 struct radv_graphics_pipeline *pipeline,
                                 const struct radv_graphics_pipeline_state *gfx_state);
 void radv_bc250_draw_task_dgc(struct radv_cmd_buffer *cmd_buffer, uint64_t input,
-                              uint64_t count, uint32_t draw_id);
+                              uint64_t count, uint32_t draw_id, uint64_t *scratch);
 void radv_bc250_draw_task(struct radv_cmd_buffer *cmd_buffer,
                          uint32_t x, uint32_t y, uint32_t z);
 void radv_bc250_draw_task_indirect(struct radv_cmd_buffer *cmd_buffer, uint64_t address,

@@ -22,9 +22,10 @@
 #define BC250_DGC_MAX_BYTES (1u << 30)
 #define BC250_DGC_CODE_MESH 65536u
 #define BC250_DGC_CODE_TASK 1048576u
+#define BC250_DGC_CODE_PATCH 131072u
 
 struct bc250_dgc_shape {
-   uint32_t records, code, data, stride;
+   uint32_t records, code, data, stride, segments, segment_code, template_offset;
    uint64_t size;
    bool task;
 };
@@ -72,21 +73,25 @@ bc250_dgc_shape(const struct radv_indirect_command_layout *layout, const void *n
    if (!s->records || s->records > 4096)
       return false;
    uint64_t draws = layout->vk.draw_count ? s->records : 1;
-   uint64_t code = s->task ? draws * BC250_DGC_CODE_TASK : BC250_DGC_CODE_MESH;
+   bool reuse = s->task && layout->vk.draw_count;
+   uint64_t code = s->task ? BC250_DGC_CODE_TASK + (reuse ? draws * BC250_DGC_CODE_PATCH : 0) : BC250_DGC_CODE_MESH;
    /* Every capture upload, record table and payload is preprocess-owned.
     * The upload margin covers all 1024 chunk constants and descriptor tables.
     * Task count draws reuse the ordinary shared scratch allocation. */
    uint64_t data = 65536u + (uint64_t)s->records * 32;
    if (s->task)
-      data += draws * 1048576u + 4096ull * p->bc250_payload_stride;
+      data += 1048576u + 4096ull * p->bc250_payload_stride;
    uint64_t stride = align64(code + data, 256);
-   if (code / 4 >= (1u << 20) || stride > BC250_DGC_MAX_BYTES ||
+   if (stride > BC250_DGC_MAX_BYTES ||
        stride * sequences > BC250_DGC_MAX_BYTES)
       return false;
    s->code = code;
    s->data = stride - code;
    s->stride = stride;
    s->size = stride * sequences;
+   s->segments = s->task ? draws : 1;
+   s->segment_code = reuse ? BC250_DGC_CODE_PATCH : s->code;
+   s->template_offset = reuse ? draws * BC250_DGC_CODE_PATCH : 0;
    return true;
 }
 
@@ -285,6 +290,10 @@ bc250_dgc_capture(struct radv_cmd_buffer *owner, const struct radv_cmd_buffer *s
          if ((void *)ds->sets[set] == (const void *)original)
             ds->sets[set] = (struct radv_descriptor_set *)&ds->push_set.set;
    }
+   cmd->bc250_dgc_task_uploads = NULL;
+   if (shape->template_offset)
+      cmd->bc250_dgc_task_uploads = calloc(1, sizeof(*cmd->bc250_dgc_task_uploads));
+   descriptors_ok &= !shape->template_offset || cmd->bc250_dgc_task_uploads;
    cmd->bc250_small_arena = NULL;
    cmd->bc250_ordered_arena = 0;
    cmd->bc250_ordered_arena_size = 0;
@@ -314,9 +323,10 @@ bc250_dgc_capture(struct radv_cmd_buffer *owner, const struct radv_cmd_buffer *s
    cmd->cs = NULL;
    bool ok = descriptors_ok && radv_create_cmd_stream(device, AMD_IP_GFX, false, &cmd->cs) == VK_SUCCESS;
    if (ok) {
-      /* A capture is a single flat program. Reserve the entire bound before
-       * emission; any larger program is rejected before it can be published. */
-      radeon_check_space(device->ws, cmd->cs->b, shape->code / 4);
+      /* Each Task draw is a separate IB. No packet or local COND_EXEC spans
+       * that boundary. Private constants remain unique; scratch is shared
+       * using the ordinary backend's consumer drains between count draws. */
+      radeon_check_space(device->ws, cmd->cs->b, (shape->task ? BC250_DGC_CODE_TASK : shape->code) / 4);
       struct radv_graphics_pipeline *pipeline = cmd->state.graphics_pipeline;
       cmd->state.graphics_pipeline = NULL;
       radv_foreach_stage(stage, RADV_GRAPHICS_STAGE_BITS)
@@ -355,48 +365,113 @@ bc250_dgc_capture(struct radv_cmd_buffer *owner, const struct radv_cmd_buffer *s
       const uint32_t *capture_buf = cmd->cs->b->buf;
       uint64_t records = cmd->bc250_dgc_upload_va + 4;
       uint64_t count = cmd->bc250_dgc_upload_va;
-      if (shape->task && !layout->vk.draw_count) {
-         radv_bc250_draw_task_dgc(cmd, records + (uint64_t)seq * 12, count, seq);
-      } else {
-         VkDrawIndirectCount2InfoKHR draw = {
-            .sType = VK_STRUCTURE_TYPE_DRAW_INDIRECT_COUNT_2_INFO_KHR,
-            .addressRange = {.address = records, .size = (uint64_t)shape->records * 12, .stride = 12},
-            .countAddressRange = {.address = count, .size = 4},
-            .maxDrawCount = layout->vk.draw_count ? shape->records : seq + 1,
-         };
-         radv_CmdDrawMeshTasksIndirectCount2EXT(radv_cmd_buffer_to_handle(cmd), &draw);
+      uint64_t scratch = 0;
+      {
+         unsigned template_code = shape->task ? BC250_DGC_CODE_TASK : shape->code;
+         if (shape->task) {
+            unsigned draw_id = layout->vk.draw_count ? 0 : seq;
+            radv_bc250_draw_task_dgc(cmd, records + (uint64_t)draw_id * 12, count, draw_id, &scratch);
+         } else {
+            VkDrawIndirectCount2InfoKHR draw = {
+               .sType = VK_STRUCTURE_TYPE_DRAW_INDIRECT_COUNT_2_INFO_KHR,
+               .addressRange = {.address = records, .size = (uint64_t)shape->records * 12, .stride = 12},
+               .countAddressRange = {.address = count, .size = 4},
+               .maxDrawCount = layout->vk.draw_count ? shape->records : seq + 1,
+            };
+            radv_CmdDrawMeshTasksIndirectCount2EXT(radv_cmd_buffer_to_handle(cmd), &draw);
+         }
+         /* Preserve the ordinary helper's deferred post-consumer flush, including
+          * readers that must finish before this preprocess region is reused. */
+         radv_emit_cache_flush(cmd);
+         ok = !vk_command_buffer_has_error(&cmd->vk) && cmd->cs->b->buf == capture_buf &&
+              cmd->cs->b->cdw * 4 <= template_code &&
+              (!cmd->bc250_dgc_task_uploads || !cmd->bc250_dgc_task_uploads->overflow) &&
+              cmd->upload.offset <= shape->data && !cmd->gang.cs;
+         if (!ok && dump)
+            fprintf(stderr, "BC250 DGC capture refused: words=%u code=%u uploads=%u data=%u sites=%u overflow=%u moved=%u\n",
+               cmd->cs->b->cdw, template_code, cmd->upload.offset, shape->data,
+               cmd->bc250_dgc_task_uploads ? cmd->bc250_dgc_task_uploads->count : 0,
+               cmd->bc250_dgc_task_uploads ? cmd->bc250_dgc_task_uploads->overflow : 0,
+               cmd->cs->b->buf != capture_buf);
+         if (ok) {
+            uint8_t *program = snapshot + shape->template_offset;
+            memcpy(program, cmd->cs->b->buf, cmd->cs->b->cdw * 4);
+            uint32_t *padding = (uint32_t *)program;
+            for (uint32_t i = cmd->cs->b->cdw; i < template_code / 4; i++)
+               padding[i] = PKT3_NOP_PAD;
+            /* Transfer residency only: an unfinalized capture has no IB buffers.
+             * The winsys copies its residency list and no executable commands. */
+            device->ws->cs_execute_secondary(owner->cs->b, cmd->cs->b, false);
+            owner->queue_state.shader_upload_seq = MAX2(owner->queue_state.shader_upload_seq, cmd->queue_state.shader_upload_seq);
+            owner->queue_state.compute_scratch_size_per_wave_needed = MAX2(owner->queue_state.compute_scratch_size_per_wave_needed,
+               cmd->queue_state.compute_scratch_size_per_wave_needed);
+            owner->queue_state.compute_scratch_waves_wanted = MAX2(owner->queue_state.compute_scratch_waves_wanted,
+               cmd->queue_state.compute_scratch_waves_wanted);
+            owner->queue_state.scratch_size_per_wave_needed = MAX2(owner->queue_state.scratch_size_per_wave_needed,
+               cmd->queue_state.scratch_size_per_wave_needed);
+            owner->queue_state.scratch_waves_wanted = MAX2(owner->queue_state.scratch_waves_wanted, cmd->queue_state.scratch_waves_wanted);
+            owner->queue_state.gds_needed |= cmd->queue_state.gds_needed;
+            owner->queue_state.mesh_scratch_ring_needed |= cmd->queue_state.mesh_scratch_ring_needed;
+            owner->queue_state.esgs_ring_size_needed = MAX2(owner->queue_state.esgs_ring_size_needed, cmd->queue_state.esgs_ring_size_needed);
+            owner->queue_state.gsvs_ring_size_needed = MAX2(owner->queue_state.gsvs_ring_size_needed, cmd->queue_state.gsvs_ring_size_needed);
+         }
+         cmd->cs->b->cdw = 0;
       }
-      /* Preserve the ordinary helper's deferred post-consumer flush, including
-       * readers that must finish before this preprocess region is reused. */
-      radv_emit_cache_flush(cmd);
-      ok = !vk_command_buffer_has_error(&cmd->vk) && cmd->cs->b->buf == capture_buf &&
-           cmd->cs->b->cdw * 4 <= shape->code &&
-           cmd->upload.offset <= shape->data && !cmd->gang.cs;
-      if (ok) {
-         memcpy(snapshot, cmd->cs->b->buf, cmd->cs->b->cdw * 4);
-         uint32_t *padding = (uint32_t *)snapshot;
-         for (uint32_t i = cmd->cs->b->cdw; i < shape->code / 4; i++)
-            padding[i] = PKT3_NOP_PAD;
-         /* Transfer residency only: an unfinalized capture has no IB buffers.
-          * The winsys copies its residency list and no executable commands. */
-         device->ws->cs_execute_secondary(owner->cs->b, cmd->cs->b, false);
-         owner->queue_state.shader_upload_seq = MAX2(owner->queue_state.shader_upload_seq, cmd->queue_state.shader_upload_seq);
-         owner->queue_state.compute_scratch_size_per_wave_needed = MAX2(owner->queue_state.compute_scratch_size_per_wave_needed,
-            cmd->queue_state.compute_scratch_size_per_wave_needed);
-         owner->queue_state.compute_scratch_waves_wanted = MAX2(owner->queue_state.compute_scratch_waves_wanted,
-            cmd->queue_state.compute_scratch_waves_wanted);
-         owner->queue_state.scratch_size_per_wave_needed = MAX2(owner->queue_state.scratch_size_per_wave_needed,
-            cmd->queue_state.scratch_size_per_wave_needed);
-         owner->queue_state.scratch_waves_wanted = MAX2(owner->queue_state.scratch_waves_wanted, cmd->queue_state.scratch_waves_wanted);
-         owner->queue_state.gds_needed |= cmd->queue_state.gds_needed;
-         owner->queue_state.mesh_scratch_ring_needed |= cmd->queue_state.mesh_scratch_ring_needed;
-         owner->queue_state.esgs_ring_size_needed = MAX2(owner->queue_state.esgs_ring_size_needed, cmd->queue_state.esgs_ring_size_needed);
-         owner->queue_state.gsvs_ring_size_needed = MAX2(owner->queue_state.gsvs_ring_size_needed, cmd->queue_state.gsvs_ring_size_needed);
+      if (ok && shape->template_offset) {
+         ok = cmd->bc250_dgc_task_uploads->count >= 1025;
+         for (unsigned u = 0; u < cmd->bc250_dgc_task_uploads->count && ok; u++) {
+            unsigned offset = cmd->bc250_dgc_task_uploads->offsets[u];
+            const uint32_t *pc = (const uint32_t *)(snapshot + shape->code + offset);
+            ok = offset + 72 <= shape->data && pc[5] == 0 &&
+                 ((uint64_t)pc[8] | (uint64_t)pc[9] << 32) == records &&
+                 ((uint64_t)pc[10] | (uint64_t)pc[11] << 32) == count;
+         }
+         /* Each patch is bounded and calls the same immutable ordinary IB.
+          * A full drain precedes writes into constants read by the last draw;
+          * publish CP writes before either inline SGPR loads or shader loads.
+          * Descriptor tables, application constants and chunk coordinates
+          * keep their captured values. Only DrawID and input change. */
+         for (unsigned draw = 0; draw < shape->segments && ok; draw++) {
+            cmd->cs->b->cdw = 0;
+            cmd->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_VS_PARTIAL_FLUSH |
+               RADV_CMD_FLAG_PS_PARTIAL_FLUSH | RADV_CMD_FLAG_WB_L2;
+            radv_emit_cache_flush(cmd);
+            for (unsigned u = 0; u < cmd->bc250_dgc_task_uploads->count; u++) {
+               unsigned offset = cmd->bc250_dgc_task_uploads->offsets[u];
+               const uint32_t *original = (const uint32_t *)(snapshot + shape->code + offset);
+               uint64_t input = records + (uint64_t)draw * 12;
+               uint32_t patch[] = {draw, original[6], original[7], input, input >> 32};
+               radv_cs_write_data(device, cmd->cs, V_371_MICRO_ENGINE,
+                  cmd->bc250_dgc_upload_va + offset + 20, ARRAY_SIZE(patch), patch, false);
+            }
+            cmd->state.flush_bits |= RADV_CMD_FLAG_INV_L2 | RADV_CMD_FLAG_INV_SCACHE | RADV_CMD_FLAG_INV_VCACHE;
+            radv_emit_cache_flush(cmd);
+            ac_emit_cp_pfp_sync_me(cmd->cs->b, false);
+            /* Tail-chain at IB2 rather than nesting an unsupported IB3. The
+             * original IB1 return address is retained by CHAIN. */
+            ac_emit_cp_indirect_buffer(cmd->cs->b, info->preprocessAddress + (uint64_t)seq * shape->stride +
+               shape->template_offset, BC250_DGC_CODE_TASK / 4, AC_CP_INDIRECT_BUFFER_CHAIN, false);
+            ok = cmd->cs->b->buf == capture_buf && cmd->cs->b->cdw * 4 <= shape->segment_code &&
+                 !vk_command_buffer_has_error(&cmd->vk);
+            if (ok) {
+               uint32_t *program = (uint32_t *)(snapshot + (uint64_t)draw * shape->segment_code);
+               memcpy(program, capture_buf, cmd->cs->b->cdw * 4);
+               for (unsigned i = cmd->cs->b->cdw; i < shape->segment_code / 4; i++)
+                  program[i] = PKT3_NOP_PAD;
+            }
+         }
+         if (dump) {
+            char path[4096];
+            snprintf(path, sizeof(path), "%s/task-uploads-%u.bin", dump, seq);
+            FILE *f = fopen(path, "wb");
+            if (f) { fwrite(cmd->bc250_dgc_task_uploads->offsets, sizeof(uint32_t), cmd->bc250_dgc_task_uploads->count, f); fclose(f); }
+         }
       }
       radv_destroy_cmd_stream(device, cmd->cs);
    }
    _mesa_set_fini(&cmd->vs_prologs, NULL);
    _mesa_set_fini(&cmd->ps_epilogs, NULL);
+   free(cmd->bc250_dgc_task_uploads);
    free(cmd);
    return ok;
 }
@@ -511,9 +586,11 @@ radv_bc250_dgc_execute(struct radv_cmd_buffer *cmd, VkBool32 preprocessed, const
    radv_emit_cache_flush(cmd);
    ac_emit_cp_pfp_sync_me(cmd->cs->b, false);
    for (uint32_t seq = 0; seq < info->maxSequenceCount; seq++) {
-      radeon_check_space(device->ws, cmd->cs->b, 4);
-      device->ws->cs_chain_dgc_ib(cmd->cs->b, info->preprocessAddress + (uint64_t)seq * shape.stride,
-                                 shape.code / 4, 0, false);
+      for (uint32_t segment = 0; segment < shape.segments; segment++) {
+         radeon_check_space(device->ws, cmd->cs->b, 4);
+         device->ws->cs_chain_dgc_ib(cmd->cs->b, info->preprocessAddress + (uint64_t)seq * shape.stride +
+                                    (uint64_t)segment * shape.segment_code, shape.segment_code / 4, 0, false);
+      }
    }
    /* Captured helper dispatches and indirect draws change tracked registers.
     * Require the next ordinary draw/dispatch to re-emit all affected state. */

@@ -6827,11 +6827,19 @@ radv_upload_push_constants(struct radv_cmd_buffer *cmd_buffer, const struct radv
 {
    unsigned offset;
    void *ptr;
+   unsigned size = cmd_buffer->bc250_dgc_task_uploads ? MAX2(pc_state->size, 72) : pc_state->size;
 
-   if (!radv_cmd_buffer_upload_alloc(cmd_buffer, pc_state->size, &offset, &ptr))
+   if (!radv_cmd_buffer_upload_alloc(cmd_buffer, size, &offset, &ptr))
       return;
 
-   memcpy(ptr, cmd_buffer->push_constants, pc_state->size);
+   memcpy(ptr, cmd_buffer->push_constants, size);
+
+   if (cmd_buffer->bc250_dgc_task_uploads) {
+      if (cmd_buffer->bc250_dgc_task_uploads->count == 2050)
+         cmd_buffer->bc250_dgc_task_uploads->overflow = true;
+      else
+         cmd_buffer->bc250_dgc_task_uploads->offsets[cmd_buffer->bc250_dgc_task_uploads->count++] = offset;
+   }
 
    *va = radv_cmd_buffer_upload_va(cmd_buffer) + offset;
 }
@@ -6859,7 +6867,12 @@ radv_flush_constants(struct radv_cmd_buffer *cmd_buffer, VkShaderStageFlags stag
       UNREACHABLE("Unhandled bind point");
    }
 
-   if (dgc_va)
+   if (cmd_buffer->bc250_dgc_task_uploads) {
+      /* A count stream reuses the ordinary Task constants. Load inlined
+       * words from that same upload, so CP updates also reach inline SGPRs. */
+      radv_upload_push_constants(cmd_buffer, push_constants, &va);
+      dgc_va = va;
+   } else if (dgc_va)
       va = dgc_va;
    else if (push_constants->need_upload)
       radv_upload_push_constants(cmd_buffer, push_constants, &va);

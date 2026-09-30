@@ -3702,6 +3702,9 @@ struct bc250_constants {
 };
 static_assert(offsetof(struct bc250_constants, split_piece) == BC250_SPLIT_PIECE_OFFSET, "split piece select");
 static_assert(sizeof(struct bc250_constants) == 72, "the constant block size is unchanged");
+static_assert(offsetof(struct bc250_constants, application_draw_id) == 20, "DGC count patch ABI");
+static_assert(offsetof(struct bc250_constants, application_constants) == 24, "DGC count patch ABI");
+static_assert(offsetof(struct bc250_constants, input) == 32, "DGC count patch ABI");
 
 /* Full-dispatch size published once per draw (direct: CPU memcpy before the
  * first chunk; indirect: the setup shader after validating the record). The
@@ -6040,9 +6043,9 @@ bc250_draw_task(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint
 
 void
 radv_bc250_draw_task_dgc(struct radv_cmd_buffer *cmd_buffer, uint64_t input,
-                          uint64_t count, uint32_t draw_id)
+                          uint64_t count, uint32_t draw_id, uint64_t *scratch)
 {
-   bc250_draw_task(cmd_buffer, 0, 0, 0, input, count, draw_id, NULL);
+   bc250_draw_task(cmd_buffer, 0, 0, 0, input, count, draw_id, scratch);
 }
 
 void

@@ -150,22 +150,35 @@ static void dgc_draw(VkCommandBuffer cb, int count)
    if(dgc_layout_count==32){dgc_failed=1;return;}
    dgc_layouts[dgc_layout_count++]=layout;
    VkGeneratedCommandsPipelineInfoEXT pi={.sType=VK_STRUCTURE_TYPE_GENERATED_COMMANDS_PIPELINE_INFO_EXT,.pipeline=dgc_pipeline};
+   unsigned draws=getenv("DGC_MAX_DRAWS")?strtoul(getenv("DGC_MAX_DRAWS"),NULL,0):2;
    VkGeneratedCommandsMemoryRequirementsInfoEXT mi={.sType=VK_STRUCTURE_TYPE_GENERATED_COMMANDS_MEMORY_REQUIREMENTS_INFO_EXT,
-      .pNext=&pi,.indirectCommandsLayout=layout,.maxSequenceCount=2,.maxDrawCount=2};
+      .pNext=&pi,.indirectCommandsLayout=layout,.maxSequenceCount=2,.maxDrawCount=draws};
    VkMemoryRequirements2 mr={.sType=VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2}; requirements(dgc_device,&mi,&mr);
+   if(getenv("DGC_REQUIREMENTS_ONLY")) {
+      const unsigned bounds[]={1,3,4,8,64,128,256,511,512,4096,4097};
+      mi.maxSequenceCount=1;
+      for(unsigned b=0;b<sizeof(bounds)/sizeof(bounds[0]);b++) {
+         mi.maxDrawCount=bounds[b];requirements(dgc_device,&mi,&mr);
+         printf("DGC_BOUND count=%d draws=%u bytes=%llu\n",count,bounds[b],(unsigned long long)mr.memoryRequirements.size);
+      }
+      return;
+   }
    printf("DGC_REQUIREMENTS count=%d bytes=%llu\n",count,(unsigned long long)mr.memoryRequirements.size);fflush(stdout);
    if(!mr.memoryRequirements.size) {dgc_failed=1;return;}
    VkBuffer stream,output; VkDeviceMemory sm,om; void *map,*out;
-   dgc_buffer(256,~0u,&stream,&sm,&map); if(dgc_failed)return;
+   unsigned stream_bytes=(64+draws*16+31)&~15u;
+   if(stream_bytes<256)stream_bytes=256;
+   unsigned count_offset=stream_bytes-16;
+   dgc_buffer(stream_bytes,~0u,&stream,&sm,&map); if(dgc_failed)return;
    dgc_buffer(mr.memoryRequirements.size,mr.memoryRequirements.memoryTypeBits,&output,&om,&out); if(dgc_failed)return;
-   memset(map,0,256);
+   memset(map,0,stream_bytes);
    uint32_t *words=map;
    if(count) {
       for(unsigned seq=0;seq<2;seq++) {
          uint64_t va=dgc_address(stream)+64;
-         memcpy(words+seq*8,&va,8);words[seq*8+2]=16;words[seq*8+3]=2;
+         memcpy(words+seq*8,&va,8);words[seq*8+2]=16;words[seq*8+3]=draws;
       }
-      words[16]=3;words[17]=1;words[18]=1;words[20]=2;words[21]=2;words[22]=1;
+      for(unsigned draw=0;draw<draws;draw++){words[16+draw*4]=3+draw;words[17+draw*4]=1;words[18+draw*4]=1;}
    } else {
       words[0]=7;words[1]=1;words[2]=1;words[8]=2;words[9]=2;words[10]=1;
    }
@@ -176,15 +189,15 @@ static void dgc_draw(VkCommandBuffer cb, int count)
       words[4]=11;words[12]=23;
 #endif
    }
-   words[60]=2;
+   words[count_offset/4]=2;
    VkGeneratedCommandsInfoEXT info={.sType=VK_STRUCTURE_TYPE_GENERATED_COMMANDS_INFO_EXT,.pNext=&pi,
       .shaderStages=ci.shaderStages,.indirectCommandsLayout=layout,.indirectAddress=dgc_address(stream),
       .indirectAddressSize=64,.preprocessAddress=dgc_address(output),.preprocessSize=mr.memoryRequirements.size,
-      .maxSequenceCount=2,.sequenceCountAddress=dgc_address(stream)+240,.maxDrawCount=2};
+      .maxSequenceCount=2,.sequenceCountAddress=dgc_address(stream)+count_offset,.maxDrawCount=draws};
    const char *dump=getenv("BC250_DGC_DUMP");
    if(dump) {
       char path[4096];snprintf(path,sizeof(path),"%s/token-%u.bin",dump,count);
-      FILE *f=fopen(path,"wb");if(f){fwrite(map,1,256,f);fclose(f);}
+      FILE *f=fopen(path,"wb");if(f){fwrite(map,1,stream_bytes,f);fclose(f);}
    }
    if(getenv("DGC_PREPROCESS")) {
       unsigned n=dgc_preprocess_count++;
@@ -214,6 +227,7 @@ static PFN_vkVoidFunction dgc_get_proc(VkDevice d,const char *name)
 }
 static VkResult dgc_submit(VkQueue q,uint32_t n,const VkSubmitInfo *infos,VkFence f)
 {
+   if(dgc_failed)return VK_ERROR_FEATURE_NOT_PRESENT;
    if(dgc_preprocess_count) {
       VkSubmitInfo submit={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=dgc_preprocess_count,.pCommandBuffers=dgc_preprocess};
       VkResult r=vkQueueSubmit(q,1,&submit,VK_NULL_HANDLE);if(r)return r;

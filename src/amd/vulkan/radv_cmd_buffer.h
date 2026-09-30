@@ -567,6 +567,12 @@ struct radv_cmd_buffer {
    /* DGC capture writes uploads into its preprocess-owned arena. */
    uint64_t bc250_dgc_upload_va;
    uint64_t bc250_dgc_application_va;
+   /* Capture-only typed Task constant uploads for a reusable count IB. */
+   struct {
+      uint32_t offsets[2050];
+      unsigned count;
+      bool overflow;
+   } *bc250_dgc_task_uploads;
    struct radv_cmd_buffer_upload upload;
    struct radv_cmd_buffer_upload *bc250_small_arena;
    uint64_t bc250_ordered_arena;
