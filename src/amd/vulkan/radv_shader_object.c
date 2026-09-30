@@ -22,7 +22,7 @@ struct radv_shader_object_metadata {
    uint32_t dynamic_offset_count;
 };
 
-#define RADV_BC250_OBJECT_MAGIC UINT64_C(0x364a424f30353242)
+#define RADV_BC250_OBJECT_MAGIC UINT64_C(0x374a424f30353242)
 
 struct radv_bc250_shader_object_context {
    int refs;
@@ -711,7 +711,10 @@ radv_shader_object_create(VkDevice _device, const VkShaderCreateInfoEXT *pCreate
       return result;
    }
 
-   radv_bc250_report_mesh_route(device, shader_obj->shader, "shader_object", 0, false, false);
+   radv_bc250_report_mesh_route(device, shader_obj->shader, "shader_object",
+                               MAX2(shader_obj->bc250_plan.direct_pieces, shader_obj->bc250_plan.split_pieces),
+                               shader_obj->bc250_plan.flags & RADV_BC250_PLAN_TASK,
+                               shader_obj->bc250_plan.flags & RADV_BC250_PLAN_ORDERED);
    *pShader = radv_shader_object_to_handle(shader_obj);
 
    return VK_SUCCESS;
@@ -879,14 +882,7 @@ radv_shader_object_create_linked(VkDevice _device, uint32_t createInfoCount, con
    struct radv_bc250_pipeline_plan bc250_plan = {0};
    if (context) {
       struct radv_shader_stage *ms = &stages[MESA_SHADER_MESH];
-      if (!shaders[MESA_SHADER_MESH] || !shaders[MESA_SHADER_FRAGMENT] ||
-          ms->key.has_task_shader ||
-          (!shaders[MESA_SHADER_MESH]->info.ms.bc250_safe_direct &&
-           !(context->pipeline.bc250_direct_split_pieces && ms->bc250_split_mesh &&
-             ms->bc250_split_pieces == context->pipeline.bc250_direct_split_pieces) &&
-           !(context->pipeline.bc250_task_pipeline &&
-             ((ms->bc250_expanded && ms->bc250_split_pieces) ||
-              (context->pipeline.bc250_ordered && ms->bc250_ordered_export))))) {
+      if (!shaders[MESA_SHADER_MESH] || !shaders[MESA_SHADER_FRAGMENT] || ms->key.has_task_shader) {
          compile_result = VK_ERROR_FEATURE_NOT_PRESENT;
          goto object_fail;
       }
@@ -966,7 +962,10 @@ radv_shader_object_create_linked(VkDevice _device, uint32_t createInfoCount, con
       ralloc_free(stages[s].nir);
       stages[s].nir = NULL;
 
-      radv_bc250_report_mesh_route(device, shader_obj->shader, "linked_shader_object", 0, false, false);
+      radv_bc250_report_mesh_route(device, shader_obj->shader, "linked_shader_object",
+                                  MAX2(shader_obj->bc250_plan.direct_pieces, shader_obj->bc250_plan.split_pieces),
+                                  shader_obj->bc250_plan.flags & RADV_BC250_PLAN_TASK,
+                                  shader_obj->bc250_plan.flags & RADV_BC250_PLAN_ORDERED);
       pShaders[i] = radv_shader_object_to_handle(shader_obj);
    }
 

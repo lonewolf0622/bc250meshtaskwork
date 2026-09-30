@@ -8,12 +8,13 @@
 /* Separate from radv_shader_info: the switch-off shader binary layout and
  * compiler keys must remain unchanged. Executable shaders remain ordinary
  * cache objects; a plan references its two private compute shaders last. */
-#define RADV_BC250_PIPELINE_PLAN_VERSION 6u
+#define RADV_BC250_PIPELINE_PLAN_VERSION 7u
 #define RADV_BC250_PLAN_TASK (1u << 0)
 #define RADV_BC250_PLAN_ORDERED (1u << 1)
 #define RADV_BC250_PLAN_ORDER_FREE (1u << 2)
 #define RADV_BC250_PLAN_CORNERS (1u << 3)
-#define RADV_BC250_PLAN_FLAGS 15u
+#define RADV_BC250_PLAN_SPLIT (1u << 4)
+#define RADV_BC250_PLAN_FLAGS 31u
 
 struct radv_bc250_pipeline_plan {
    uint32_t version;
@@ -28,7 +29,7 @@ struct radv_bc250_pipeline_plan {
    uint32_t bary_slots;
    /* Exact compiler policy bytes, including adaptive in the primitive ceiling byte. */
    uint8_t route_key[24];
-   /* Includes safe compact, dead payload and piece PrimitiveId policy bits. */
+   /* Includes safe compact, dead payload, piece PrimitiveId and fail-closed policy bits. */
    uint8_t hardware_key[8];
    /* Bind the plan to the exact graphics executables, not just their policy. */
    uint8_t mesh_hash[32];
@@ -56,6 +57,7 @@ radv_bc250_pipeline_plan_valid(const struct radv_bc250_pipeline_plan *plan)
           refs == plan->bary_ref_mask &&
           !(plan->flags & ~RADV_BC250_PLAN_FLAGS) && !plan->reserved &&
           plan->direct_pieces <= 5 && plan->split_pieces <= 5 &&
+          (!(plan->flags & RADV_BC250_PLAN_SPLIT) || plan->split_pieces) &&
           (!task || (!plan->direct_pieces && plan->payload_stride >= 16 &&
                      plan->payload_stride <= ((plan->flags & RADV_BC250_PLAN_ORDERED) ? 65536 : 16384) &&
                      !(plan->payload_stride & 15))) &&

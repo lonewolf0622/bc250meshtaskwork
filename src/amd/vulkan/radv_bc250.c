@@ -97,6 +97,7 @@ radv_bc250_report_mesh_route(const struct radv_device *device, const struct radv
       return;
    const struct radv_shader_info *info = &shader->info;
    const bool safe = info->ms.bc250_safe_direct && !ordered;
+   const bool merged = info->ms.bc250_merge_k > 1;
    static const char *const reasons[] = {
       [RADV_BC250_ROUTE_REASON_UNKNOWN] = "route_policy_or_shader_object",
       [RADV_BC250_ROUTE_REASON_SWITCHES_OFF] = "safe_direct_switches_off",
@@ -120,7 +121,7 @@ radv_bc250_report_mesh_route(const struct radv_device *device, const struct radv
       [RADV_BC250_ROUTE_REASON_BARY_COST] = "bary_small_class_cost_not_better_than_split",
    };
    const unsigned reason_id = info->ms.bc250_route_reason;
-   const char *reason = ordered ? "ordered_materialization_route" : safe ? "none" :
+   const char *reason = ordered ? "ordered_materialization_route" : safe ? "none" : merged ? "merged_workgroups" :
       reason_id < ARRAY_SIZE(reasons) && reasons[reason_id] ? reasons[reason_id] : "unclassified";
    char shader_hash[17];
    for (unsigned i = 0; i < 8; i++)
@@ -128,7 +129,7 @@ radv_bc250_report_mesh_route(const struct radv_device *device, const struct radv
    fprintf(stderr, "BC250 NO_SPLIT: object=%s fallback_needed=%u route=%s reason=%s V=%u P=%u lanes=%u "
                    "pieces=%u task_transport=%u scratch=%u fallback_retained=1 shader_hash=%s\n",
            object, !safe, ordered ? "ordered_materialization" : safe ? (pieces ? "safe_direct_pieces" : "safe_direct") :
-           pieces ? "split" : info->ms.bc250_expanded ? "expansion" : "raw_unproven", reason,
+           pieces ? "split" : merged ? "merged" : info->ms.bc250_expanded ? "expansion" : "raw_unproven", reason,
            info->ms.bc250_api_vertices, info->ms.bc250_api_primitives, info->workgroup_size,
            pieces, task || info->ms.has_task, info->ms.needs_ms_scratch_ring, shader_hash);
 }
@@ -5457,14 +5458,14 @@ radv_bc250_prepare_task(struct radv_device *device,
 bool
 radv_bc250_pipeline_plan_admitted(const struct radv_bc250_pipeline_plan *plan, const struct radv_shader *mesh)
 {
-   /* A matching hash proves identity, not that the raw exporter is safe.
-    * Preserve only routes selected by the proven direct/expansion paths or
-    * the separately materialized ordered producer. */
+   /* Route protection uses the compiler's rule. Native Task transport is
+    * still refused here: plans own private producer/setup executables. */
    return radv_bc250_pipeline_plan_valid(plan) && mesh && mesh->info.stage == MESA_SHADER_MESH &&
           !mesh->info.ms.has_task &&
-          (mesh->info.ms.bc250_safe_direct || mesh->info.ms.bc250_expanded ||
-           (plan->flags & (RADV_BC250_PLAN_TASK | RADV_BC250_PLAN_ORDERED)) ==
-              (RADV_BC250_PLAN_TASK | RADV_BC250_PLAN_ORDERED));
+          radv_bc250_mesh_protected_route(mesh->info.ms.bc250_safe_direct,
+                                          plan->flags & RADV_BC250_PLAN_ORDERED,
+                                          plan->flags & RADV_BC250_PLAN_SPLIT,
+                                          mesh->info.ms.bc250_expanded, mesh->info.ms.bc250_merge_k);
 }
 
 void
@@ -5479,7 +5480,8 @@ radv_bc250_capture_pipeline_plan(const struct radv_device *device, struct radv_g
       .flags = (pipeline->bc250_task_pipeline ? RADV_BC250_PLAN_TASK : 0) |
                (pipeline->bc250_ordered ? RADV_BC250_PLAN_ORDERED : 0) |
                (pipeline->bc250_split_order_free ? RADV_BC250_PLAN_ORDER_FREE : 0) |
-               (ms->bc250_safe_owned ? RADV_BC250_PLAN_CORNERS : 0),
+               (ms->bc250_safe_owned ? RADV_BC250_PLAN_CORNERS : 0) |
+               (ms->bc250_split_mesh ? RADV_BC250_PLAN_SPLIT : 0),
       .bary_ref_mask = ms->bc250_bary_ref_mask,
       .per_primitive_locations = ms->bc250_pp_locations,
       .split_pieces = ms->bc250_split_pieces,

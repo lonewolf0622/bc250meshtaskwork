@@ -3,6 +3,7 @@
 #define RADV_BC250_H
 #include "vulkan/vulkan_core.h"
 #include <stdbool.h>
+#include "radv_bc250_route.h"
 struct radv_device;
 struct radv_graphics_pipeline;
 struct radv_graphics_pipeline_state;

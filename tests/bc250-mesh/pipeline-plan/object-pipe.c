@@ -70,9 +70,14 @@ object_pipeline(VkDevice device, VkPipelineCache cache, uint32_t count,
    }
    /* A pipeline supplies the inherited fixture's initial graphics state; the
     * draw uses the objects after vkCmdBindShadersEXT clears that pipeline. */
-   VkResult result = create_pipeline(device, cache, count, infos, alloc, pipelines);
-   if (result != VK_SUCCESS)
-      return result;
+   VkResult result = VK_SUCCESS;
+   if (getenv("OBJECT_SKIP_PIPELINE") && !strcmp(getenv("OBJECT_SKIP_PIPELINE"), "1")) {
+      *pipelines = VK_NULL_HANDLE;
+   } else {
+      result = create_pipeline(device, cache, count, infos, alloc, pipelines);
+      if (result != VK_SUCCESS)
+         return result;
+   }
    object_count = infos->stageCount;
    VkShaderCreateInfoEXT shader_infos[3];
    for (unsigned i = 0; i < object_count; i++) {

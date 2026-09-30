@@ -26,7 +26,7 @@ SAFE_AUTOCULL SAFE_PARALLEL SAFE_BARY SAFE_BARY_TINY SAFE_BARY_AFFINE SAFE_BARY_
 ALLOW_POS1 SPLIT_ANY NESTED_SLICE SAFE_SPLIT_PIECES'''.split():
     env['RADV_BC250_MESH_' + flag] = '1'
 env.update(RADV_BC250_BARY_IO16='1', RADV_BC250_BARY_CORNER_ID='1')
-hw_flags = ['RADV_BC250_MESH_SAFE_COMPACT', 'RADV_BC250_MESH_DEAD_PAYLOAD', 'RADV_BC250_MESH_PIECE_PRIMID']
+hw_flags = ['RADV_BC250_MESH_SAFE_COMPACT', 'RADV_BC250_MESH_DEAD_PAYLOAD', 'RADV_BC250_MESH_PIECE_PRIMID', 'RADV_BC250_MESH_FAIL_CLOSED']
 hw_policy = os.environ.get('PLAN_HW_POLICY', 'off')
 assert hw_policy in ('off', 'on')
 env.update({flag: '1' if hw_policy == 'on' else '0' for flag in hw_flags})
@@ -157,15 +157,34 @@ for flag in ('SAFE_FAST', 'SAFE_PIECES', 'SAFE_OWNED', 'SAFE_LOCAL', 'SAFE_CHECK
              'SAFE_AUTOCULL', 'SAFE_PARALLEL', 'SAFE_BARY', 'SAFE_BARY_TINY', 'SAFE_BARY_AFFINE', 'SAFE_BARY_LAST',
              'SAFE_SPLIT_PIECES', 'SAFE_ADAPTIVE'):
     raw_env['RADV_BC250_MESH_' + flag] = '0'
+raw_rows = []
+for plans, fail_closed in ((1, 0), (0, 1), (1, 1)):
+    for program in ('cache-pipe', 'gpl-pipe', 'object-pipe'):
+        raw_env.update(RADV_BC250_PIPELINE_PLAN=str(plans), RADV_BC250_MESH_FAIL_CLOSED=str(fail_closed),
+                       RADV_BC250_GPL_SOURCE_LINK='1', RADV_BC250_GPL_BINARY_LINK='1',
+                       RADV_BC250_SHADER_OBJECT_PLAN='1', GPL_MODE='compiled')
+        case = out / 'plain'
+        raw_env['OBJECT_SKIP_PIPELINE'] = '1' if program == 'object-pipe' else '0'
+        p = subprocess.run([str(out / program), str(case / 'mesh.spv'), str(case / 'frag.spv'), '-', '1'],
+                           env=raw_env, capture_output=True, text=True)
+        (out / (program + f'-raw-refused-plan{plans}-closed{fail_closed}.log')).write_text(p.stdout + p.stderr)
+        assert p.returncode == 1 and 'PIPELINE_RESULT=-8' in p.stdout and 'SUBMIT_OK' not in p.stdout
+        raw_rows.append(dict(program=program, plans=plans, fail_closed=fail_closed, refused=True))
+(out / 'raw-policy-summary.json').write_text(json.dumps(raw_rows, indent=2) + '\n')
+print('nine pipeline/plan/object raw executable refusals PASS', flush=True)
+
+# Merged workgroups are a protected route even when all direct proofs are off.
+merge_env = dict(raw_env, RADV_BC250_PIPELINE_PLAN='1', RADV_BC250_MESH_FAIL_CLOSED='1',
+                 RADV_BC250_MESH_MERGE='1', RADV_BC250_MESH_MERGE_INDIRECT='a',
+                 RADV_BC250_EXPAND_PRIMITIVES='1', RADV_BC250_MESH_NO_SPLIT='1', OBJECT_SKIP_PIPELINE='0')
 for program in ('cache-pipe', 'gpl-pipe', 'object-pipe'):
-    raw_env.update(RADV_BC250_GPL_SOURCE_LINK='1', RADV_BC250_GPL_BINARY_LINK='1',
-                   RADV_BC250_SHADER_OBJECT_PLAN='1', GPL_MODE='compiled')
-    case = out / 'plain'
-    p = subprocess.run([str(out / program), str(case / 'mesh.spv'), str(case / 'frag.spv'), '-', '1'],
-                       env=raw_env, capture_output=True, text=True)
-    (out / (program + '-raw-refused.log')).write_text(p.stdout + p.stderr)
-    assert p.returncode == 1 and 'PIPELINE_RESULT=-8' in p.stdout and 'SUBMIT_OK' not in p.stdout
-print('three unproven raw executable refusals PASS', flush=True)
+    text = subprocess.run([str(out / program), str(out / 'plain/mesh.spv'), str(out / 'plain/frag.spv'), '-', '1'],
+                          env=merge_env, capture_output=True, text=True)
+    log = text.stdout + text.stderr
+    (out / (program + '-protected-merge.log')).write_text(log)
+    assert text.returncode == 0 and 'SUBMIT_OK' in log and re.search(r'merge_k=[2-9]', log), log[-4000:]
+    assert 'route=merged' in log and 'raw_unproven' not in log, log[-4000:]
+print('three protected merged executable restorations PASS', flush=True)
 
 case = out / 'plain'
 args = [str(out / 'binary-pipe'), str(case / 'mesh.spv'), str(case / 'frag.spv'), '-', '1']

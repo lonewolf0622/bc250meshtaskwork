@@ -1,9 +1,17 @@
 /* SPDX-License-Identifier: MIT */
 #include "radv_bc250_pipeline_plan.h"
+#include "radv_bc250_route.h"
 #include <assert.h>
 
 int main(void)
 {
+   assert(!radv_bc250_mesh_protected_route(false, false, false, false, 0));
+   assert(!radv_bc250_mesh_protected_route(false, false, false, false, 1));
+   assert(radv_bc250_mesh_protected_route(true, false, false, false, 0));
+   assert(radv_bc250_mesh_protected_route(false, true, false, false, 0));
+   assert(radv_bc250_mesh_protected_route(false, false, true, false, 0));
+   assert(radv_bc250_mesh_protected_route(false, false, false, true, 0));
+   assert(radv_bc250_mesh_protected_route(false, false, false, false, 2));
    struct radv_bc250_pipeline_plan p = {.version = RADV_BC250_PIPELINE_PLAN_VERSION};
    assert(radv_bc250_pipeline_plan_valid(&p));
    p.flags = RADV_BC250_PLAN_TASK;
@@ -49,5 +57,10 @@ int main(void)
    assert(radv_bc250_pipeline_plan_valid(&p));
    p.bary_ref_mask = 0;
    assert(!radv_bc250_pipeline_plan_valid(&p));
+   p = (struct radv_bc250_pipeline_plan){.version = RADV_BC250_PIPELINE_PLAN_VERSION,
+                                       .flags = RADV_BC250_PLAN_SPLIT};
+   assert(!radv_bc250_pipeline_plan_valid(&p));
+   p.split_pieces = 1;
+   assert(radv_bc250_pipeline_plan_valid(&p));
    return 0;
 }
