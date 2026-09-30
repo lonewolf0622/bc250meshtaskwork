@@ -6525,6 +6525,8 @@ radv_bc250_directmesh_env(void)
       {"RADV_BC250_MESH_SAFE_PIECES_EXT", "1"}, {"RADV_BC250_TASK_GRID_FOLD", "1"},
       /* Renumbered referenced vertices after culling instead of private corners (gate CM1). */
       {"RADV_BC250_MESH_SAFE_COMPACT", "1"},
+      /* Shared vertices on the owned route, private provoking corners (gates PS1, PS2). */
+      {"RADV_BC250_MESH_PP_SHARE", "1"},
    };
    for (unsigned i = 0; i < ARRAY_SIZE(settings); i++)
       setenv(settings[i][0], settings[i][1], 0);
