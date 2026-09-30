@@ -5752,6 +5752,13 @@ bc250_alloc_scratch(struct radv_cmd_buffer *cmd_buffer, unsigned bytes,
                     uint64_t *address, void **mapped)
 {
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   if (cmd_buffer->bc250_dgc_upload_va) {
+      unsigned offset;
+      if (!radv_cmd_buffer_upload_alloc_aligned(cmd_buffer, bytes, 256, &offset, mapped))
+         return false;
+      *address = radv_cmd_buffer_upload_va(cmd_buffer) + offset;
+      return true;
+   }
    /* Suballocation is restricted to one execution of a primary buffer. Keep
     * existing allocation semantics for secondary/repeated/simultaneous uses.
     * RADV_BC250_SCRATCH_REUSE=1 also suballocates for primaries that may be
@@ -5836,7 +5843,7 @@ bc250_alloc_records(struct radv_cmd_buffer *cmd_buffer, unsigned bytes, uint64_t
    unsigned offset;
    if (!radv_cmd_buffer_upload_alloc_aligned(cmd_buffer, bytes, 256, &offset, mapped))
       return false;
-   *address = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + offset;
+   *address = radv_cmd_buffer_upload_va(cmd_buffer) + offset;
    return true;
 }
 
@@ -5937,7 +5944,7 @@ bc250_draw_task(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint
       .xyz = address,
       .payload = pipeline->bc250_ordered ? ordered_payload : address + payload_offset,
       .stride = pipeline->bc250_payload_stride,
-      .application_constants = address + app_offset,
+      .application_constants = cmd_buffer->bc250_dgc_application_va ? cmd_buffer->bc250_dgc_application_va : address + app_offset,
       .application_draw_id = draw_id,
       .input = indirect_va,
       .input_count = count_va,
@@ -6029,6 +6036,13 @@ bc250_draw_task(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint
 
    cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_INV_VCACHE |
                                    RADV_CMD_FLAG_INV_SCACHE | RADV_CMD_FLAG_INV_L2;
+}
+
+void
+radv_bc250_draw_task_dgc(struct radv_cmd_buffer *cmd_buffer, uint64_t input,
+                          uint64_t count, uint32_t draw_id)
+{
+   bc250_draw_task(cmd_buffer, 0, 0, 0, input, count, draw_id, NULL);
 }
 
 void
@@ -6377,7 +6391,7 @@ bc250_draw_split_prep_free(struct radv_cmd_buffer *cmd_buffer, struct radv_graph
       return;
    memcpy(app_map, cmd_buffer->push_constants, MAX_PUSH_CONSTANTS_SIZE);
    struct bc250_constants cc = {.input = input, .stride = stride,
-      .application_constants = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + offset};
+      .application_constants = cmd_buffer->bc250_dgc_application_va ? cmd_buffer->bc250_dgc_application_va : radv_cmd_buffer_upload_va(cmd_buffer) + offset};
    uint8_t saved[sizeof(cc)];
    memcpy(saved, cmd_buffer->push_constants, sizeof(saved));
    cmd_buffer->bc250_inside_mesh_draw = true;
@@ -6459,7 +6473,7 @@ radv_bc250_draw_split_indirect(struct radv_cmd_buffer *cmd_buffer, uint64_t inpu
       return;
    memcpy(app_map, cmd_buffer->push_constants, MAX_PUSH_CONSTANTS_SIZE);
    struct bc250_constants cc = {.input = input, .stride = stride,
-      .application_constants = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + offset};
+      .application_constants = cmd_buffer->bc250_dgc_application_va ? cmd_buffer->bc250_dgc_application_va : radv_cmd_buffer_upload_va(cmd_buffer) + offset};
    uint8_t saved[sizeof(cc)];
    memcpy(saved, cmd_buffer->push_constants, sizeof(saved));
    memcpy(cmd_buffer->push_constants, &cc, sizeof(cc));
@@ -6495,7 +6509,7 @@ radv_bc250_draw_split(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y
    memcpy(mapped, cmd_buffer->push_constants, MAX_PUSH_CONSTANTS_SIZE);
    uint32_t dims[4] = {x, y, z, 0};
    memcpy((char *)mapped + MAX_PUSH_CONSTANTS_SIZE, dims, sizeof(dims));
-   uint64_t address = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + offset;
+   uint64_t address = radv_cmd_buffer_upload_va(cmd_buffer) + offset;
    if (cmd_buffer->bc250_trace_chain)
       radv_bc250_chain_event(radv_cmd_buffer_device(cmd_buffer), "CPU_DIMENSIONS_WRITE",
          "cmd=%p epoch=%llu chain=%llu va=%llx x=%u y=%u z=%u bytes=16 private_compute_producer=NONE external_resource_generation=UNKNOWN",
@@ -6503,7 +6517,7 @@ radv_bc250_draw_split(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y
          (unsigned long long)cmd_buffer->bc250_trace_chain,
          (unsigned long long)(address + MAX_PUSH_CONSTANTS_SIZE), x, y, z);
    struct bc250_constants cc = {.input = address + MAX_PUSH_CONSTANTS_SIZE, .stride = 16,
-      .application_constants = address};
+      .application_constants = cmd_buffer->bc250_dgc_application_va ? cmd_buffer->bc250_dgc_application_va : address};
    uint8_t saved[sizeof(cc)];
    memcpy(saved, cmd_buffer->push_constants, sizeof(saved));
    memcpy(cmd_buffer->push_constants, &cc, sizeof(cc));
@@ -6622,7 +6636,7 @@ radv_bc250_draw_merge_indirect(struct radv_cmd_buffer *cmd_buffer, unsigned merg
       if (!radv_cmd_buffer_upload_alloc_aligned(cmd_buffer, records * BC250_MERGE_RECORD_BYTES + 64, 64, &offset,
                                                 &mapped))
          return;
-      output = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + offset;
+      output = radv_cmd_buffer_upload_va(cmd_buffer) + offset;
       if ((uint32_t)output == 0)
          output += 64;
       bc250_chain_begin(cmd_buffer, "merge_indirect", input, count, records, stride);

@@ -114,6 +114,7 @@ struct radv_physical_device {
    bool bc250_native_mesh;
    bool bc250_native_task; /* Experimental native TASK capability; submission separately gated. */
    bool bc250_hybrid_task;
+   bool bc250_expose_dgc;
    /* VK_KHR_fragment_shader_barycentric on GFX1013 (vertex order recovered in
     * the fragment shader, radv_nir_bc250_lower_bary_rotation); off with
     * RADV_BC250_NO_BARYCENTRICS=1. */

@@ -126,7 +126,17 @@ while IFS='|' read -r name script extra; do
   fi
   if [ -n "$OLDICD" ]; then
     shim "$OLDICD" env $extra RADV_DEBUG=dumpibs,shaders,nocache ./fb legacy "$script" > "$work/$name.old.out" 2> "$work/$name.old.err"
-    if cmp -s <(notimer "$work/$name.old.err") <(notimer "$work/$name.off.err") && cmp -s "$work/$name.old.out" "$work/$name.off.out"; then
+    # DGC is now default-off even with hybrid Task disabled. Admit exactly that
+    # extension-list change; shader/PM4 and every other reported value stay exact.
+    baseline_stdout() {
+      if [ "$name" = hybrid0 ] && grep -q 'EXT_device_generated_commands=1' "$work/$name.old.out"; then
+        grep -q 'EXT_device_generated_commands=0' "$work/$name.off.out" || return 1
+        sed 's/EXT_device_generated_commands=1/EXT_device_generated_commands=0/' "$work/$name.old.out"
+      else
+        cat "$work/$name.old.out"
+      fi
+    }
+    if cmp -s <(notimer "$work/$name.old.err") <(notimer "$work/$name.off.err") && cmp -s <(baseline_stdout) "$work/$name.off.out"; then
       res="$res off_identical_to_old_build=True"
     else
       res="$res off_identical_to_old_build=False"; st=FAIL

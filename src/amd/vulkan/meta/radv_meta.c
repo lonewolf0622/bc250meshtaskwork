@@ -463,7 +463,7 @@ radv_meta_bind_descriptors(struct radv_cmd_buffer *cmd_buffer, VkPipelineBindPoi
 
    const VkDescriptorBufferBindingInfoEXT descriptor_buffer_binding = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_INFO_EXT,
-      .address = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + upload_offset,
+      .address = radv_cmd_buffer_upload_va(cmd_buffer) + upload_offset,
       .usage = VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT,
    };
 

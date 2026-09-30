@@ -564,6 +564,9 @@ struct radv_cmd_buffer {
    uint64_t descriptor_buffers[MAX_SETS];
    uint64_t descriptor_heaps[RADV_MAX_HEAPS];
 
+   /* DGC capture writes uploads into its preprocess-owned arena. */
+   uint64_t bc250_dgc_upload_va;
+   uint64_t bc250_dgc_application_va;
    struct radv_cmd_buffer_upload upload;
    struct radv_cmd_buffer_upload *bc250_small_arena;
    uint64_t bc250_ordered_arena;
@@ -707,6 +710,13 @@ radv_get_num_pipeline_stat_queries(struct radv_cmd_buffer *cmd_buffer)
 }
 
 bool radv_cmd_buffer_uses_mec(struct radv_cmd_buffer *cmd_buffer);
+
+static inline uint64_t
+radv_cmd_buffer_upload_va(const struct radv_cmd_buffer *cmd_buffer)
+{
+   return cmd_buffer->bc250_dgc_upload_va ? cmd_buffer->bc250_dgc_upload_va :
+      radv_buffer_get_va(cmd_buffer->upload.upload_bo);
+}
 
 bool radv_cmd_buffer_upload_alloc_aligned(struct radv_cmd_buffer *cmd_buffer, unsigned size, unsigned alignment,
                                           unsigned *out_offset, void **ptr);

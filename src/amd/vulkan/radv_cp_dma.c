@@ -230,7 +230,7 @@ radv_cp_dma_realign_engine(struct radv_cmd_buffer *cmd_buffer, unsigned size)
 
    radv_cmd_buffer_upload_alloc(cmd_buffer, buf_size, &offset, NULL);
 
-   va = radv_buffer_get_va(cmd_buffer->upload.upload_bo);
+   va = radv_cmd_buffer_upload_va(cmd_buffer);
    va += offset;
 
    radv_cp_dma_prepare(cmd_buffer, size, size, &dma_flags);
