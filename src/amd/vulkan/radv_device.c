@@ -1643,6 +1643,7 @@ radv_destroy_device(struct radv_device *device, const VkAllocationCallbacks *pAl
 
    _mesa_hash_table_destroy(device->rt_handles, NULL);
 
+   _mesa_hash_table_u64_destroy(device->bc250_dgc_query_states);
    radv_device_finish_meta(device);
    radv_device_finish_tools(device);
    radv_device_finish_memory_cache(device);

@@ -99,8 +99,8 @@ static void task_count(const std::vector<uint8_t> &v,const params &p,unsigned se
 int main(int argc,char **argv)
 {
    try {
-      check(argc==4 || argc==5,"usage: oracle dump-directory count-token task-route [push-constants]");
-      bool pcs=argc==5 && atoi(argv[4]);
+      check(argc>=4 && argc<=6,"usage: oracle dump-directory count-token task-route [push-constants [static]]");
+      bool pcs=argc>=5 && atoi(argv[4]);
       std::string dir=argv[1];bool count=atoi(argv[2]),task=atoi(argv[3]);
       std::string suffix=std::to_string(count);
       auto capture=read(dir+"/capture-"+suffix+".bin");
@@ -108,6 +108,12 @@ int main(int argc,char **argv)
       params p;memcpy(&p,capture.data(),sizeof(p));
       std::vector<uint8_t> src(capture.begin()+sizeof(p),capture.end());
       check(src.size()==uint64_t(p.stride)*p.sequences,"incorrect snapshot bounds");
+      if(argc==6) {
+         check(count && task && !strcmp(argv[5],"static"),"static proof requires Task count");
+         for(unsigned seq=0;seq<p.sequences;seq++)task_count(src,p,seq,dir);
+         std::cout<<"Full Task count PM4 PASS "<<p.records<<" draws per sequence\n";
+         return 0;
+      }
       auto token=read(dir+"/token-"+suffix+".bin");auto blob=read(dir+"/prepare-"+suffix+".nir");
       struct blob_reader reader;blob_reader_init(&reader,blob.data(),blob.size());
       nir_shader_compiler_options options={};

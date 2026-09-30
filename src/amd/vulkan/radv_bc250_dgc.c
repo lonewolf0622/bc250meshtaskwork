@@ -229,9 +229,7 @@ bc250_dgc_state_valid(const struct radv_cmd_buffer *state, const VkGeneratedComm
        (state->usage_flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT) ||
        s->graphics_pipeline != radv_pipeline_to_graphics(p) || s->render.view_mask || state->gang.cs ||
        s->render.vrs_att.iview || s->uses_vrs_attachment || s->force_vrs_per_vertex ||
-       s->cond_render.enabled || s->active_occlusion_queries || s->active_pipeline_queries ||
-       s->active_emulated_pipeline_queries || s->active_pipeline_ace_queries || s->active_prims_gen_queries ||
-       s->active_emulated_prims_gen_queries || s->active_prims_xfb_queries || s->active_emulated_prims_xfb_queries ||
+       s->active_pipeline_ace_queries || s->active_prims_xfb_queries || s->active_emulated_prims_xfb_queries ||
        s->streamout.enabled_mask || device->sqtt.bo || device->utrace.context || device->bc250_timer.enabled ||
        radv_bc250_chain_enabled(device) || device->bc250_split_batch_prep)
       return false;
@@ -240,6 +238,37 @@ bc250_dgc_state_valid(const struct radv_cmd_buffer *state, const VkGeneratedComm
          return false;
    }
    return true;
+}
+
+static uintptr_t
+bc250_dgc_query_state(const struct radv_cmd_buffer *cmd)
+{
+   const struct radv_cmd_state *s = &cmd->state;
+   return 1 | (!!s->active_occlusion_queries << 1) | (!!s->active_pipeline_queries << 2) |
+      (!!s->active_emulated_pipeline_queries << 3) | (!!s->active_prims_gen_queries << 4) |
+      (!!s->active_emulated_prims_gen_queries << 5) | (!!s->perfect_occlusion_queries_enabled << 6);
+}
+
+static bool
+bc250_dgc_query_certificate(struct radv_cmd_buffer *cmd, uint64_t va, bool record)
+{
+   struct radv_device *device = radv_cmd_buffer_device(cmd);
+   uintptr_t signature = bc250_dgc_query_state(cmd);
+   /* Ordinary meta suspend/resume uses the query state of the state command
+    * buffer. Explicit execute may use another command buffer, but its query
+    * flags must match that capture. Unknown or changed state fails closed;
+    * no source-command-buffer lifetime is retained in this certificate. */
+   mtx_lock(&device->meta_state.mtx);
+   if (record && !device->bc250_dgc_query_states)
+      device->bc250_dgc_query_states = _mesa_hash_table_u64_create(NULL);
+   bool ok = device->bc250_dgc_query_states != NULL;
+   if (ok && record) {
+      _mesa_hash_table_u64_insert(device->bc250_dgc_query_states, va, (void *)signature);
+   }
+   if (ok)
+      ok = (uintptr_t)_mesa_hash_table_u64_search(device->bc250_dgc_query_states, va) == signature;
+   mtx_unlock(&device->meta_state.mtx);
+   return ok;
 }
 
 static bool
@@ -495,7 +524,7 @@ radv_bc250_dgc_prepare(struct radv_cmd_buffer *cmd, const VkGeneratedCommandsInf
 {
    struct bc250_dgc_shape shape;
    if (!bc250_dgc_info_valid(state, info, &shape) || cmd->qf != RADV_QUEUE_GENERAL ||
-       cmd->state.cond_render.enabled || cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
+       cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
@@ -532,12 +561,19 @@ radv_bc250_dgc_prepare(struct radv_cmd_buffer *cmd, const VkGeneratedCommandsInf
       if (f) { fwrite(&params, 1, sizeof(params), f); fwrite(snapshot, 1, shape.size, f); fclose(f); }
    }
    free(snapshot);
+   if (!bc250_dgc_query_certificate(state, info->preprocessAddress, true)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return;
+   }
    cmd->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_VS_PARTIAL_FLUSH |
                             RADV_CMD_FLAG_PS_PARTIAL_FLUSH | RADV_CMD_FLAG_WB_L2;
    radv_meta_begin(cmd);
    radv_meta_bind_compute_pipeline(cmd, layout->pipeline);
    radv_meta_push_constants(cmd, layout->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(params), &params);
+   bool conditional = cmd->state.cond_render.enabled;
+   cmd->state.cond_render.enabled = false;
    radv_CmdDispatchBase(radv_cmd_buffer_to_handle(cmd), 0, 0, 0, info->maxSequenceCount, 1, 1);
+   cmd->state.cond_render.enabled = conditional;
    radv_meta_end(cmd);
 }
 
@@ -546,6 +582,12 @@ radv_bc250_dgc_execute(struct radv_cmd_buffer *cmd, VkBool32 preprocessed, const
 {
    struct bc250_dgc_shape shape;
    if (!bc250_dgc_info_valid(cmd, info, &shape)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   if (!info->maxSequenceCount)
+      return;
+   if (preprocessed && !bc250_dgc_query_certificate(cmd, info->preprocessAddress, false)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
@@ -589,7 +631,8 @@ radv_bc250_dgc_execute(struct radv_cmd_buffer *cmd, VkBool32 preprocessed, const
       for (uint32_t segment = 0; segment < shape.segments; segment++) {
          radeon_check_space(device->ws, cmd->cs->b, 4);
          device->ws->cs_chain_dgc_ib(cmd->cs->b, info->preprocessAddress + (uint64_t)seq * shape.stride +
-                                    (uint64_t)segment * shape.segment_code, shape.segment_code / 4, 0, false);
+                                    (uint64_t)segment * shape.segment_code, shape.segment_code / 4, 0,
+                                    cmd->state.cond_render.enabled);
       }
    }
    /* Captured helper dispatches and indirect draws change tracked registers.

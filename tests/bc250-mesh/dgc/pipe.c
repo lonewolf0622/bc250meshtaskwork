@@ -11,6 +11,11 @@ static VkPipeline dgc_pipeline;
 static int dgc_task;
 static struct {VkPipeline pipeline;VkPipelineLayout layout;int task;} dgc_pipelines[32];
 static unsigned dgc_pipeline_count;
+static VkQueryPool dgc_query_pool;
+static VkBuffer dgc_predicate;
+static VkDeviceMemory dgc_predicate_memory;
+static int dgc_query_ended;
+static void dgc_reset_query(VkCommandBuffer cb);
 
 static int dgc_failed;
 static VkPipelineLayout dgc_pipeline_layout;
@@ -42,6 +47,8 @@ static void dgc_destroy_device(VkDevice device,const VkAllocationCallbacks *allo
    for(unsigned i=0;i<dgc_layout_count;i++)destroy(device,dgc_layouts[i],NULL);
    for(unsigned i=0;i<dgc_pipeline_count;i++)vkDestroyPipeline(device,dgc_pipelines[i].pipeline,NULL);
    for(unsigned i=0;i<dgc_compute_count;i++)vkDestroyPipeline(device,dgc_compute[i],NULL);
+   if(dgc_query_pool)vkDestroyQueryPool(device,dgc_query_pool,NULL);
+   if(dgc_predicate){vkDestroyBuffer(device,dgc_predicate,NULL);vkFreeMemory(device,dgc_predicate_memory,NULL);}
    vkDestroyDevice(device,alloc);
 }
 static VkResult dgc_create_device(VkPhysicalDevice pd, const VkDeviceCreateInfo *info,
@@ -51,14 +58,27 @@ static VkResult dgc_create_device(VkPhysicalDevice pd, const VkDeviceCreateInfo 
    VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT feature = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_EXT,
       .pNext = (void *)ci.pNext, .deviceGeneratedCommands = VK_TRUE};
-   for (VkBaseOutStructure *s = (void *)ci.pNext; s; s = s->pNext)
+   VkPhysicalDeviceFeatures core=ci.pEnabledFeatures?*ci.pEnabledFeatures:(VkPhysicalDeviceFeatures){0};
+   if(getenv("DGC_QUERY") && ci.pEnabledFeatures){core.pipelineStatisticsQuery=1;core.occlusionQueryPrecise=1;ci.pEnabledFeatures=&core;}
+   for (VkBaseOutStructure *s = (void *)ci.pNext; s; s = s->pNext) {
       if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)
          ((VkPhysicalDeviceVulkan12Features *)s)->bufferDeviceAddress = VK_TRUE;
+      if(getenv("DGC_QUERY") && s->sType==VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) {
+         ((VkPhysicalDeviceFeatures2 *)s)->features.pipelineStatisticsQuery=1;
+         ((VkPhysicalDeviceFeatures2 *)s)->features.occlusionQueryPrecise=1;
+      }
+      if(getenv("DGC_QUERY") && !strncmp(getenv("DGC_QUERY"),"mesh-",5) && s->sType==VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT)
+         ((VkPhysicalDeviceMeshShaderFeaturesEXT *)s)->meshShaderQueries=1;
+   }
    const char *extensions[16];
    for (uint32_t i = 0; i < ci.enabledExtensionCount; i++) extensions[i] = ci.ppEnabledExtensionNames[i];
    extensions[ci.enabledExtensionCount++] = VK_EXT_DEVICE_GENERATED_COMMANDS_EXTENSION_NAME;
+   if(getenv("DGC_CONDITIONAL"))extensions[ci.enabledExtensionCount++]=VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
    ci.ppEnabledExtensionNames = extensions;
    ci.pNext = &feature;
+   VkPhysicalDeviceConditionalRenderingFeaturesEXT conditional={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT,
+      .pNext=&feature,.conditionalRendering=1};
+   if(getenv("DGC_CONDITIONAL"))ci.pNext=&conditional;
    VkResult r = vkCreateDevice(pd, &ci, alloc, device);
    dgc_device = *device; dgc_physical = pd;
    return r;
@@ -67,7 +87,9 @@ static VkResult dgc_begin(VkCommandBuffer cb,const VkCommandBufferBeginInfo *inf
 {
    VkCommandBufferBeginInfo ci=*info;
    if(getenv("DGC_REJECT_SIMULT"))ci.flags|=VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
-   return vkBeginCommandBuffer(cb,&ci);
+   VkResult r=vkBeginCommandBuffer(cb,&ci);
+   if(!r)dgc_reset_query(cb);
+   return r;
 }
 static VkResult dgc_create_pipeline(VkDevice d, VkPipelineCache c, uint32_t n,
                                     const VkGraphicsPipelineCreateInfo *i, const VkAllocationCallbacks *a, VkPipeline *p)
@@ -102,6 +124,7 @@ static void dgc_buffer(VkDeviceSize bytes, uint32_t bits, VkBuffer *buffer, VkDe
    VkBufferCreateInfo ci = {.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=bytes,
       .usage=VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT|VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT|
              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT};
+   if(getenv("DGC_CONDITIONAL"))ci.usage|=VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
    VkBufferUsageFlags2CreateInfo usage = {.sType=VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO,
       .usage=ci.usage | (bits != ~0u ? VK_BUFFER_USAGE_2_PREPROCESS_BUFFER_BIT_EXT : 0)};
    ci.pNext=&usage;
@@ -125,6 +148,44 @@ static VkDeviceAddress dgc_address(VkBuffer buffer)
    VkBufferDeviceAddressInfo i={.sType=VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,.buffer=buffer};
    return vkGetBufferDeviceAddress(dgc_device,&i);
 }
+static void dgc_reset_query(VkCommandBuffer cb)
+{
+   dgc_query_ended=0;
+   if(!getenv("DGC_QUERY"))return;
+   if(!dgc_query_pool) {
+      const char *kind=getenv("DGC_QUERY");
+      VkQueryPoolCreateInfo ci={.sType=VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,.queryCount=1,
+         .queryType=!strcmp(kind,"occlusion")?VK_QUERY_TYPE_OCCLUSION:!strcmp(kind,"mesh-primitives")?VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT:VK_QUERY_TYPE_PIPELINE_STATISTICS,
+         .pipelineStatistics=VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT|
+           VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT};
+      if(!strcmp(kind,"mesh-pipeline"))ci.pipelineStatistics|=VK_QUERY_PIPELINE_STATISTIC_MESH_SHADER_INVOCATIONS_BIT_EXT|VK_QUERY_PIPELINE_STATISTIC_TASK_SHADER_INVOCATIONS_BIT_EXT;
+      CHECK(vkCreateQueryPool(dgc_device,&ci,NULL,&dgc_query_pool));
+   }
+   vkCmdResetQueryPool(cb,dgc_query_pool,0,1);
+}
+static void dgc_scope_begin(VkCommandBuffer cb)
+{
+   if(dgc_query_pool)vkCmdBeginQuery(cb,dgc_query_pool,0,!strcmp(getenv("DGC_QUERY"),"occlusion")?VK_QUERY_CONTROL_PRECISE_BIT:0);
+   if(getenv("DGC_CONDITIONAL")) {
+      if(!dgc_predicate) {
+         void *map;dgc_buffer(256,~0u,&dgc_predicate,&dgc_predicate_memory,&map);
+         if(dgc_failed)return;
+         *(uint32_t *)map=strtoul(getenv("DGC_CONDITIONAL"),NULL,0);
+      }
+      VkConditionalRenderingBeginInfoEXT ci={.sType=VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT,.buffer=dgc_predicate,
+         .flags=getenv("DGC_INVERTED")?VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT:0};
+      PFN_vkCmdBeginConditionalRenderingEXT begin=(void *)vkGetDeviceProcAddr(dgc_device,"vkCmdBeginConditionalRenderingEXT");begin(cb,&ci);
+   }
+}
+static void dgc_scope_end(VkCommandBuffer cb)
+{
+   if(getenv("DGC_CONDITIONAL")){PFN_vkCmdEndConditionalRenderingEXT end=(void *)vkGetDeviceProcAddr(dgc_device,"vkCmdEndConditionalRenderingEXT");end(cb);}
+   if(dgc_query_pool&&!dgc_query_ended)vkCmdEndQuery(cb,dgc_query_pool,0);
+}
+static void dgc_render_begin(VkCommandBuffer cb,const VkRenderPassBeginInfo *i,VkSubpassContents c){vkCmdBeginRenderPass(cb,i,c);dgc_scope_begin(cb);}
+static void dgc_render_end(VkCommandBuffer cb){dgc_scope_end(cb);vkCmdEndRenderPass(cb);}
+static void dgc_rendering_begin(VkCommandBuffer cb,const VkRenderingInfo *i){vkCmdBeginRendering(cb,i);dgc_scope_begin(cb);}
+static void dgc_rendering_end(VkCommandBuffer cb){dgc_scope_end(cb);vkCmdEndRendering(cb);}
 static void dgc_draw(VkCommandBuffer cb, int count)
 {
    PFN_vkCreateIndirectCommandsLayoutEXT create=(void *)vkGetDeviceProcAddr(dgc_device,"vkCreateIndirectCommandsLayoutEXT");
@@ -151,8 +212,9 @@ static void dgc_draw(VkCommandBuffer cb, int count)
    dgc_layouts[dgc_layout_count++]=layout;
    VkGeneratedCommandsPipelineInfoEXT pi={.sType=VK_STRUCTURE_TYPE_GENERATED_COMMANDS_PIPELINE_INFO_EXT,.pipeline=dgc_pipeline};
    unsigned draws=getenv("DGC_MAX_DRAWS")?strtoul(getenv("DGC_MAX_DRAWS"),NULL,0):2;
+   unsigned sequences=getenv("DGC_MAX_SEQUENCES")?strtoul(getenv("DGC_MAX_SEQUENCES"),NULL,0):2;
    VkGeneratedCommandsMemoryRequirementsInfoEXT mi={.sType=VK_STRUCTURE_TYPE_GENERATED_COMMANDS_MEMORY_REQUIREMENTS_INFO_EXT,
-      .pNext=&pi,.indirectCommandsLayout=layout,.maxSequenceCount=2,.maxDrawCount=draws};
+      .pNext=&pi,.indirectCommandsLayout=layout,.maxSequenceCount=sequences,.maxDrawCount=draws};
    VkMemoryRequirements2 mr={.sType=VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2}; requirements(dgc_device,&mi,&mr);
    if(getenv("DGC_REQUIREMENTS_ONLY")) {
       const unsigned bounds[]={1,3,4,8,64,128,256,511,512,4096,4097};
@@ -189,11 +251,11 @@ static void dgc_draw(VkCommandBuffer cb, int count)
       words[4]=11;words[12]=23;
 #endif
    }
-   words[count_offset/4]=2;
+   words[count_offset/4]=sequences;
    VkGeneratedCommandsInfoEXT info={.sType=VK_STRUCTURE_TYPE_GENERATED_COMMANDS_INFO_EXT,.pNext=&pi,
       .shaderStages=ci.shaderStages,.indirectCommandsLayout=layout,.indirectAddress=dgc_address(stream),
       .indirectAddressSize=64,.preprocessAddress=dgc_address(output),.preprocessSize=mr.memoryRequirements.size,
-      .maxSequenceCount=2,.sequenceCountAddress=dgc_address(stream)+count_offset,.maxDrawCount=draws};
+      .maxSequenceCount=sequences,.sequenceCountAddress=dgc_address(stream)+count_offset,.maxDrawCount=draws};
    const char *dump=getenv("BC250_DGC_DUMP");
    if(dump) {
       char path[4096];snprintf(path,sizeof(path),"%s/token-%u.bin",dump,count);
@@ -211,6 +273,7 @@ static void dgc_draw(VkCommandBuffer cb, int count)
       PFN_vkCmdPreprocessGeneratedCommandsEXT prepare=(void *)vkGetDeviceProcAddr(dgc_device,"vkCmdPreprocessGeneratedCommandsEXT");
       prepare(dgc_preprocess[n],&info,cb);
       CHECK(vkEndCommandBuffer(dgc_preprocess[n]));
+      if(getenv("DGC_QUERY_CHANGE")&&!dgc_query_ended){vkCmdEndQuery(cb,dgc_query_pool,0);dgc_query_ended=1;}
       execute(cb,VK_TRUE,&info);
    } else execute(cb,VK_FALSE,&info);
    puts("DGC_RECORDED");fflush(stdout);
@@ -238,6 +301,10 @@ static VkResult dgc_submit(VkQueue q,uint32_t n,const VkSubmitInfo *infos,VkFenc
    return vkQueueSubmit(q,n,infos,f);
 }
 #define vkCreateComputePipelines dgc_create_compute
+#define vkCmdBeginRenderPass dgc_render_begin
+#define vkCmdEndRenderPass dgc_render_end
+#define vkCmdBeginRendering dgc_rendering_begin
+#define vkCmdEndRendering dgc_rendering_end
 #define vkDestroyDevice dgc_destroy_device
 #define vkCmdBindPipeline dgc_bind_pipeline
 #define vkBeginCommandBuffer dgc_begin
