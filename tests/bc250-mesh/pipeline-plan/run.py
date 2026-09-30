@@ -151,6 +151,22 @@ for name, defs in [('plain', []), ('pieces', ['-DVERTS=128', '-DPRIMS=128', '-DL
 (out / 'summary.json').write_text(json.dumps(rows, indent=2) + '\n')
 
 policy_rows = []
+# Even with route reporting disabled, portable plans must not admit the raw exporter.
+raw_env = dict(env, RADV_BC250_MESH_NO_SPLIT='0', RADV_BC250_EXPAND_PRIMITIVES='0')
+for flag in ('SAFE_FAST', 'SAFE_PIECES', 'SAFE_OWNED', 'SAFE_LOCAL', 'SAFE_CHECK', 'SAFE_CORNERS',
+             'SAFE_AUTOCULL', 'SAFE_PARALLEL', 'SAFE_BARY', 'SAFE_BARY_TINY', 'SAFE_BARY_AFFINE', 'SAFE_BARY_LAST',
+             'SAFE_SPLIT_PIECES', 'SAFE_ADAPTIVE'):
+    raw_env['RADV_BC250_MESH_' + flag] = '0'
+for program in ('cache-pipe', 'gpl-pipe', 'object-pipe'):
+    raw_env.update(RADV_BC250_GPL_SOURCE_LINK='1', RADV_BC250_GPL_BINARY_LINK='1',
+                   RADV_BC250_SHADER_OBJECT_PLAN='1', GPL_MODE='compiled')
+    case = out / 'plain'
+    p = subprocess.run([str(out / program), str(case / 'mesh.spv'), str(case / 'frag.spv'), '-', '1'],
+                       env=raw_env, capture_output=True, text=True)
+    (out / (program + '-raw-refused.log')).write_text(p.stdout + p.stderr)
+    assert p.returncode == 1 and 'PIPELINE_RESULT=-8' in p.stdout and 'SUBMIT_OK' not in p.stdout
+print('three unproven raw executable refusals PASS', flush=True)
+
 case = out / 'plain'
 args = [str(out / 'binary-pipe'), str(case / 'mesh.spv'), str(case / 'frag.spv'), '-', '1']
 base_env = dict(env)

@@ -3710,6 +3710,8 @@ radv_graphics_pipeline_compile(struct radv_graphics_pipeline *pipeline, const Vk
    if (device->bc250_env.pipeline_plan && pipeline->base.shaders[MESA_SHADER_MESH]) {
       radv_bc250_capture_pipeline_plan(device, pipeline, &stages[MESA_SHADER_MESH]);
       radv_bc250_graphics_state_hash(device, pCreateInfo, gfx_state, pipeline->bc250_plan.state_hash);
+      if (!radv_bc250_pipeline_plan_admitted(&pipeline->bc250_plan, pipeline->base.shaders[MESA_SHADER_MESH]))
+         return VK_ERROR_FEATURE_NOT_PRESENT;
    }
 
    if (!skip_shaders_cache) {

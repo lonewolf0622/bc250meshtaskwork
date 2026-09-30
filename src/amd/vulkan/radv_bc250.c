@@ -5454,6 +5454,19 @@ radv_bc250_prepare_task(struct radv_device *device,
    return VK_SUCCESS;
 }
 
+bool
+radv_bc250_pipeline_plan_admitted(const struct radv_bc250_pipeline_plan *plan, const struct radv_shader *mesh)
+{
+   /* A matching hash proves identity, not that the raw exporter is safe.
+    * Preserve only routes selected by the proven direct/expansion paths or
+    * the separately materialized ordered producer. */
+   return radv_bc250_pipeline_plan_valid(plan) && mesh && mesh->info.stage == MESA_SHADER_MESH &&
+          !mesh->info.ms.has_task &&
+          (mesh->info.ms.bc250_safe_direct || mesh->info.ms.bc250_expanded ||
+           (plan->flags & (RADV_BC250_PLAN_TASK | RADV_BC250_PLAN_ORDERED)) ==
+              (RADV_BC250_PLAN_TASK | RADV_BC250_PLAN_ORDERED));
+}
+
 void
 radv_bc250_capture_pipeline_plan(const struct radv_device *device, struct radv_graphics_pipeline *pipeline,
                                  const struct radv_shader_stage *ms)
@@ -5501,7 +5514,7 @@ radv_bc250_restore_cached_plan(struct radv_device *device, struct radv_graphics_
                                struct radv_shader *producer, struct radv_shader *setup)
 {
    const uint8_t absent_hash[32] = {0};
-   if (!radv_bc250_pipeline_plan_valid(plan) || !mesh || mesh->info.stage != MESA_SHADER_MESH ||
+   if (!radv_bc250_pipeline_plan_admitted(plan, mesh) ||
        (fragment && fragment->info.stage != MESA_SHADER_FRAGMENT) ||
        memcmp(plan->mesh_hash, mesh->hash, sizeof(plan->mesh_hash)) ||
        memcmp(plan->fragment_hash, fragment ? fragment->hash : absent_hash, sizeof(plan->fragment_hash)) ||

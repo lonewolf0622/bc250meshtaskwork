@@ -895,6 +895,10 @@ radv_shader_object_create_linked(VkDevice _device, uint32_t createInfoCount, con
       radv_bc250_capture_pipeline_plan(device, &context->pipeline, ms);
       _mesa_blake3_compute(&gfx_state, sizeof(gfx_state), context->pipeline.bc250_plan.state_hash);
       bc250_plan = context->pipeline.bc250_plan;
+      if (!radv_bc250_pipeline_plan_admitted(&bc250_plan, shaders[MESA_SHADER_MESH])) {
+         compile_result = VK_ERROR_FEATURE_NOT_PRESENT;
+         goto object_fail;
+      }
       compile_result = radv_bc250_object_context_serialize(context);
       if (compile_result != VK_SUCCESS)
          goto object_fail;

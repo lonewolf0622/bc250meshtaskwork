@@ -147,6 +147,8 @@ struct radv_physical_device;
 struct radv_pipeline_layout;
 struct radv_bc250_pipeline_plan;
 struct radv_shader_stage;
+bool radv_bc250_pipeline_plan_admitted(const struct radv_bc250_pipeline_plan *plan,
+                                       const struct radv_shader *mesh);
 void radv_bc250_capture_pipeline_plan(const struct radv_device *device,
                                       struct radv_graphics_pipeline *pipeline,
                                       const struct radv_shader_stage *mesh_stage);
