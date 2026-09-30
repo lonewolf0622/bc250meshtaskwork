@@ -410,6 +410,9 @@ radv_create_pipeline_binary_from_pipeline(struct radv_device *device, const VkAl
             return result;
       }
    } else {
+      if (pipeline->type == RADV_PIPELINE_GRAPHICS_LIB &&
+          radv_pipeline_to_graphics_lib(pipeline)->bc250_source_only)
+         return VK_ERROR_FEATURE_NOT_PRESENT;
       for (uint32_t i = 0; i < MESA_VULKAN_SHADER_STAGES; i++) {
          if (!pipeline->shaders[i])
             continue;

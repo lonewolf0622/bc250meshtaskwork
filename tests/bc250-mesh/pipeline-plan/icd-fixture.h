@@ -1,3 +1,5 @@
+#ifndef BC250_ICD_FIXTURE_H
+#define BC250_ICD_FIXTURE_H
 /* SPDX-License-Identifier: MIT
  * Direct ICD fixture: probe hidden entrypoints without loader extension
  * trampolines or advertising unproven features to applications. */
@@ -58,3 +60,9 @@ fixture_create_instance(const VkInstanceCreateInfo *info, const VkAllocationCall
 #define vkUpdateDescriptorSets ((PFN_vkUpdateDescriptorSets)fixture_get_proc(fixture_instance, "vkUpdateDescriptorSets"))
 
 #define vkDestroyShaderModule ((PFN_vkDestroyShaderModule)fixture_get_proc(fixture_instance, "vkDestroyShaderModule"))
+
+#define vkCreatePipelineCache ((PFN_vkCreatePipelineCache)fixture_get_proc(fixture_instance, "vkCreatePipelineCache"))
+#define vkGetPipelineCacheData ((PFN_vkGetPipelineCacheData)fixture_get_proc(fixture_instance, "vkGetPipelineCacheData"))
+#define vkDestroyPipelineCache ((PFN_vkDestroyPipelineCache)fixture_get_proc(fixture_instance, "vkDestroyPipelineCache"))
+
+#endif

@@ -11,7 +11,7 @@ src = Path(__file__).resolve().parents[3]
 out = Path.cwd()
 env = dict(os.environ, VK_DRIVER_FILES=os.environ['ICD'], VK_ICD_FILENAMES=os.environ['ICD'],
            RADV_BC250_PIPELINE_PLAN='1', BC250_TRACE_COMPILE='1',
-           NIR_DEBUG='validate', ACO_DEBUG='validateir,validatera')
+           NIR_DEBUG='validate', ACO_DEBUG='validateir,validatera', BC250_CAPTURE_POLICY_SHADERS='1')
 policy = '''RADV_BC250_NATIVE_TASK=0 RADV_BC250_HYBRID_TASK=1 RADV_PERFTEST=mesh,nircache
 BC250_BALANCED_SLICES=true BC250_SINGLE_PIECE=true BC250_CACHE_PLAN=true
 BC250_TRANSIENT_ARENA=true BC250_PARALLEL_CULL=true BC250_COMPACT_VERTICES=false
@@ -46,6 +46,7 @@ def run(args, name):
 
 run(['cc', '-O1', '-Wall', '-o', 'cache-pipe', src / 'tests/bc250-mesh/pipeline-plan/pipe.c', '-lvulkan'], 'pipe-build')
 run(['cc', '-O1', '-Wall', '-o', 'binary-pipe', src / 'tests/bc250-mesh/pipeline-plan/binary-pipe.c', '-ldl'], 'binary-build')
+run(['cc', '-O1', '-Wall', '-o', 'gpl-pipe', src / 'tests/bc250-mesh/pipeline-plan/gpl-pipe.c', '-ldl'], 'gpl-build')
 env['TEST_ICD_LIBRARY'] = json.loads(Path(os.environ['ICD']).read_text())['ICD']['library_path']
 run(['cc', '-Wall', '-Werror', '-I' + str(src / 'src/amd/vulkan'), '-o', 'validate-plan',
      src / 'tests/bc250-mesh/pipeline-plan/validate.c'], 'validate-build')
@@ -72,6 +73,30 @@ for name, defs in [('plain', []), ('pieces', ['-DVERTS=128', '-DPRIMS=128', '-DL
     binary = run([out / 'binary-pipe', case / 'mesh.spv', case / 'frag.spv',
                   case / 'task.spv' if name.startswith('task') else '-', '1'], name + '-binary')
     assert 'BINARY_FOREIGN_PLAN_REFUSED' in binary and 'BINARY_ROUNDTRIP count=3 result=0' in binary and 'SUBMIT_OK' in binary, (name, binary[-4000:])
-    rows.append(dict(case=name, serialized_cache_hit=True, binary_roundtrip=True, submit_ok=True))
+    swap_mesh = env.pop('PLAN_SWAP_MESH')
+    env['RADV_BC250_GPL_SOURCE_LINK'] = '1'
+    for mode in ('fast', 'lto', 'nested'):
+        env['GPL_MODE'] = mode
+        linked = run([out / 'gpl-pipe', case / 'mesh.spv', case / 'frag.spv',
+                      case / 'task.spv' if name.startswith('task') else '-', '1'], name + '-gpl-' + mode)
+        assert 'GPL_SOURCE_LINK mode=' + mode + ' result=0' in linked and 'SUBMIT_OK' in linked
+        assert 'route=raw_unproven' not in linked
+        def shader_records(log):
+            return sorted({re.sub(r' va=[0-9a-f]+', '', line) for line in log.splitlines()
+                           if re.match(r'^BC250POLICY(CODE)? ', line)})
+        assert shader_records(text) and shader_records(text) == shader_records(linked), (name, mode, 'shader identity')
+        env['GPL_FINAL_BINARY'] = '1'
+        imported = run([out / 'gpl-pipe', case / 'mesh.spv', case / 'frag.spv',
+                        case / 'task.spv' if name.startswith('task') else '-', '1'], name + '-gpl-' + mode + '-binary')
+        env.pop('GPL_FINAL_BINARY')
+        assert 'BINARY_ROUNDTRIP count=3 result=0' in imported and 'SUBMIT_OK' in imported
+        assert shader_records(text) == shader_records(imported), (name, mode, 'binary shader identity')
+
+
+    env['PLAN_SWAP_MESH'] = swap_mesh
+    env.pop('RADV_BC250_GPL_SOURCE_LINK')
+    env.pop('GPL_MODE')
+    rows.append(dict(case=name, serialized_cache_hit=True, binary_roundtrip=True, submit_ok=True,
+                     gpl_source_links=['fast_request', 'lto', 'nested']))
     print(name, 'PASS', flush=True)
 (out / 'summary.json').write_text(json.dumps(rows, indent=2) + '\n')

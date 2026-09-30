@@ -60,5 +60,8 @@ cache_roundtrip(VkDevice device, VkPipelineCache unused_cache, uint32_t count,
    return result;
 }
 
+#undef vkCreateGraphicsPipelines
 #define vkCreateGraphicsPipelines cache_roundtrip
+#ifndef BC250_PIPELINE_PLAN_FIXTURE_ONLY
 #include "../safe-direct/pipe.c"
+#endif

@@ -167,4 +167,6 @@ binary_roundtrip(VkDevice device, VkPipelineCache cache, uint32_t count,
 #define vkCreateInstance binary_create_instance
 #undef vkCreateGraphicsPipelines
 #define vkCreateGraphicsPipelines binary_roundtrip
+#ifndef BC250_PIPELINE_PLAN_FIXTURE_ONLY
 #include "../safe-direct/pipe.c"
+#endif

@@ -191,6 +191,7 @@ struct radv_graphics_lib_pipeline {
 
    VkGraphicsPipelineLibraryFlagsEXT lib_flags;
 
+   bool bc250_source_only;
    struct radv_retained_shaders retained_shaders;
 
    void *mem_ctx;

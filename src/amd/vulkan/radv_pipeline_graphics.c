@@ -2300,7 +2300,7 @@ radv_pipeline_load_retained_shaders(const struct radv_device *device, const VkGr
       return;
 
    /* Nothing to load if fast-linking is enabled and if there is no retained shaders. */
-   if (radv_should_import_lib_binaries(create_flags))
+   if (radv_should_import_lib_binaries(create_flags) && !device->bc250_env.gpl_source_link)
       return;
 
    for (uint32_t i = 0; i < libs_info->libraryCount; i++) {
@@ -4052,6 +4052,12 @@ radv_graphics_pipeline_init(struct radv_graphics_pipeline *pipeline, struct radv
    struct radv_graphics_pipeline_state gfx_state;
    VkResult result = VK_SUCCESS;
 
+   /* A partial BC250 interface cannot prove barycentric slot ownership or
+    * the Task consumer route. Recompile the merged source at the final link,
+    * including when the application requests a link without LTO. */
+   if (device->bc250_env.gpl_source_link)
+      fast_linking_enabled = false;
+
    pipeline->last_vgt_api_stage = MESA_SHADER_NONE;
 
    const VkPipelineLibraryCreateInfoKHR *libs_info =
@@ -4272,9 +4278,51 @@ radv_graphics_lib_pipeline_init(struct radv_graphics_lib_pipeline *pipeline, str
       if (result != VK_SUCCESS)
          return result;
 
-      result =
-         radv_graphics_pipeline_compile(&pipeline->base, pCreateInfo, &gfx_state, device, cache, fast_linking_enabled);
+      if (device->bc250_env.gpl_source_link) {
+         VkPipelineShaderStageCreateInfo source[MESA_VULKAN_SHADER_STAGES];
+         unsigned count = 0;
+         if (libs_info) {
+            for (unsigned i = 0; i < libs_info->libraryCount; i++) {
+               VK_FROM_HANDLE(radv_pipeline, imported, libs_info->pLibraries[i]);
+               struct radv_graphics_lib_pipeline *lib = radv_pipeline_to_graphics_lib(imported);
+               if (!lib->bc250_source_only || count + lib->stage_count > ARRAY_SIZE(source)) {
+                  result = VK_ERROR_FEATURE_NOT_PRESENT;
+                  goto source_done;
+               }
+               if (lib->stage_count)
+                  memcpy(source + count, lib->stages, lib->stage_count * sizeof(source[0]));
+               count += lib->stage_count;
+            }
+         }
+         if (count + pCreateInfo->stageCount > ARRAY_SIZE(source)) {
+            result = VK_ERROR_FEATURE_NOT_PRESENT;
+            goto source_done;
+         }
+         if (pCreateInfo->stageCount)
+            memcpy(source + count, pCreateInfo->pStages, pCreateInfo->stageCount * sizeof(source[0]));
+         count += pCreateInfo->stageCount;
+         for (unsigned i = 0; i < count; i++) {
+            mesa_shader_stage stage = vk_to_mesa_shader_stage(source[i].stage);
+            if (!gfx_state.stages[stage].spirv.size || gfx_state.stages[stage].layout.mapping) {
+               result = VK_ERROR_FEATURE_NOT_PRESENT;
+               goto source_done;
+            }
+            pipeline->stage_keys[stage] = gfx_state.stages[stage].key;
+         }
+         pipeline->stages = radv_copy_shader_stage_create_info(device, count, source, pipeline->mem_ctx);
+         if (!pipeline->stages) {
+            result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto source_done;
+         }
+         pipeline->stage_count = count;
+         pipeline->bc250_source_only = true;
+         result = VK_SUCCESS;
+      } else {
+         result =
+            radv_graphics_pipeline_compile(&pipeline->base, pCreateInfo, &gfx_state, device, cache, fast_linking_enabled);
+      }
 
+source_done:
       radv_graphics_pipeline_state_finish(device, &gfx_state);
    }
 
