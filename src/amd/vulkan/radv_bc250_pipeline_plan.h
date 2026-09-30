@@ -28,6 +28,7 @@ struct radv_bc250_pipeline_plan {
    uint32_t bary_slots;
    /* Exact compiler policy bytes, including adaptive in the primitive ceiling byte. */
    uint8_t route_key[24];
+   /* Includes safe compact, dead payload and piece PrimitiveId policy bits. */
    uint8_t hardware_key[8];
    /* Bind the plan to the exact graphics executables, not just their policy. */
    uint8_t mesh_hash[32];

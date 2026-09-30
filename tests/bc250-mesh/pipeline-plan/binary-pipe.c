@@ -68,7 +68,43 @@ binary_roundtrip(VkDevice device, VkPipelineCache cache, uint32_t count,
          return result;
       destroy(device, binaries[i], NULL);
    }
+   const char *write_path = getenv("PLAN_BINARY_WRITE");
+   const char *read_path = getenv("PLAN_BINARY_READ");
+   if (write_path) {
+      FILE *file = fopen(write_path, "wb");
+      if (!file || fwrite(&n, sizeof(n), 1, file) != 1)
+         return VK_ERROR_UNKNOWN;
+      for (unsigned i = 0; i < n; i++) {
+         const uint64_t size = data[i].dataSize;
+         if (fwrite(&keys[i], sizeof(keys[i]), 1, file) != 1 ||
+             fwrite(&size, sizeof(size), 1, file) != 1 ||
+             fwrite(data[i].pData, 1, size, file) != size)
+            return VK_ERROR_UNKNOWN;
+      }
+      if (fclose(file))
+         return VK_ERROR_UNKNOWN;
+   }
+   if (read_path) {
+      FILE *file = fopen(read_path, "rb");
+      unsigned stored_count;
+      if (!file || fread(&stored_count, sizeof(stored_count), 1, file) != 1 || stored_count != n)
+         return VK_ERROR_UNKNOWN;
+      for (unsigned i = 0; i < n; i++) {
+         uint64_t size;
+         if (fread(&keys[i], sizeof(keys[i]), 1, file) != 1 ||
+             fread(&size, sizeof(size), 1, file) != 1 || !size || size > (UINT64_C(128) << 20))
+            return VK_ERROR_UNKNOWN;
+         free(data[i].pData);
+         data[i].dataSize = size;
+         data[i].pData = malloc(size);
+         if (!data[i].pData || fread(data[i].pData, 1, size, file) != size)
+            return VK_ERROR_UNKNOWN;
+      }
+      if (fgetc(file) != EOF || fclose(file))
+         return VK_ERROR_UNKNOWN;
+   }
    vkDestroyPipeline(device, *pipelines, alloc);
+   *pipelines = VK_NULL_HANDLE;
    VkPipelineBinaryKeysAndDataKHR kd = {.binaryCount = n, .pPipelineBinaryKeys = keys,
                                        .pPipelineBinaryData = data};
    ci.pipeline = VK_NULL_HANDLE;
@@ -138,6 +174,16 @@ binary_roundtrip(VkDevice device, VkPipelineCache cache, uint32_t count,
       printf("BINARY_FOREIGN_PLAN_REFUSED\n");
    }
    result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &info, alloc, pipelines);
+   if (getenv("PLAN_BINARY_EXPECT_REFUSAL")) {
+      for (unsigned i = 0; i < n; i++) {
+         destroy(device, binaries[i], NULL);
+         free(data[i].pData);
+      }
+      if (result != VK_ERROR_FEATURE_NOT_PRESENT || *pipelines != VK_NULL_HANDLE)
+         return VK_ERROR_UNKNOWN;
+      printf("BINARY_POLICY_PLAN_REFUSED\n");
+      return result;
+   }
    for (unsigned i = 0; i < n; i++) {
       destroy(device, binaries[i], NULL);
    }

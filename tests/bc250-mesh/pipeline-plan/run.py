@@ -26,6 +26,10 @@ SAFE_AUTOCULL SAFE_PARALLEL SAFE_BARY SAFE_BARY_TINY SAFE_BARY_AFFINE SAFE_BARY_
 ALLOW_POS1 SPLIT_ANY NESTED_SLICE SAFE_SPLIT_PIECES'''.split():
     env['RADV_BC250_MESH_' + flag] = '1'
 env.update(RADV_BC250_BARY_IO16='1', RADV_BC250_BARY_CORNER_ID='1')
+hw_flags = ['RADV_BC250_MESH_SAFE_COMPACT', 'RADV_BC250_MESH_DEAD_PAYLOAD', 'RADV_BC250_MESH_PIECE_PRIMID']
+hw_policy = os.environ.get('PLAN_HW_POLICY', 'off')
+assert hw_policy in ('off', 'on')
+env.update({flag: '1' if hw_policy == 'on' else '0' for flag in hw_flags})
 variant = os.environ.get('PLAN_VARIANT', 'default')
 assert variant in ('default', 'adaptive', 'corner-id')
 if variant == 'adaptive':
@@ -100,3 +104,28 @@ for name, defs in [('plain', []), ('pieces', ['-DVERTS=128', '-DPRIMS=128', '-DL
                      gpl_source_links=['fast_request', 'lto', 'nested']))
     print(name, 'PASS', flush=True)
 (out / 'summary.json').write_text(json.dumps(rows, indent=2) + '\n')
+
+policy_rows = []
+case = out / 'plain'
+args = [str(out / 'binary-pipe'), str(case / 'mesh.spv'), str(case / 'frag.spv'), '-', '1']
+base_env = dict(env)
+base_env.pop('PLAN_SWAP_MESH', None)
+base_env.update({flag: '0' for flag in hw_flags})
+policies = {'off': {flag: '0' for flag in hw_flags}, 'on': {flag: '1' for flag in hw_flags}}
+policies.update({flag: {name: str(int(name == flag)) for name in hw_flags} for flag in hw_flags})
+for name, flags in policies.items():
+    file = out / ('policy-' + name + '.bin')
+    e = dict(base_env, **flags, PLAN_BINARY_WRITE=str(file))
+    result = subprocess.run(args, env=e, capture_output=True, text=True)
+    (out / ('policy-write-' + name + '.log')).write_text(result.stdout + result.stderr)
+    assert result.returncode == 0, (name, result.stdout, result.stderr[-4000:])
+for source, target in [('off', name) for name in policies if name != 'off'] + [(name, 'off') for name in policies if name != 'off']:
+    e = dict(base_env, **policies[target], PLAN_BINARY_READ=str(out / ('policy-' + source + '.bin')),
+             PLAN_BINARY_EXPECT_REFUSAL='1')
+    result = subprocess.run(args, env=e, capture_output=True, text=True)
+    log = result.stdout + result.stderr
+    (out / ('policy-' + source + '-to-' + target + '.log')).write_text(log)
+    assert result.returncode == 1 and 'BINARY_POLICY_PLAN_REFUSED' in log and 'SUBMIT_OK' not in log, log[-4000:]
+    policy_rows.append(dict(source=source, target=target, refused=True))
+(out / 'policy-summary.json').write_text(json.dumps(policy_rows, indent=2) + '\n')
+print('hardware-policy cross-import refusals', len(policy_rows), 'PASS', flush=True)
