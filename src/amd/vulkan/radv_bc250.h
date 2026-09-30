@@ -131,6 +131,10 @@ struct nir_shader;
 void radv_bc250_mesh_set_wave(struct nir_shader *nir, unsigned wave);
 /* RADV_BC250_MESH_PIECE_PRIMID: set only around the safe direct pieces split. */
 extern __thread bool radv_bc250_split_piece_primid;
+/* RADV_BC250_MESH_SAFE_PIECES_EXT: set only around the owned admission of a split piece with every
+ * direct-read part on. The private-corner LDS estimate then leaves out the per-vertex attribute copies
+ * (read directly at export); an actual overflow still spills to the scratch ring and is refused. */
+extern __thread bool radv_bc250_owned_lds_direct;
 /* RADV_BC250_TASK_GRID_FOLD: set only around the Task-route split. */
 extern __thread bool radv_bc250_split_task_grid_fold;
 void radv_bc250_directmesh_env(void);

@@ -2522,8 +2522,9 @@ bc250_safe_bary_tiny_candidate(nir_shader *mesh, bool last)
    const unsigned vertices = corners * mesh->info.mesh.max_primitives_out;
    const unsigned threads = mesh->info.workgroup_size[0] * mesh->info.workgroup_size[1] *
                             mesh->info.workgroup_size[2];
+   const unsigned attribute_copies = radv_bc250_owned_lds_direct ? 0 : 16 * slots * vertices;
    return vertices == mesh->info.mesh.max_vertices_out && vertices <= ((corners == 3 || last) ? 256 : 32) && threads <= 256 &&
-      align(mesh->info.shared_size, 16) + 128 + 16 * slots * vertices +
+      align(mesh->info.shared_size, 16) + 128 + attribute_copies +
          3 * mesh->info.mesh.max_primitives_out < 30 * 1024;
 }
 
@@ -2980,6 +2981,7 @@ bc250_slice_rebuild_deref(nir_builder *b, nir_deref_instr *d, nir_variable *targ
 __thread bool radv_bc250_split_refused_retry;
 __thread bool radv_bc250_split_piece_primid;
 __thread bool radv_bc250_split_task_grid_fold;
+__thread bool radv_bc250_owned_lds_direct;
 
 /* RADV_BC250_MESH_PIECE_PRIMID: the Mesh shader writes PrimitiveId as one scalar 32-bit integer per
  * primitive. The split slices it like any other per-primitive output, so each piece exports the value

@@ -2748,13 +2748,18 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
                                             !gfx_state->rs.provoking_vtx_last))))
             break;
          const bool use_tiny = tiny_bary && !attempt;
-         if (!radv_bc250_mesh_safe_owned(&owned_ms->nir, &stages[MESA_SHADER_FRAGMENT].nir,
+         radv_bc250_owned_lds_direct = compiler_info->bc250x.safe_pieces_ext && use_tiny &&
+            owned_ms->bc250_split_mesh &&
+            (compiler_info->key.bc250_mesh_direct_read & RADV_BC250_DIRECT_READ_ALL) == RADV_BC250_DIRECT_READ_ALL;
+         const bool owned_ok = radv_bc250_mesh_safe_owned(&owned_ms->nir, &stages[MESA_SHADER_FRAGMENT].nir,
                                         compiler_info->key.bc250_mesh_safe_corners,
                                         private_bary, use_tiny, compiler_info->key.bc250_mesh_safe_bary_last,
                                         compiler_info->key.bc250_bary_io16, safe_split_pieces,
                                         compiler_info->key.mesh_shader_queries,
                                         compiler_info->key.bc250_mesh_direct_read & RADV_BC250_DIRECT_READ_ALL,
-                                        owned_ms->bc250_index_staging, &owned_ms->bc250_pp_locations))
+                                        owned_ms->bc250_index_staging, &owned_ms->bc250_pp_locations);
+         radv_bc250_owned_lds_direct = false;
+         if (!owned_ok)
             continue;
          owned_ms->bc250_safe_owned = true;
          owned_ms->bc250_safe_bary_tiny = use_tiny;
