@@ -229,7 +229,7 @@ bc250_dgc_state_valid(const struct radv_cmd_buffer *state, const VkGeneratedComm
    if (!p || state->qf != RADV_QUEUE_GENERAL || state->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY ||
        (state->vk.pool->flags & VK_COMMAND_POOL_CREATE_PROTECTED_BIT) ||
        (state->usage_flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT) ||
-       s->graphics_pipeline != radv_pipeline_to_graphics(p) || s->render.view_mask || state->gang.cs ||
+       s->graphics_pipeline != radv_pipeline_to_graphics(p) || !s->render.active || s->render.view_mask || state->gang.cs ||
        s->render.vrs_att.iview || s->uses_vrs_attachment || s->force_vrs_per_vertex ||
        s->active_pipeline_ace_queries || s->active_prims_xfb_queries || s->active_emulated_prims_xfb_queries ||
        s->streamout.enabled_mask || device->sqtt.bo || device->utrace.context || device->bc250_timer.enabled ||
