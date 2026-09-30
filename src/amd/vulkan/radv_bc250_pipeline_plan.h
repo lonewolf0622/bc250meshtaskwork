@@ -8,13 +8,14 @@
 /* Separate from radv_shader_info: the switch-off shader binary layout and
  * compiler keys must remain unchanged. Executable shaders remain ordinary
  * cache objects; a plan references its two private compute shaders last. */
-#define RADV_BC250_PIPELINE_PLAN_VERSION 7u
+#define RADV_BC250_PIPELINE_PLAN_VERSION 8u
 #define RADV_BC250_PLAN_TASK (1u << 0)
 #define RADV_BC250_PLAN_ORDERED (1u << 1)
 #define RADV_BC250_PLAN_ORDER_FREE (1u << 2)
 #define RADV_BC250_PLAN_CORNERS (1u << 3)
 #define RADV_BC250_PLAN_SPLIT (1u << 4)
-#define RADV_BC250_PLAN_FLAGS 31u
+#define RADV_BC250_PLAN_EMPTY (1u << 5)
+#define RADV_BC250_PLAN_FLAGS 63u
 
 struct radv_bc250_pipeline_plan {
    uint32_t version;
@@ -31,6 +32,8 @@ struct radv_bc250_pipeline_plan {
    uint8_t route_key[24];
    /* Includes safe compact, dead payload, piece PrimitiveId and fail-closed policy bits. */
    uint8_t hardware_key[8];
+   /* Task grid fold, extended safe pieces, shared provoking corners and lean checks. */
+   uint8_t extended_key[4];
    /* Bind the plan to the exact graphics executables, not just their policy. */
    uint8_t mesh_hash[32];
    uint8_t fragment_hash[32];

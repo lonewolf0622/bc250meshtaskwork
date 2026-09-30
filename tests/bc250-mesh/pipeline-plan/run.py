@@ -26,7 +26,8 @@ SAFE_AUTOCULL SAFE_PARALLEL SAFE_BARY SAFE_BARY_TINY SAFE_BARY_AFFINE SAFE_BARY_
 ALLOW_POS1 SPLIT_ANY NESTED_SLICE SAFE_SPLIT_PIECES'''.split():
     env['RADV_BC250_MESH_' + flag] = '1'
 env.update(RADV_BC250_BARY_IO16='1', RADV_BC250_BARY_CORNER_ID='1')
-hw_flags = ['RADV_BC250_MESH_SAFE_COMPACT', 'RADV_BC250_MESH_DEAD_PAYLOAD', 'RADV_BC250_MESH_PIECE_PRIMID', 'RADV_BC250_MESH_FAIL_CLOSED']
+hw_flags = ['RADV_BC250_MESH_SAFE_COMPACT', 'RADV_BC250_MESH_DEAD_PAYLOAD', 'RADV_BC250_MESH_PIECE_PRIMID', 'RADV_BC250_MESH_FAIL_CLOSED', 'RADV_BC250_TASK_GRID_FOLD',
+            'RADV_BC250_MESH_SAFE_PIECES_EXT', 'RADV_BC250_MESH_PP_SHARE', 'RADV_BC250_MESH_LEAN_CHECK']
 hw_policy = os.environ.get('PLAN_HW_POLICY', 'off')
 assert hw_policy in ('off', 'on')
 env.update({flag: '1' if hw_policy == 'on' else '0' for flag in hw_flags})
@@ -66,7 +67,10 @@ env['PLAN_SWAP_MESH'] = str(out / 'swap.mesh.spv')
 rows = []
 for name, defs in [('plain', []), ('pieces', ['-DVERTS=128', '-DPRIMS=128', '-DLANES=128']),
                    ('task', ['-DTASK=1']), ('task-pieces', ['-DTASK=1', '-DVERTS=128', '-DPRIMS=128', '-DLANES=128']),
-                   ('bary', ['-DBARY=1']), ('task-bary', ['-DTASK=1', '-DBARY=1'])]:
+                   ('bary', ['-DBARY=1']), ('task-bary', ['-DTASK=1', '-DBARY=1']),
+                   ('share', ['-DPERPRIM=1', '-DNOCULL=1', '-DVERTS=64', '-DPRIMS=64', '-DLANES=64'])]:
+    if name == 'share':
+        env['RADV_BC250_MESH_SAFE_BARY_TINY'] = '0'
     case = out / name
     case.mkdir(exist_ok=True)
     defs = list({x.split('=')[0]: x for x in ['-DVERTS=32', '-DPRIMS=32', '-DLANES=32'] + defs}.values())
@@ -77,6 +81,8 @@ for name, defs in [('plain', []), ('pieces', ['-DVERTS=128', '-DPRIMS=128', '-DL
                 case / 'task.spv' if name.startswith('task') else '-', '1'], name)
     if variant == 'corner-id' and name == 'bary':
         assert 'rotation from corner id' in text, text[-4000:]
+    if name == 'share' and hw_policy == 'on' and variant == 'default':
+        assert 'BC250 MESH PP SHARE: applied' in text, text[-4000:]
     assert 'CACHE_ROUNDTRIP' in text and 'hit=1' in text and 'SUBMIT_OK' in text, (name, text[-4000:])
     assert not re.search(r'validation failed|NIR_VALIDATE|Assertion .*failed', text)
     binary = run([out / 'binary-pipe', case / 'mesh.spv', case / 'frag.spv',
@@ -185,6 +191,51 @@ for program in ('cache-pipe', 'gpl-pipe', 'object-pipe'):
     assert text.returncode == 0 and 'SUBMIT_OK' in log and re.search(r'merge_k=[2-9]', log), log[-4000:]
     assert 'route=merged' in log and 'raw_unproven' not in log, log[-4000:]
 print('three protected merged executable restorations PASS', flush=True)
+
+# Literal empty outputs must retain the compiler exemption after every import.
+# Folded Task records must retain the selected producer and Mesh decoder together.
+for label, mesh_source, defs, task_source in (
+        ('empty', 'pipeline-plan/empty.mesh', [], None),
+        ('fold', 'compact/cmp.mesh', ['-DTASK=1', '-DVERTS=128', '-DPRIMS=128', '-DLANES=128'],
+         'pipeline-plan/fold.task')):
+    case = out / label
+    case.mkdir(exist_ok=True)
+    for stage, source in [('mesh', mesh_source), ('frag', 'compact/cmp.frag')] + (
+            [('task', task_source)] if task_source else []):
+        run(['glslangValidator', '--target-env', 'vulkan1.3', '-S', stage, *defs,
+             '-o', case / (stage + '.spv'), src / ('tests/bc250-mesh/' + source)], label + '-' + stage)
+    special = dict(raw_env, RADV_BC250_PIPELINE_PLAN='1', RADV_BC250_MESH_FAIL_CLOSED='1',
+                   RADV_BC250_MESH_SAFE_BARY_LAST='1', RADV_BC250_EXPAND_PRIMITIVES='1',
+                   RADV_BC250_TASK_GRID_FOLD='1', RADV_BC250_MESH_NO_SPLIT='1' if label == 'empty' else '0',
+                   OBJECT_SKIP_PIPELINE='0')
+    special.pop('PLAN_SWAP_MESH', None)
+    signatures = []
+    for program in ('cache-pipe', 'binary-pipe', 'gpl-pipe', 'object-pipe',
+                    'gpl-pipe-fast', 'gpl-pipe-lto', 'gpl-pipe-nested'):
+        special['GPL_MODE'] = program.removeprefix('gpl-pipe-') if program.startswith('gpl-pipe-') else 'compiled'
+        executable = 'gpl-pipe' if program.startswith('gpl-pipe-') else program
+        args_special = [str(out / executable), str(case / 'mesh.spv'), str(case / 'frag.spv'),
+                        str(case / 'task.spv') if task_source else '-', '1']
+        p = subprocess.run(args_special, env=special, capture_output=True, text=True)
+        log = p.stdout + p.stderr
+        (out / (label + '-' + program + '.log')).write_text(log)
+        marker = 'BC250 MESH EMPTY:' if label == 'empty' else 'BC250 TASK GRID FOLD:'
+        assert p.returncode == 0 and 'SUBMIT_OK' in log and marker in log, log[-4000:]
+        assert not re.search(r'validation failed|NIR_VALIDATE|Assertion .*failed', log)
+        mesh_records = []
+        lines = log.splitlines()
+        for index, line in enumerate(lines):
+            if line.startswith('BC250POLICY stage=7 '):
+                mesh_records.append(re.sub(r' va=[0-9a-f]+', '', line))
+                assert lines[index + 1].startswith('BC250POLICYCODE ')
+                mesh_records.append(lines[index + 1])
+        signatures.append(sorted(set(mesh_records)))
+        if label == 'empty':
+            assert 'route=empty' in log and 'raw_unproven' not in log
+        if label == 'fold':
+            assert 'records=(pieces,x,y)' in log
+    assert signatures[0] and all(sig == signatures[0] for sig in signatures), label + ' shader identity'
+    print(label + ' cache/binary/compiled-GPL/object restorations PASS', flush=True)
 
 case = out / 'plain'
 args = [str(out / 'binary-pipe'), str(case / 'mesh.spv'), str(case / 'frag.spv'), '-', '1']

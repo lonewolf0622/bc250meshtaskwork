@@ -176,6 +176,6 @@ void radv_bc250_draw_merge_indirect(struct radv_cmd_buffer *cmd_buffer, unsigned
 
 struct radv_shader;
 void radv_bc250_report_mesh_route(const struct radv_device *device, const struct radv_shader *shader,
-                                  const char *object, unsigned pieces, bool task, bool ordered);
+                                  const char *object, unsigned pieces, bool task, bool ordered, bool empty);
 
 #endif

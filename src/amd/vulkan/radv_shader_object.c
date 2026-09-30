@@ -22,7 +22,7 @@ struct radv_shader_object_metadata {
    uint32_t dynamic_offset_count;
 };
 
-#define RADV_BC250_OBJECT_MAGIC UINT64_C(0x374a424f30353242)
+#define RADV_BC250_OBJECT_MAGIC UINT64_C(0x384a424f30353242)
 
 struct radv_bc250_shader_object_context {
    int refs;
@@ -226,6 +226,7 @@ radv_bc250_shader_object_policy(struct radv_device *device, struct radv_shader_o
    obj->bc250_policy_valid = true;
    memcpy(obj->bc250_route_key, &device->compiler_info.key, sizeof(obj->bc250_route_key));
    memcpy(obj->bc250_hardware_key, &device->compiler_info.hw, sizeof(obj->bc250_hardware_key));
+   memcpy(obj->bc250_extended_key, &device->compiler_info.bc250x, sizeof(obj->bc250_extended_key));
 }
 
 static void
@@ -620,6 +621,7 @@ radv_shader_object_init(struct radv_shader_object *shader_obj, struct radv_devic
             return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
          blob_copy_bytes(&blob, shader_obj->bc250_route_key, sizeof(shader_obj->bc250_route_key));
          blob_copy_bytes(&blob, shader_obj->bc250_hardware_key, sizeof(shader_obj->bc250_hardware_key));
+         blob_copy_bytes(&blob, shader_obj->bc250_extended_key, sizeof(shader_obj->bc250_extended_key));
          blob_copy_bytes(&blob, shader_obj->bc250_layout_hash, sizeof(shader_obj->bc250_layout_hash));
          blob_copy_bytes(&blob, &shader_obj->bc250_plan, sizeof(shader_obj->bc250_plan));
          const uint64_t context_size = blob_read_uint64(&blob);
@@ -636,7 +638,8 @@ radv_shader_object_init(struct radv_shader_object *shader_obj, struct radv_devic
          const uint8_t *stored_hash = blob_read_bytes(&blob, sizeof(hash));
          if (blob.overrun || blob.current != blob.end || memcmp(hash, stored_hash, sizeof(hash)) ||
              memcmp(shader_obj->bc250_route_key, &device->compiler_info.key, sizeof(shader_obj->bc250_route_key)) ||
-             memcmp(shader_obj->bc250_hardware_key, &device->compiler_info.hw, sizeof(shader_obj->bc250_hardware_key)))
+             memcmp(shader_obj->bc250_hardware_key, &device->compiler_info.hw, sizeof(shader_obj->bc250_hardware_key)) ||
+             memcmp(shader_obj->bc250_extended_key, &device->compiler_info.bc250x, sizeof(shader_obj->bc250_extended_key)))
             return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
          if (shader_obj->bc250_plan.version) {
             const struct radv_bc250_pipeline_plan *plan = &shader_obj->bc250_plan;
@@ -648,7 +651,8 @@ radv_shader_object_init(struct radv_shader_object *shader_obj, struct radv_devic
                 (task && (shader_obj->shader || !(plan->flags & RADV_BC250_PLAN_TASK))) ||
                 (shader_obj->stage != MESA_SHADER_MESH && shader_obj->stage != MESA_SHADER_FRAGMENT && !task) ||
                 memcmp(plan->route_key, shader_obj->bc250_route_key, sizeof(plan->route_key)) ||
-                memcmp(plan->hardware_key, shader_obj->bc250_hardware_key, sizeof(plan->hardware_key)))
+                memcmp(plan->hardware_key, shader_obj->bc250_hardware_key, sizeof(plan->hardware_key)) ||
+                memcmp(plan->extended_key, shader_obj->bc250_extended_key, sizeof(plan->extended_key)))
                return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
             result = radv_bc250_object_context_import(device, pCreateInfo, shader_obj, context_data, context_size);
             if (result != VK_SUCCESS)
@@ -714,7 +718,8 @@ radv_shader_object_create(VkDevice _device, const VkShaderCreateInfoEXT *pCreate
    radv_bc250_report_mesh_route(device, shader_obj->shader, "shader_object",
                                MAX2(shader_obj->bc250_plan.direct_pieces, shader_obj->bc250_plan.split_pieces),
                                shader_obj->bc250_plan.flags & RADV_BC250_PLAN_TASK,
-                               shader_obj->bc250_plan.flags & RADV_BC250_PLAN_ORDERED);
+                               shader_obj->bc250_plan.flags & RADV_BC250_PLAN_ORDERED,
+                               shader_obj->bc250_plan.flags & RADV_BC250_PLAN_EMPTY);
    *pShader = radv_shader_object_to_handle(shader_obj);
 
    return VK_SUCCESS;
@@ -965,7 +970,8 @@ radv_shader_object_create_linked(VkDevice _device, uint32_t createInfoCount, con
       radv_bc250_report_mesh_route(device, shader_obj->shader, "linked_shader_object",
                                   MAX2(shader_obj->bc250_plan.direct_pieces, shader_obj->bc250_plan.split_pieces),
                                   shader_obj->bc250_plan.flags & RADV_BC250_PLAN_TASK,
-                                  shader_obj->bc250_plan.flags & RADV_BC250_PLAN_ORDERED);
+                                  shader_obj->bc250_plan.flags & RADV_BC250_PLAN_ORDERED,
+                                  shader_obj->bc250_plan.flags & RADV_BC250_PLAN_EMPTY);
       pShaders[i] = radv_shader_object_to_handle(shader_obj);
    }
 
@@ -1123,11 +1129,13 @@ radv_get_shader_object_size(const struct radv_shader_object *shader_obj)
       size += radv_get_shader_binary_size(shader_obj->gs.copy_binary);
    }
 
-   if (shader_obj->bc250_policy_valid)
+   if (shader_obj->bc250_policy_valid) {
       size = align(size, 8) + 16 + sizeof(shader_obj->bc250_route_key) +
-         sizeof(shader_obj->bc250_hardware_key) + sizeof(shader_obj->bc250_layout_hash) +
-         sizeof(shader_obj->bc250_plan) + 8 +
+         sizeof(shader_obj->bc250_hardware_key) + sizeof(shader_obj->bc250_extended_key) +
+         sizeof(shader_obj->bc250_layout_hash) + sizeof(shader_obj->bc250_plan);
+      size = align(size, 8) + 8 +
          (shader_obj->bc250_context ? shader_obj->bc250_context->size : 0) + 32;
+   }
 
    return size;
 }
@@ -1198,6 +1206,7 @@ radv_GetShaderBinaryDataEXT(VkDevice _device, VkShaderEXT shader, size_t *pDataS
       blob_write_uint32(&blob, 0);
       blob_write_bytes(&blob, shader_obj->bc250_route_key, sizeof(shader_obj->bc250_route_key));
       blob_write_bytes(&blob, shader_obj->bc250_hardware_key, sizeof(shader_obj->bc250_hardware_key));
+      blob_write_bytes(&blob, shader_obj->bc250_extended_key, sizeof(shader_obj->bc250_extended_key));
       blob_write_bytes(&blob, shader_obj->bc250_layout_hash, sizeof(shader_obj->bc250_layout_hash));
       blob_write_bytes(&blob, &shader_obj->bc250_plan, sizeof(shader_obj->bc250_plan));
       blob_write_uint64(&blob, shader_obj->bc250_context ? shader_obj->bc250_context->size : 0);

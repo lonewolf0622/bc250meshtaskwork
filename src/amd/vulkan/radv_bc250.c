@@ -91,7 +91,7 @@ radv_bc250_device_env_init(struct radv_device *device, const struct radv_physica
  * neither admission, shader keys nor command recording depend on this switch. */
 void
 radv_bc250_report_mesh_route(const struct radv_device *device, const struct radv_shader *shader,
-                              const char *object, unsigned pieces, bool task, bool ordered)
+                              const char *object, unsigned pieces, bool task, bool ordered, bool empty)
 {
    if (!device->bc250_env.mesh_no_split || !shader || shader->info.stage != MESA_SHADER_MESH)
       return;
@@ -121,14 +121,14 @@ radv_bc250_report_mesh_route(const struct radv_device *device, const struct radv
       [RADV_BC250_ROUTE_REASON_BARY_COST] = "bary_small_class_cost_not_better_than_split",
    };
    const unsigned reason_id = info->ms.bc250_route_reason;
-   const char *reason = ordered ? "ordered_materialization_route" : safe ? "none" : merged ? "merged_workgroups" :
+   const char *reason = empty ? "empty_output" : ordered ? "ordered_materialization_route" : safe ? "none" : merged ? "merged_workgroups" :
       reason_id < ARRAY_SIZE(reasons) && reasons[reason_id] ? reasons[reason_id] : "unclassified";
    char shader_hash[17];
    for (unsigned i = 0; i < 8; i++)
       snprintf(shader_hash + 2 * i, 3, "%02x", shader->hash[i]);
    fprintf(stderr, "BC250 NO_SPLIT: object=%s fallback_needed=%u route=%s reason=%s V=%u P=%u lanes=%u "
                    "pieces=%u task_transport=%u scratch=%u fallback_retained=1 shader_hash=%s\n",
-           object, !safe, ordered ? "ordered_materialization" : safe ? (pieces ? "safe_direct_pieces" : "safe_direct") :
+           object, !safe && !empty, empty ? "empty" : ordered ? "ordered_materialization" : safe ? (pieces ? "safe_direct_pieces" : "safe_direct") :
            pieces ? "split" : merged ? "merged" : info->ms.bc250_expanded ? "expansion" : "raw_unproven", reason,
            info->ms.bc250_api_vertices, info->ms.bc250_api_primitives, info->workgroup_size,
            pieces, task || info->ms.has_task, info->ms.needs_ms_scratch_ring, shader_hash);
@@ -5465,7 +5465,8 @@ radv_bc250_pipeline_plan_admitted(const struct radv_bc250_pipeline_plan *plan, c
           radv_bc250_mesh_protected_route(mesh->info.ms.bc250_safe_direct,
                                           plan->flags & RADV_BC250_PLAN_ORDERED,
                                           plan->flags & RADV_BC250_PLAN_SPLIT,
-                                          mesh->info.ms.bc250_expanded, mesh->info.ms.bc250_merge_k);
+                                          mesh->info.ms.bc250_expanded, mesh->info.ms.bc250_merge_k,
+                                          plan->flags & RADV_BC250_PLAN_EMPTY);
 }
 
 void
@@ -5481,7 +5482,8 @@ radv_bc250_capture_pipeline_plan(const struct radv_device *device, struct radv_g
                (pipeline->bc250_ordered ? RADV_BC250_PLAN_ORDERED : 0) |
                (pipeline->bc250_split_order_free ? RADV_BC250_PLAN_ORDER_FREE : 0) |
                (ms->bc250_safe_owned ? RADV_BC250_PLAN_CORNERS : 0) |
-               (ms->bc250_split_mesh ? RADV_BC250_PLAN_SPLIT : 0),
+               (ms->bc250_split_mesh ? RADV_BC250_PLAN_SPLIT : 0) |
+               (ms->bc250_empty_output ? RADV_BC250_PLAN_EMPTY : 0),
       .bary_ref_mask = ms->bc250_bary_ref_mask,
       .per_primitive_locations = ms->bc250_pp_locations,
       .split_pieces = ms->bc250_split_pieces,
@@ -5494,6 +5496,9 @@ radv_bc250_capture_pipeline_plan(const struct radv_device *device, struct radv_g
                  "BC250 hardware policy must retain all compiler hardware bytes");
    memcpy(plan->route_key, &device->compiler_info.key, sizeof(plan->route_key));
    memcpy(plan->hardware_key, &device->compiler_info.hw, sizeof(plan->hardware_key));
+   static_assert(sizeof(device->compiler_info.bc250x) == sizeof(plan->extended_key),
+                 "BC250 extended policy must retain all compiler extension bytes");
+   memcpy(plan->extended_key, &device->compiler_info.bc250x, sizeof(plan->extended_key));
    memcpy(plan->mesh_hash, pipeline->base.shaders[MESA_SHADER_MESH]->hash, sizeof(plan->mesh_hash));
    if (pipeline->base.shaders[MESA_SHADER_FRAGMENT])
       memcpy(plan->fragment_hash, pipeline->base.shaders[MESA_SHADER_FRAGMENT]->hash, sizeof(plan->fragment_hash));
@@ -5522,6 +5527,7 @@ radv_bc250_restore_cached_plan(struct radv_device *device, struct radv_graphics_
        memcmp(plan->fragment_hash, fragment ? fragment->hash : absent_hash, sizeof(plan->fragment_hash)) ||
        memcmp(plan->hardware_key, &device->compiler_info.hw, sizeof(plan->hardware_key)) ||
        memcmp(plan->route_key, &device->compiler_info.key, sizeof(plan->route_key)) ||
+       memcmp(plan->extended_key, &device->compiler_info.bc250x, sizeof(plan->extended_key)) ||
        pipeline->bc250_task_pipeline ||
        pipeline->bc250_setup_pipeline || pipeline->bc250_task_layout)
       return VK_ERROR_FEATURE_NOT_PRESENT;

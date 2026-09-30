@@ -2946,12 +2946,12 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
     * none of them would draw the API connectivity unchecked (the route the hang rules forbid):
     * refuse it. The refused-pipeline retry may still split it; otherwise pipeline creation fails. */
    if (compiler_info->hw.bc250_mesh_fail_closed && stages[MESA_SHADER_MESH].nir &&
-       !stages[MESA_SHADER_MESH].bc250_empty_output &&
        !radv_bc250_mesh_protected_route(stages[MESA_SHADER_MESH].bc250_safe_direct,
                                        stages[MESA_SHADER_MESH].bc250_ordered_export,
                                        stages[MESA_SHADER_MESH].bc250_split_mesh,
                                        stages[MESA_SHADER_MESH].bc250_expanded,
-                                       stages[MESA_SHADER_MESH].bc250_merge_k)) {
+                                       stages[MESA_SHADER_MESH].bc250_merge_k,
+                                       stages[MESA_SHADER_MESH].bc250_empty_output)) {
       if (getenv("BC250_TRACE_COMPILE"))
          fprintf(stderr, "BC250 MESH FAIL CLOSED: no protected route (V=%u P=%u prim=%u), refused\n",
                  stages[MESA_SHADER_MESH].nir->info.mesh.max_vertices_out,
@@ -4235,7 +4235,7 @@ radv_graphics_pipeline_create(VkDevice _device, VkPipelineCache _cache, const Vk
 
    radv_bc250_report_mesh_route(device, pipeline->base.shaders[MESA_SHADER_MESH],
       "pipeline", pipeline->bc250_direct_split_pieces, pipeline->bc250_task_pipeline != VK_NULL_HANDLE,
-      pipeline->bc250_ordered);
+      pipeline->bc250_ordered, pipeline->bc250_plan.flags & RADV_BC250_PLAN_EMPTY);
 
    radv_pipeline_report_pso_history(device, &pipeline->base);
 
@@ -4421,7 +4421,7 @@ radv_graphics_lib_pipeline_create(VkDevice _device, VkPipelineCache _cache,
    }
 
    radv_bc250_report_mesh_route(device, pipeline->base.base.shaders[MESA_SHADER_MESH],
-      "library", 0, false, false);
+      "library", 0, false, false, pipeline->base.bc250_plan.flags & RADV_BC250_PLAN_EMPTY);
 
    radv_pipeline_report_pso_history(device, &pipeline->base.base);
 

@@ -916,7 +916,7 @@ radv_device_init_cache_key(struct radv_device *device)
    if (bc250x)
       _mesa_blake3_update(&ctx, &bc250x, sizeof(bc250x));
    if (device->bc250_env.pipeline_plan) {
-      static const char tag[] = "bc250-pipeline-plan-v7";
+      static const char tag[] = "bc250-pipeline-plan-v8";
       _mesa_blake3_update(&ctx, tag, sizeof(tag));
    }
    _mesa_blake3_final(&ctx, device->cache_hash);

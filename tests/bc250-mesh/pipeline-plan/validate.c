@@ -5,13 +5,14 @@
 
 int main(void)
 {
-   assert(!radv_bc250_mesh_protected_route(false, false, false, false, 0));
-   assert(!radv_bc250_mesh_protected_route(false, false, false, false, 1));
-   assert(radv_bc250_mesh_protected_route(true, false, false, false, 0));
-   assert(radv_bc250_mesh_protected_route(false, true, false, false, 0));
-   assert(radv_bc250_mesh_protected_route(false, false, true, false, 0));
-   assert(radv_bc250_mesh_protected_route(false, false, false, true, 0));
-   assert(radv_bc250_mesh_protected_route(false, false, false, false, 2));
+   assert(!radv_bc250_mesh_protected_route(false, false, false, false, 0, false));
+   assert(!radv_bc250_mesh_protected_route(false, false, false, false, 1, false));
+   assert(radv_bc250_mesh_protected_route(true, false, false, false, 0, false));
+   assert(radv_bc250_mesh_protected_route(false, true, false, false, 0, false));
+   assert(radv_bc250_mesh_protected_route(false, false, true, false, 0, false));
+   assert(radv_bc250_mesh_protected_route(false, false, false, true, 0, false));
+   assert(radv_bc250_mesh_protected_route(false, false, false, false, 2, false));
+   assert(radv_bc250_mesh_protected_route(false, false, false, false, 0, true));
    struct radv_bc250_pipeline_plan p = {.version = RADV_BC250_PIPELINE_PLAN_VERSION};
    assert(radv_bc250_pipeline_plan_valid(&p));
    p.flags = RADV_BC250_PLAN_TASK;
