@@ -9434,9 +9434,13 @@ radv_bind_graphics_pipeline(struct radv_cmd_buffer *cmd_buffer, struct radv_grap
    if (cmd_buffer->state.graphics_pipeline == graphics_pipeline)
       return;
 
+   /* RADV_BC250_ASYNC_COMPILE: one snapshot per bind, all quick or all optimized. */
+   struct radv_shader *const *pipeline_shaders =
+      __atomic_load_n(&graphics_pipeline->bc250_opt_ready, __ATOMIC_ACQUIRE) ? graphics_pipeline->bc250_opt_shaders
+                                                                             : graphics_pipeline->base.shaders;
    radv_foreach_stage (
       stage, (cmd_buffer->state.active_stages | graphics_pipeline->active_stages) & RADV_GRAPHICS_STAGE_BITS) {
-      radv_bind_shader(cmd_buffer, graphics_pipeline->base.shaders[stage], stage);
+      radv_bind_shader(cmd_buffer, pipeline_shaders[stage], stage);
    }
 
    radv_bind_gs_copy_shader(cmd_buffer, graphics_pipeline->base.gs_copy_shader);
@@ -9450,7 +9454,7 @@ radv_bind_graphics_pipeline(struct radv_cmd_buffer *cmd_buffer, struct radv_grap
    cmd_buffer->state.prefetch_L2_mask |= RADV_PREFETCH_GFX_SHADERS;
 
    const struct radv_physical_device *pdev = radv_device_physical(radv_cmd_buffer_device(cmd_buffer));
-   const struct radv_shader *ps = radv_get_shader(graphics_pipeline->base.shaders, MESA_SHADER_FRAGMENT);
+   const struct radv_shader *ps = radv_get_shader(pipeline_shaders, MESA_SHADER_FRAGMENT);
 
    radv_bind_fragment_output_state(cmd_buffer, ps, NULL, graphics_pipeline->custom_blend_mode);
 

@@ -2138,6 +2138,23 @@ radv_create_gs_copy_shader(const struct radv_compiler_info *compiler_info, struc
    return gs_copy_binary;
 }
 
+/* RADV_BC250_ASYNC_COMPILE: the Mesh and fragment stages are compiled by ACO without optimizations first;
+ * the job keeps a clone of their final NIR (ACO modifies its input) and the stage state, and compiles the
+ * optimized binaries in the background. The NIR, route, plan, LDS layout and shader info are identical; only
+ * the machine code differs. */
+struct radv_bc250_async_job {
+   struct util_queue_fence fence;
+   struct radv_device *device;
+   struct radv_graphics_pipeline *pipeline;
+   bool skip_shaders_cache;
+   uint32_t stage_mask;
+   nir_shader *nir[MESA_VULKAN_SHADER_STAGES];
+   struct radv_shader_stage stage[MESA_VULKAN_SHADER_STAGES];
+   struct radv_graphics_state_key gfx_state;
+};
+
+static __thread struct radv_bc250_async_job *bc250_async_capture;
+
 static void
 radv_graphics_shaders_nir_to_asm(const struct radv_compiler_info *compiler_info, struct vk_pipeline_cache *cache,
                                  struct radv_shader_stage *stages, const struct radv_graphics_state_key *gfx_state,
@@ -2186,7 +2203,18 @@ radv_graphics_shaders_nir_to_asm(const struct radv_compiler_info *compiler_info,
          }
       }
 
-      binaries[s] = radv_shader_nir_to_asm(compiler_info, &stages[s], nir_shaders, shader_count, gfx_state);
+      if (bc250_async_capture && shader_count == 1 && (s == MESA_SHADER_MESH || s == MESA_SHADER_FRAGMENT)) {
+         struct radv_bc250_async_job *job = bc250_async_capture;
+         job->nir[s] = nir_shader_clone(NULL, stages[s].nir);
+         job->stage[s] = stages[s];
+         job->stage[s].nir = NULL;
+         job->stage_mask |= 1u << s;
+         struct radv_shader_stage quick = stages[s];
+         quick.key.optimisations_disabled = 1;
+         binaries[s] = radv_shader_nir_to_asm(compiler_info, &quick, nir_shaders, shader_count, gfx_state);
+      } else {
+         binaries[s] = radv_shader_nir_to_asm(compiler_info, &stages[s], nir_shaders, shader_count, gfx_state);
+      }
 
       /* Dump NIR after nir_to_asm, because ACO modifies it. */
       char *nir_string = NULL;
@@ -3559,6 +3587,91 @@ radv_graphics_pipeline_hash(const struct radv_device *device, const struct radv_
    _mesa_blake3_final(&ctx, hash);
 }
 
+static void
+radv_bc250_async_free_nir(struct radv_bc250_async_job *job)
+{
+   for (unsigned s = 0; s < MESA_VULKAN_SHADER_STAGES; ++s) {
+      ralloc_free(job->nir[s]);
+      job->nir[s] = NULL;
+   }
+}
+
+/* Background: the optimized binaries of the same NIR. Published only if every stage compiled without scratch
+ * and with shader info and LDS equal to the quick binaries; otherwise the quick binaries stay bound. */
+static void
+radv_bc250_async_execute(void *data, void *gdata, int thread_index)
+{
+   struct radv_bc250_async_job *job = data;
+   struct radv_device *device = job->device;
+   struct radv_graphics_pipeline *pipeline = job->pipeline;
+   struct radv_shader *opt[MESA_VULKAN_SHADER_STAGES] = {NULL};
+   bool ok = true;
+
+   u_foreach_bit (s, job->stage_mask) {
+      nir_shader *nir = job->nir[s];
+      struct radv_shader_binary *binary = radv_shader_nir_to_asm(&device->compiler_info, &job->stage[s], &nir, 1,
+                                                                 &job->gfx_state);
+      struct radv_shader_debug_info debug = {0};
+      /* Cached like the synchronous path's shaders, so the pipeline entry below resolves on the next run. */
+      opt[s] = binary ? radv_shader_create(device, NULL, binary, job->skip_shaders_cache, &debug) : NULL;
+      free(binary);
+      const struct radv_shader *quick = pipeline->base.shaders[s];
+      if (!opt[s] || !quick || opt[s]->config.scratch_bytes_per_wave || opt[s]->config.lds_size != quick->config.lds_size ||
+          memcmp(&opt[s]->info, &quick->info, sizeof(quick->info))) {
+         ok = false;
+         break;
+      }
+   }
+   radv_bc250_async_free_nir(job);
+
+   if (!ok) {
+      for (unsigned s = 0; s < MESA_VULKAN_SHADER_STAGES; ++s) {
+         if (opt[s])
+            radv_shader_unref(device, opt[s]);
+      }
+      if (getenv("BC250_TRACE_COMPILE"))
+         fprintf(stderr, "BC250 ASYNC COMPILE: optimized binaries not published (quick binaries stay)\n");
+      return;
+   }
+
+   for (unsigned s = 0; s < MESA_VULKAN_SHADER_STAGES; ++s)
+      pipeline->bc250_opt_shaders[s] = opt[s] ? opt[s] : pipeline->base.shaders[s];
+   __atomic_store_n(&pipeline->bc250_opt_ready, 1, __ATOMIC_RELEASE);
+
+   /* The disk cache gets the entry the synchronous path would have written, so the next run loads the
+    * optimized binaries directly. */
+   if (!job->skip_shaders_cache) {
+      struct radv_graphics_pipeline *copy = malloc(sizeof(*copy));
+      if (copy) {
+         memcpy(copy, pipeline, sizeof(*copy));
+         memcpy(copy->base.shaders, pipeline->bc250_opt_shaders, sizeof(copy->base.shaders));
+         copy->base.cache_object = NULL;
+         radv_pipeline_cache_insert(device, NULL, &copy->base);
+         /* The entry reached the disk cache when it was added; this copy holds no reference. */
+         if (copy->base.cache_object)
+            vk_pipeline_cache_object_unref(&device->vk, copy->base.cache_object);
+         free(copy);
+      }
+   }
+   if (getenv("BC250_TRACE_COMPILE"))
+      fprintf(stderr, "BC250 ASYNC COMPILE: optimized binaries published (stages 0x%x)\n", job->stage_mask);
+}
+
+static bool
+radv_bc250_async_allowed(const struct radv_device *device, const struct radv_graphics_pipeline *pipeline,
+                         const struct radv_shader_stage *stages, bool fast_linking_enabled)
+{
+   const VkPipelineCreateFlags2 excluded = VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR |
+      VK_PIPELINE_CREATE_2_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT |
+      VK_PIPELINE_CREATE_2_DISABLE_OPTIMIZATION_BIT | VK_PIPELINE_CREATE_2_CAPTURE_STATISTICS_BIT_KHR |
+      VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR | VK_PIPELINE_CREATE_2_INDIRECT_BINDABLE_BIT_EXT;
+   return device->bc250_async && !pipeline->base.is_internal && !fast_linking_enabled &&
+          !(pipeline->base.create_flags & excluded) &&
+          (pipeline->active_stages & VK_SHADER_STAGE_MESH_BIT_EXT) &&
+          !stages[MESA_SHADER_MESH].key.keep_executable_info &&
+          !stages[MESA_SHADER_FRAGMENT].key.keep_executable_info;
+}
+
 static VkResult
 radv_graphics_pipeline_compile(struct radv_graphics_pipeline *pipeline, const VkGraphicsPipelineCreateInfo *pCreateInfo,
                                const struct radv_graphics_pipeline_state *gfx_state, struct radv_device *device,
@@ -3677,14 +3790,36 @@ radv_graphics_pipeline_compile(struct radv_graphics_pipeline *pipeline, const Vk
 
    struct radv_shader_debug_info debug[MESA_VULKAN_SHADER_STAGES] = {0};
    struct radv_shader_debug_info gs_copy_debug = {0};
+   struct radv_bc250_async_job *async_job = NULL;
+   if (!retained_shaders && radv_bc250_async_allowed(device, pipeline, stages, fast_linking_enabled))
+      async_job = calloc(1, sizeof(*async_job));
+   bc250_async_capture = async_job;
    VkResult compile_result = radv_graphics_shaders_compile(compiler_info, cache, stages, &gfx_state->key.gfx_state, pipeline->base.is_internal,
                                  retained_shaders, noop_fs, debug, binaries, &gs_copy_debug, &gs_copy_binary);
+   bc250_async_capture = NULL;
+   if (async_job && (compile_result != VK_SUCCESS || !async_job->stage_mask)) {
+      radv_bc250_async_free_nir(async_job);
+      free(async_job);
+      async_job = NULL;
+   }
    if (compile_result != VK_SUCCESS)
       return compile_result;
-   radv_graphics_shaders_create(device, cache, skip_shaders_cache, pipeline->base.shaders, binaries, debug,
+   /* RADV_BC250_ASYNC_COMPILE: the quick binaries are never cached. */
+   radv_graphics_shaders_create(device, cache, skip_shaders_cache || async_job, pipeline->base.shaders, binaries, debug,
                                 &pipeline->base.gs_copy_shader, gs_copy_binary, &gs_copy_debug);
 
-   if (!skip_shaders_cache) {
+   if (async_job) {
+      async_job->device = device;
+      async_job->pipeline = pipeline;
+      async_job->skip_shaders_cache = skip_shaders_cache;
+      async_job->gfx_state = gfx_state->key.gfx_state;
+      util_queue_fence_init(&async_job->fence);
+      pipeline->bc250_async = async_job;
+      util_queue_add_job(&device->bc250_async_queue, async_job, &async_job->fence, radv_bc250_async_execute, NULL, 0);
+      if (getenv("BC250_TRACE_COMPILE"))
+         fprintf(stderr, "BC250 ASYNC COMPILE: quick binaries bound, optimized queued (stages 0x%x)\n",
+                 async_job->stage_mask);
+   } else if (!skip_shaders_cache) {
       radv_pipeline_cache_insert(device, cache, &pipeline->base);
    }
 
@@ -4137,6 +4272,20 @@ radv_graphics_pipeline_create(VkDevice _device, VkPipelineCache _cache, const Vk
 void
 radv_destroy_graphics_pipeline(struct radv_device *device, struct radv_graphics_pipeline *pipeline)
 {
+   if (pipeline->bc250_async) {
+      /* Removes a queued job, or waits for a running one. */
+      util_queue_drop_job(&device->bc250_async_queue, &pipeline->bc250_async->fence);
+      util_queue_fence_destroy(&pipeline->bc250_async->fence);
+      radv_bc250_async_free_nir(pipeline->bc250_async);
+      free(pipeline->bc250_async);
+      pipeline->bc250_async = NULL;
+      if (__atomic_load_n(&pipeline->bc250_opt_ready, __ATOMIC_ACQUIRE)) {
+         for (unsigned i = 0; i < MESA_VULKAN_SHADER_STAGES; ++i) {
+            if (pipeline->bc250_opt_shaders[i] && pipeline->bc250_opt_shaders[i] != pipeline->base.shaders[i])
+               radv_shader_unref(device, pipeline->bc250_opt_shaders[i]);
+         }
+      }
+   }
    if (pipeline->bc250_task_pipeline)
       radv_DestroyPipeline(radv_device_to_handle(device), pipeline->bc250_task_pipeline, NULL);
    if (pipeline->bc250_setup_pipeline && !pipeline->bc250_shared_setup)

@@ -1604,6 +1604,8 @@ radv_destroy_device(struct radv_device *device, const VkAllocationCallbacks *pAl
       device->bc250_prof_file = NULL;
    }
    radv_bc250_timer_finish(device);
+   if (device->bc250_async)
+      util_queue_destroy(&device->bc250_async_queue);
    radv_device_finish_utrace(device);
    radv_device_finish_perf_counter(device);
 
@@ -2025,6 +2027,12 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
    }
 
    radv_bc250_timer_init(device); /* BC250_MESH_TIMER (off unless set) */
+   /* RADV_BC250_ASYNC_COMPILE=1: Mesh pipelines are created with unoptimized ACO binaries of the same NIR
+    * (same route, plan and LDS) and swapped to the optimized binaries at a later bind. Off by default. */
+   if (pdev->bc250_native_mesh && debug_get_bool_option("RADV_BC250_ASYNC_COMPILE", false))
+      device->bc250_async = util_queue_init(&device->bc250_async_queue, "radv_bc250_async", 256, 1,
+                                            UTIL_QUEUE_INIT_USE_MINIMUM_PRIORITY | UTIL_QUEUE_INIT_RESIZE_IF_FULL,
+                                            NULL);
    device->bc250_split_batch_prep = pdev->info.family == CHIP_GFX1013 &&
                                     debug_get_bool_option("RADV_BC250_SPLIT_BATCH_PREP", false);
    device->bc250_mesh_dealloc_dist = radv_bc250_parse_mesh_dealloc_dist(pdev);

@@ -131,6 +131,11 @@ struct radv_graphics_pipeline {
    uint64_t needed_dynamic_state;
 
    VkShaderStageFlags active_stages;
+   /* RADV_BC250_ASYNC_COMPILE: the background job, and the shader set bound once bc250_opt_ready is set
+    * (acquire/release); base.shaders keeps the unoptimized binaries until the pipeline is destroyed. */
+   struct radv_bc250_async_job *bc250_async;
+   struct radv_shader *bc250_opt_shaders[MESA_VULKAN_SHADER_STAGES];
+   int bc250_opt_ready;
    VkPipeline bc250_task_pipeline;
    VkPipeline bc250_setup_pipeline;
    bool bc250_shared_setup; /* Setup pipeline and layout owned by the device meta cache. */

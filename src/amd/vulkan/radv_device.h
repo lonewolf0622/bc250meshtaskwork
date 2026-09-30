@@ -15,6 +15,7 @@
 #include "ac_sqtt.h"
 
 #include "util/mesa-blake3.h"
+#include "util/u_queue.h"
 
 #include "tools/radv_debug.h"
 #include "tools/radv_debug_nir.h"
@@ -189,6 +190,10 @@ struct radv_bc250_device_env {
 struct radv_device {
    struct vk_device vk;
    struct radv_bc250_device_env bc250_env;
+   /* RADV_BC250_ASYNC_COMPILE: background queue for the optimized Mesh/FS binaries of pipelines that were
+    * created with an unoptimized ACO build first (radv_pipeline_graphics.c). */
+   bool bc250_async;
+   struct util_queue bc250_async_queue;
    uint64_t bc250_trace_device_id; /* Process-local diagnostic generation. */
    struct radv_bc250_mesh_timer bc250_timer; /* BC250_MESH_TIMER (radv_bc250_timer.h) */
    /* RADV_BC250_COMPUTE_QUEUE_PRIORITY (radv_queue.c): the kernel context priority of compute-family
