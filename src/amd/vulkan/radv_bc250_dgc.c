@@ -229,8 +229,12 @@ bc250_dgc_state_valid(const struct radv_cmd_buffer *state, const VkGeneratedComm
    if (!p || state->qf != RADV_QUEUE_GENERAL || state->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY ||
        (state->vk.pool->flags & VK_COMMAND_POOL_CREATE_PROTECTED_BIT) ||
        (state->usage_flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT) ||
-       s->graphics_pipeline != radv_pipeline_to_graphics(p) || !s->render.active || s->render.view_mask || state->gang.cs ||
+       s->graphics_pipeline != radv_pipeline_to_graphics(p) || s->render.view_mask || state->gang.cs ||
        s->render.vrs_att.iview || s->uses_vrs_attachment || s->force_vrs_per_vertex ||
+       device->force_vrs_enabled || s->dynamic.vk.fsr.fragment_size.width != 1 ||
+       s->dynamic.vk.fsr.fragment_size.height != 1 ||
+       s->dynamic.vk.fsr.combiner_ops[0] != VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR ||
+       s->dynamic.vk.fsr.combiner_ops[1] != VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR ||
        s->active_pipeline_ace_queries || s->active_prims_xfb_queries || s->active_emulated_prims_xfb_queries ||
        s->streamout.enabled_mask || device->sqtt.bo || device->utrace.context || device->bc250_timer.enabled ||
        radv_bc250_chain_enabled(device) || device->bc250_split_batch_prep)
@@ -242,33 +246,100 @@ bc250_dgc_state_valid(const struct radv_cmd_buffer *state, const VkGeneratedComm
    return true;
 }
 
-static uintptr_t
-bc250_dgc_query_state(const struct radv_cmd_buffer *cmd)
+struct bc250_dgc_query_patch { uint64_t offset; uint32_t header, event; };
+struct bc250_dgc_program {
+   VkIndirectCommandsLayoutEXT layout;
+   VkPipeline pipeline;
+   uint64_t size;
+   uint32_t sequences, draws, count;
+   struct bc250_dgc_query_patch patches[];
+};
+
+static bool
+bc250_dgc_record_program(struct radv_device *device, const VkGeneratedCommandsInfoEXT *info,
+                         const struct bc250_dgc_shape *shape, const uint8_t *snapshot)
 {
-   const struct radv_cmd_state *s = &cmd->state;
-   return 1 | (!!s->active_occlusion_queries << 1) | (!!s->active_pipeline_queries << 2) |
-      (!!s->active_emulated_pipeline_queries << 3) | (!!s->active_prims_gen_queries << 4) |
-      (!!s->active_emulated_prims_gen_queries << 5) | (!!s->perfect_occlusion_queries_enabled << 6);
+   unsigned count = 0;
+   struct bc250_dgc_program *program = NULL;
+   for (unsigned pass = 0; pass < 2; pass++) {
+      unsigned index = 0;
+      for (uint32_t seq = 0; seq < info->maxSequenceCount; seq++) {
+         const uint32_t *words = (const uint32_t *)(snapshot + (uint64_t)seq * shape->stride);
+         for (unsigned i = 0; i < shape->code / 4;) {
+            uint32_t header = words[i];
+            unsigned len = header == PKT3_NOP_PAD || header >> 30 == 2 ? 1 : ((header >> 16) & 0x3fff) + 2;
+            if ((header >> 30 != 2 && header >> 30 != 3) || i + len > shape->code / 4) {
+               free(program); return false;
+            }
+            if ((header >> 8 & 255) == PKT3_EVENT_WRITE && len > 1 &&
+                ((words[i + 1] & 63) == V_028A90_PIPELINESTAT_START ||
+                 (words[i + 1] & 63) == V_028A90_PIPELINESTAT_STOP)) {
+               if (len != 2) { free(program); return false; }
+               if (pass)
+                  program->patches[index] = (struct bc250_dgc_query_patch){
+                     (uint64_t)seq * shape->stride + i * 4, header, words[i + 1]};
+               index++;
+            }
+            i += len;
+         }
+      }
+      if (!pass) {
+         count = index;
+         program = malloc(sizeof(*program) + (size_t)count * sizeof(program->patches[0]));
+         if (!program) return false;
+      }
+   }
+   const VkGeneratedCommandsPipelineInfoEXT *pi = vk_find_struct_const(info->pNext, GENERATED_COMMANDS_PIPELINE_INFO_EXT);
+   *program = (struct bc250_dgc_program){.layout = info->indirectCommandsLayout, .pipeline = pi->pipeline,
+      .size = shape->size, .sequences = info->maxSequenceCount, .draws = info->maxDrawCount, .count = count};
+   mtx_lock(&device->meta_state.mtx);
+   if (!device->bc250_dgc_query_states)
+      device->bc250_dgc_query_states = _mesa_hash_table_u64_create(NULL);
+   bool ok = device->bc250_dgc_query_states != NULL;
+   if (ok) {
+      free(_mesa_hash_table_u64_search(device->bc250_dgc_query_states, info->preprocessAddress));
+      _mesa_hash_table_u64_insert(device->bc250_dgc_query_states, info->preprocessAddress, program);
+   }
+   mtx_unlock(&device->meta_state.mtx);
+   if (!ok) free(program);
+   return ok;
 }
 
 static bool
-bc250_dgc_query_certificate(struct radv_cmd_buffer *cmd, uint64_t va, bool record)
+bc250_dgc_patch_queries(struct radv_cmd_buffer *cmd, const VkGeneratedCommandsInfoEXT *info,
+                        const struct bc250_dgc_shape *shape)
 {
    struct radv_device *device = radv_cmd_buffer_device(cmd);
-   uintptr_t signature = bc250_dgc_query_state(cmd);
-   /* Ordinary meta suspend/resume uses the query state of the state command
-    * buffer. Explicit execute may use another command buffer, but its query
-    * flags must match that capture. Unknown or changed state fails closed;
-    * no source-command-buffer lifetime is retained in this certificate. */
    mtx_lock(&device->meta_state.mtx);
-   if (record && !device->bc250_dgc_query_states)
-      device->bc250_dgc_query_states = _mesa_hash_table_u64_create(NULL);
-   bool ok = device->bc250_dgc_query_states != NULL;
-   if (ok && record) {
-      _mesa_hash_table_u64_insert(device->bc250_dgc_query_states, va, (void *)signature);
+   const struct bc250_dgc_program *program = device->bc250_dgc_query_states ?
+      _mesa_hash_table_u64_search(device->bc250_dgc_query_states, info->preprocessAddress) : NULL;
+   const VkGeneratedCommandsPipelineInfoEXT *pi = vk_find_struct_const(info->pNext, GENERATED_COMMANDS_PIPELINE_INFO_EXT);
+   bool ok = program && program->pipeline == pi->pipeline && program->layout == info->indirectCommandsLayout && program->size == shape->size &&
+      program->sequences == info->maxSequenceCount && program->draws == info->maxDrawCount;
+   if (ok) {
+      bool native_stats = radv_get_num_pipeline_stat_queries(cmd) > 0;
+      FILE *packets = NULL;
+      const char *dump = debug_get_option("BC250_DGC_DUMP", NULL);
+      if (dump) {
+         VK_FROM_HANDLE(radv_indirect_command_layout, layout, info->indirectCommandsLayout);
+         char path[4096];
+         snprintf(path, sizeof(path), "%s/query-owner-%u.bin", dump, layout->vk.draw_count);
+         packets = fopen(path, "wb");
+      }
+      for (unsigned i = 0; i < program->count; i++) {
+         const struct bc250_dgc_query_patch *patch = &program->patches[i];
+         /* Restore both words: inactive sequences were filled entirely with
+          * NOPs by preprocessing. Their stop/start pairs contain no draw and
+          * preserve the caller's query state. Helpers are never counted. */
+         uint32_t words[] = {native_stats ? patch->header : PKT3(PKT3_NOP, 0, false), patch->event};
+         radv_cs_write_data(device, cmd->cs, V_371_MICRO_ENGINE,
+            info->preprocessAddress + patch->offset, 2, words, false);
+         /* Preserve every emitted write even if command-stream growth chains
+          * away the earlier IB. The publication tail is appended below. */
+         if (packets) fwrite(cmd->cs->b->buf + cmd->cs->b->cdw - 6, 4, 6, packets);
+      }
+      if (packets) fclose(packets);
    }
-   if (ok)
-      ok = (uintptr_t)_mesa_hash_table_u64_search(device->bc250_dgc_query_states, va) == signature;
    mtx_unlock(&device->meta_state.mtx);
    return ok;
 }
@@ -284,6 +355,10 @@ bc250_dgc_capture(struct radv_cmd_buffer *owner, const struct radv_cmd_buffer *s
    if (!cmd)
       return false;
    *cmd = *state;
+   cmd->bc250_dgc_inherit_graphics_state = true;
+   /* Capture all native meta query stop/start pairs. Execution patches these
+    * typed packets according to its query scope, independently of preprocessing. */
+   cmd->state.active_pipeline_queries = 1;
    cmd->bc250_dgc_merged_constants = cmd->state.graphics_pipeline->base.shaders[MESA_SHADER_MESH]->info.ms.bc250_merge_k > 1;
    cmd->bc250_dgc_upload_va = info->preprocessAddress + (uint64_t)seq * shape->stride + shape->code;
    memset(&cmd->upload, 0, sizeof(cmd->upload));
@@ -563,8 +638,9 @@ radv_bc250_dgc_prepare(struct radv_cmd_buffer *cmd, const VkGeneratedCommandsInf
       FILE *f = fopen(path, "wb");
       if (f) { fwrite(&params, 1, sizeof(params), f); fwrite(snapshot, 1, shape.size, f); fclose(f); }
    }
+   bool recorded = bc250_dgc_record_program(radv_cmd_buffer_device(cmd), info, &shape, snapshot);
    free(snapshot);
-   if (!bc250_dgc_query_certificate(state, info->preprocessAddress, true)) {
+   if (!recorded) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
       return;
    }
@@ -590,10 +666,6 @@ radv_bc250_dgc_execute(struct radv_cmd_buffer *cmd, VkBool32 preprocessed, const
    }
    if (!info->maxSequenceCount)
       return;
-   if (preprocessed && !bc250_dgc_query_certificate(cmd, info->preprocessAddress, false)) {
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-      return;
-   }
    if (!preprocessed)
       radv_bc250_dgc_prepare(cmd, info, cmd);
    if (vk_command_buffer_has_error(&cmd->vk))
@@ -629,7 +701,21 @@ radv_bc250_dgc_execute(struct radv_cmd_buffer *cmd, VkBool32 preprocessed, const
    cmd->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_INV_L2 | RADV_CMD_FLAG_INV_VCACHE |
                             RADV_CMD_FLAG_INV_SCACHE | RADV_CMD_FLAG_WB_L2;
    radv_emit_cache_flush(cmd);
+   if (!bc250_dgc_patch_queries(cmd, info, &shape)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   cmd->state.flush_bits |= RADV_CMD_FLAG_WB_L2 | RADV_CMD_FLAG_INV_L2;
+   radv_emit_cache_flush(cmd);
    ac_emit_cp_pfp_sync_me(cmd->cs->b, false);
+   const char *dump = debug_get_option("BC250_DGC_DUMP", NULL);
+   if (dump) {
+      VK_FROM_HANDLE(radv_indirect_command_layout, layout, info->indirectCommandsLayout);
+      char path[4096];
+      snprintf(path, sizeof(path), "%s/query-owner-%u.bin", dump, layout->vk.draw_count);
+      FILE *f = fopen(path, "ab");
+      if (f) { fwrite(cmd->cs->b->buf, 4, cmd->cs->b->cdw, f); fclose(f); }
+   }
    for (uint32_t seq = 0; seq < info->maxSequenceCount; seq++) {
       for (uint32_t segment = 0; segment < shape.segments; segment++) {
          radeon_check_space(device->ws, cmd->cs->b, 4);

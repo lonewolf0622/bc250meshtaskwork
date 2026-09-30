@@ -1,4 +1,4 @@
-"""Inherited query scopes, explicit query certificates and both predicate senses."""
+"""Execution query scopes, inherited graphics state and both predicate senses."""
 import os,json,re,struct,subprocess
 from pathlib import Path
 src=Path(__file__).resolve().parents[3];out=Path(os.environ['KEEP']);out.mkdir(parents=True,exist_ok=True);os.chdir(out)
@@ -12,6 +12,29 @@ run(['cc','-O1','-Wall','-o',out/'pipe',src/'tests/bc250-mesh/dgc/pipe.c','-lvul
 run(['cc','-O1','-Wall','-o',out/'ordinary',src/'tests/bc250-mesh/safe-direct/pipe.c','-lvulkan'],'ordinary-build')
 run(['python3',src/'tests/bc250-mesh/dgc/build_oracle.py',out/'oracle'],'oracle-build')
 fixtures=Path(os.environ['FIXTURES']);rows=[]
+def check_patches(dump,count,native):
+ data=(dump/f'capture-{count}.bin').read_bytes();p=struct.unpack_from('<QQQQIIII',data)
+ owner=(dump/f'query-owner-{count}.bin').read_bytes();w=struct.unpack('<'+'I'*(len(owner)//4),owner)
+ writes={};i=0
+ while i<len(w):
+  h=w[i];n=1 if h==0xffff1000 or h>>30==2 else ((h>>16)&0x3fff)+2
+  assert i+n<=len(w)
+  if h>>8&255==0x37 and n==6:writes[w[i+2]|w[i+3]<<32]=w[i+4:i+6]
+  i+=n
+ sites=0;dispatches=0
+ for seq in range(p[4]):
+  begin=seq*p[5];words=struct.unpack_from('<'+'I'*(p[6]//4),data,48+begin);i=0
+  while i<len(words):
+   h=words[i];n=1 if h==0xffff1000 or h>>30==2 else ((h>>16)&0x3fff)+2
+   op=h>>8&255
+   if op in (0x15,0x16):dispatches+=1
+   assert op!=0x69,'generated program overwrites execution graphics context'
+   if op==0x46 and n>1 and words[i+1]&63 in (0x19,0x1a):
+    assert n==2
+    assert writes[p[1]+begin+i*4]==(h if native else 0xc0001000,words[i+1])
+    sites+=1
+   i+=n
+ assert sites>0 or not dispatches
 variants=[(q,'1',False,explicit) for q in ('pipeline','occlusion','mesh-pipeline','mesh-primitives') for explicit in (False,True)]
 variants += [(None,value,inverted,True) for value in ('0','1') for inverted in (False,True)]
 for shape in ('plain','task','fold'):
@@ -34,6 +57,7 @@ for shape in ('plain','task','fold'):
    (out/'summary.json').write_text(json.dumps(rows,indent=2)+'\n');print(name,'ordinary route refusal PASS',flush=True);continue
   t=run(args,name,env);assert 'SUBMIT_OK' in t and t.count('DGC_RECORDED')==2
   for count in (0,1):
+   check_patches(dump,count,query in ('pipeline','mesh-pipeline'))
    run([out/'oracle',dump,count,int(shape!='plain'),1],name+'-cpu-'+str(count),env)
    data=(dump/f'capture-{count}.bin').read_bytes();p=struct.unpack_from('<QQQQIIII',data)
    for seq in range(p[4]):
@@ -49,8 +73,16 @@ for shape in ('plain','task','fold'):
     assert draws and (shape=='plain' or producers>=draws)
   rows.append(dict(shape=shape,query=query,predicate=int(predicate),inverted=inverted,explicit=explicit,cpu_cases=32,ordinary_pm4=True))
   (out/'summary.json').write_text(json.dumps(rows,indent=2)+'\n');print(name,'PASS',flush=True)
- # Query state changes after explicit preprocess must reject execution.
- env=dict(e,DGC_QUERY='pipeline',DGC_PREPROCESS='1',DGC_QUERY_CHANGE='1')
- p=subprocess.run(list(map(str,args)),env=env,capture_output=True,text=True);t=p.stdout+p.stderr;(out/(shape+'-changed-query.log')).write_text(t)
- assert p.returncode==1 and 'FAIL vkEndCommandBuffer(cb) = -8' in t and 'SUBMIT_OK' not in t and 'Assertion' not in t,t[-3000:]
-print('State proof PASS',len(rows),'routes',sum(r['cpu_cases'] for r in rows),'CPU cases; query changes fail closed',flush=True)
+ for after in (False,True):
+  name=shape+('-query-after-outside-preprocess' if after else '-changed-query')
+  dump=out/name;dump.mkdir(exist_ok=True)
+  env=dict(e,DGC_QUERY='pipeline',DGC_PREPROCESS='1',BC250_DGC_DUMP=str(dump))
+  if after:env.update(DGC_QUERY_AFTER_PREPROCESS='1',DGC_PREPROCESS_OUTSIDE='1')
+  else:env['DGC_QUERY_CHANGE']='1'
+  t=run(args,name,env);assert 'SUBMIT_OK' in t
+  for count in (0,1):
+   check_patches(dump,count,after)
+   run([out/'oracle',dump,count,int(shape!='plain'),1],name+'-cpu-'+str(count),env)
+  rows.append(dict(shape=shape,query_transition=True,outside_preprocess=after,cpu_cases=32))
+ (out/'summary.json').write_text(json.dumps(rows,indent=2)+'\n')
+print('State proof PASS',len(rows),'routes',sum(r['cpu_cases'] for r in rows),'CPU cases; execution query transitions admitted',flush=True)

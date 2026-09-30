@@ -60,6 +60,10 @@ static VkPhysicalDevice dgc_physical;
 static VkPipeline dgc_pipeline;
 static VkPipelineLayout dgc_pipeline_layout;
 static int dgc_failed;
+static VkCommandPool gate_pool;
+static VkCommandBuffer gate_preprocess;
+static VkGeneratedCommandsInfoEXT gate_generated;
+static VkGeneratedCommandsPipelineInfoEXT gate_generated_pipeline;
 #define CHECK(x) do { VkResult r = (x); if (r) { fprintf(stderr,"DGC_ERROR %s %d\n",#x,r); dgc_failed=1; return; } } while(0)
 static void dgc_buffer(VkDeviceSize bytes, uint32_t bits, VkBuffer *buffer, VkDeviceMemory *memory, void **map)
 {
@@ -93,7 +97,7 @@ static VkDeviceAddress dgc_address(VkBuffer buffer)
    VkBufferDeviceAddressInfo i={.sType=VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,.buffer=buffer};
    return vkGetBufferDeviceAddress(dgc_device,&i);
 }
-static void dgc_draw(VkCommandBuffer cb,int task)
+static void dgc_draw(VkCommandBuffer cb,int task,int outside)
 {
    PFN_vkCreateIndirectCommandsLayoutEXT create=(void *)vkGetDeviceProcAddr(dgc_device,"vkCreateIndirectCommandsLayoutEXT");
    PFN_vkGetGeneratedCommandsMemoryRequirementsEXT requirements=(void *)vkGetDeviceProcAddr(dgc_device,"vkGetGeneratedCommandsMemoryRequirementsEXT");
@@ -109,6 +113,7 @@ static void dgc_draw(VkCommandBuffer cb,int task)
    unsigned stream_stride=gate_many?16:12;
    if(gate_db)stream_stride+=4;
    VkIndirectCommandsLayoutCreateInfoEXT ci={.sType=VK_STRUCTURE_TYPE_INDIRECT_COMMANDS_LAYOUT_CREATE_INFO_EXT,
+      .flags=outside?VK_INDIRECT_COMMANDS_LAYOUT_USAGE_EXPLICIT_PREPROCESS_BIT_EXT:0,
       .shaderStages=VK_SHADER_STAGE_MESH_BIT_EXT|VK_SHADER_STAGE_FRAGMENT_BIT|(task?VK_SHADER_STAGE_TASK_BIT_EXT:0),
       .pipelineLayout=dgc_pipeline_layout,.indirectStride=stream_stride,.tokenCount=gate_db?2:1,.pTokens=gate_db?tokens:&token};
    CHECK(create(dgc_device,&ci,NULL,&owned_layout));
@@ -131,7 +136,20 @@ static void dgc_draw(VkCommandBuffer cb,int task)
       .shaderStages=ci.shaderStages,.indirectCommandsLayout=owned_layout,.indirectAddress=dgc_address(stream),
       .indirectAddressSize=stream_stride,.preprocessAddress=dgc_address(output),.preprocessSize=mr.memoryRequirements.size,
       .maxSequenceCount=1,.maxDrawCount=draws};
-   execute(cb,VK_FALSE,&info);
+   if(outside) {
+      VkCommandBufferAllocateInfo ai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=gate_pool,
+         .level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
+      CHECK(vkAllocateCommandBuffers(dgc_device,&ai,&gate_preprocess));
+      VkCommandBufferBeginInfo bi={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+      CHECK(vkBeginCommandBuffer(gate_preprocess,&bi));
+      PFN_vkCmdPreprocessGeneratedCommandsEXT prepare=(void *)vkGetDeviceProcAddr(dgc_device,"vkCmdPreprocessGeneratedCommandsEXT");
+      prepare(gate_preprocess,&info,cb);CHECK(vkEndCommandBuffer(gate_preprocess));
+      gate_generated_pipeline=pi;gate_generated=info;gate_generated.pNext=&gate_generated_pipeline;
+      VkMemoryBarrier barrier={.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,.srcAccessMask=VK_ACCESS_COMMAND_PREPROCESS_WRITE_BIT_EXT,
+         .dstAccessMask=VK_ACCESS_INDIRECT_COMMAND_READ_BIT};
+      vkCmdPipelineBarrier(cb,VK_PIPELINE_STAGE_COMMAND_PREPROCESS_BIT_EXT,VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,0,1,&barrier,0,NULL,0,NULL);
+      puts("GATE_EXPLICIT_PREPROCESS_OUTSIDE_RENDERING separate_primary=1");
+   } else execute(cb,VK_FALSE,&info);
 }
 
 int main(int argc, char **argv)
@@ -280,6 +298,7 @@ int main(int argc, char **argv)
    void *mapped; CK(vkMapMemory(dev,buffer_mem,0,VK_WHOLE_SIZE,0,&mapped)); memset(mapped,0xa5,BYTES);
    VkCommandPoolCreateInfo cpci={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.queueFamilyIndex=family};
    VkCommandPool pool; CK(vkCreateCommandPool(dev,&cpci,NULL,&pool));
+   gate_pool=pool;
    VkCommandBufferAllocateInfo cbai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=pool,
       .level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
    VkCommandBuffer cb; CK(vkAllocateCommandBuffers(dev,&cbai,&cb));
@@ -293,7 +312,7 @@ int main(int argc, char **argv)
       VkDeviceMemory memory;void *map;dgc_buffer(64*12,~0u,&indirect,&memory,&map);if(dgc_failed)return 1;
       for(unsigned i=0;i<64;i++) {uint32_t xyz[]={1,1,1};memcpy((char *)map+i*12,xyz,12);}
    }
-   vkCmdBeginRenderPass(cb,&rbi,VK_SUBPASS_CONTENTS_INLINE); vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline);
+   vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline);
    if(gate_db) {
       VkPhysicalDeviceDescriptorBufferPropertiesEXT properties={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT};
       VkPhysicalDeviceProperties2 p2={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,.pNext=&properties};vkGetPhysicalDeviceProperties2(pd,&p2);
@@ -325,11 +344,19 @@ int main(int argc, char **argv)
    }
    PFN_vkCmdDrawMeshTasksEXT draw=(PFN_vkCmdDrawMeshTasksEXT)vkGetDeviceProcAddr(dev,"vkCmdDrawMeshTasksEXT");
    if (!draw) return 2;
+   int feature=getenv("GATE_MODE")&&!strcmp(getenv("GATE_MODE"),"feature");
+   dgc_device=dev;dgc_physical=pd;dgc_pipeline=pipeline;dgc_pipeline_layout=layout;
+   if(feature&&gate_db){dgc_draw(cb,task,1);if(dgc_failed)return 1;}
+   vkCmdBeginRenderPass(cb,&rbi,VK_SUBPASS_CONTENTS_INLINE);
    if (!getenv("GATE_MODE") || strcmp(getenv("GATE_MODE"),"feature")) {
       if(gate_many) {PFN_vkCmdDrawMeshTasksIndirectEXT draw_many=(void *)vkGetDeviceProcAddr(dev,"vkCmdDrawMeshTasksIndirectEXT");draw_many(cb,indirect,0,64,12);}
       else draw(cb,1,1,1);
    }
-   else { dgc_device=dev;dgc_physical=pd;dgc_pipeline=pipeline;dgc_pipeline_layout=layout;dgc_draw(cb,task);if(dgc_failed)return 1; }
+   else {
+      if(gate_db){PFN_vkCmdExecuteGeneratedCommandsEXT execute=(void *)vkGetDeviceProcAddr(dev,"vkCmdExecuteGeneratedCommandsEXT");execute(cb,VK_TRUE,&gate_generated);}
+      else dgc_draw(cb,task,0);
+      if(dgc_failed)return 1;
+   }
    vkCmdEndRenderPass(cb);
    VkBufferImageCopy copy={.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.imageExtent={SIDE,SIDE,1}};
    vkCmdCopyImageToBuffer(cb,image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,buffer,1,&copy);
@@ -340,7 +367,9 @@ int main(int argc, char **argv)
    CK(vkEndCommandBuffer(cb));
    if (validation_errors) { fputs("REFUSE: validation errors before submit\n",stderr); return 1; }
    VkFenceCreateInfo fci={.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence fence; CK(vkCreateFence(dev,&fci,NULL,&fence));
-   VkSubmitInfo submit={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&cb};
+   VkCommandBuffer commands[]={gate_preprocess,cb};
+   VkSubmitInfo submit={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=gate_preprocess?2:1,
+      .pCommandBuffers=gate_preprocess?commands:&cb};
    printf("DGC_READY mode=%s mesh_draws=%u workgroups=1,1,1 submits=1\n",offline?"noop":"hardware",gate_many?64:1);
    /* The one-shot launcher verifies the actual compilation before releasing
     * this single submission. EOF, a bad token, or launcher failure stops here. */

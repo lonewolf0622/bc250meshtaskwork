@@ -13747,6 +13747,12 @@ radv_validate_dynamic_states(struct radv_cmd_buffer *cmd_buffer, uint64_t dynami
 static void
 radv_emit_all_graphics_states(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info)
 {
+   /* The execution command buffer establishes the complete graphics state.
+    * Private helpers use compute registers; generated draws only replace
+    * descriptors and constants. In particular, preprocessing outside a
+    * render scope must not freeze attachment-dependent state or query VAs. */
+   if (cmd_buffer->bc250_dgc_inherit_graphics_state)
+      return;
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
 

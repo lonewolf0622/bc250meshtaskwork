@@ -568,6 +568,7 @@ struct radv_cmd_buffer {
    uint64_t bc250_dgc_upload_va;
    uint64_t bc250_dgc_application_va;
    bool bc250_dgc_merged_constants;
+   bool bc250_dgc_inherit_graphics_state;
    /* Capture-only typed Task constant uploads for a reusable count IB. */
    struct {
       uint32_t offsets[2050];

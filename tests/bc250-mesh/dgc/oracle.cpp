@@ -24,6 +24,43 @@ static uint32_t get(const std::vector<uint8_t> &v, size_t off)
 }
 static void set(std::vector<uint8_t> &v,size_t off,uint32_t x) { memcpy(v.data()+off,&x,4); }
 static void check(bool b,const char *why) { if(!b)throw std::runtime_error(why); }
+static void execution_queries(std::vector<uint8_t> dst,const params &p,const std::string &path,unsigned seq_count)
+{
+   std::ifstream exists(path,std::ios::binary);
+   if(!exists)return;
+   auto owner=read(path);unsigned writes=0;size_t last_write=0;bool acquired=false,synced=false;
+   for(size_t off=0;off<owner.size();) {
+      uint32_t h=get(owner,off);unsigned len=h==PKT3_NOP_PAD || h>>30==2 ? 1 : ((h>>16)&0x3fff)+2;
+      check(off+len*4<=owner.size(),"owner packet exceeds command stream");unsigned op=h>>8&255;
+      if(op==PKT3_WRITE_DATA && len==6) {
+         uint64_t va=get(owner,off+8)|(uint64_t)get(owner,off+12)<<32;
+         if(va>=p.output && va+8<=p.output+uint64_t(p.stride)*p.sequences && (va-p.output)%p.stride<p.code) {
+            check(G_371_WR_CONFIRM(get(owner,off+4)),"query publication write lacks confirmation");
+            uint32_t header=get(owner,off+16),event=get(owner,off+20);
+            check(header==PKT3(PKT3_EVENT_WRITE,0,false) || header==PKT3(PKT3_NOP,0,false),"untyped query patch");
+            check((event&63)==V_028A90_PIPELINESTAT_START || (event&63)==V_028A90_PIPELINESTAT_STOP,"query patch changes another event");
+            set(dst,va-p.output,header);set(dst,va-p.output+4,event);writes++;last_write=off;acquired=synced=false;
+         }
+      }
+      if(off>last_write && op==PKT3_ACQUIRE_MEM)acquired=true;
+      if(off>last_write && op==PKT3_PFP_SYNC_ME)synced=true;
+      off+=len*4;
+   }
+   if(!writes)return; /* A direct Mesh stream without helpers has no query packets. */
+   check(acquired && synced,"query patches were not published before IB fetch");
+   for(unsigned seq=0;seq<p.sequences;seq++)for(size_t off=size_t(seq)*p.stride;off<size_t(seq)*p.stride+p.code;) {
+      uint32_t h=get(dst,off);check(h>>30==2 || h>>30==3,"query patch corrupts PM4 header");
+      unsigned len=h==PKT3_NOP_PAD || h>>30==2 ? 1 : ((h>>16)&0x3fff)+2;
+      check(off+len*4<=size_t(seq)*p.stride+p.code,"patched packet crosses program boundary");
+      unsigned op=h>>8&255;
+      if(seq>=std::min(seq_count,p.sequences)) {
+         check(op==PKT3_NOP || op==PKT3_EVENT_WRITE,"inactive patched sequence executes draws");
+         if(op==PKT3_EVENT_WRITE)check(len==2 && ((get(dst,off+4)&63)==V_028A90_PIPELINESTAT_START ||
+            (get(dst,off+4)&63)==V_028A90_PIPELINESTAT_STOP),"inactive sequence executes another event");
+      }
+      off+=len*4;
+   }
+}
 static void pm4(const std::vector<uint8_t> &v,size_t begin,size_t bytes,bool task,unsigned draws)
 {
    unsigned dispatch=0,mesh=0,flush=0,native=0;
@@ -156,6 +193,7 @@ int main(int argc,char **argv)
                check(!memcmp(dst.data()+base+p.code+skip,src.data()+base+p.code+skip,p.stride-p.code-skip),"private upload changed");
             }
             for(size_t i=src.size();i<dst.size();i++)check(dst[i]==0xA5,"preprocess output overrun");
+            execution_queries(dst,p,dir+"/query-owner-"+suffix+".bin",seq_count);
          }
       }
       ralloc_free(s);

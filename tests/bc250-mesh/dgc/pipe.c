@@ -168,9 +168,15 @@ static void dgc_reset_query(VkCommandBuffer cb)
    }
    vkCmdResetQueryPool(cb,dgc_query_pool,0,1);
 }
+static VkRenderPassBeginInfo dgc_render_info;
+static int dgc_query_started;
 static void dgc_scope_begin(VkCommandBuffer cb)
 {
-   if(dgc_query_pool)vkCmdBeginQuery(cb,dgc_query_pool,0,!strcmp(getenv("DGC_QUERY"),"occlusion")?VK_QUERY_CONTROL_PRECISE_BIT:0);
+   dgc_query_started=0;
+   if(dgc_query_pool&&!getenv("DGC_QUERY_AFTER_PREPROCESS")) {
+      vkCmdBeginQuery(cb,dgc_query_pool,0,!strcmp(getenv("DGC_QUERY"),"occlusion")?VK_QUERY_CONTROL_PRECISE_BIT:0);
+      dgc_query_started=1;
+   }
    if(getenv("DGC_CONDITIONAL")) {
       if(!dgc_predicate) {
          void *map;dgc_buffer(256,~0u,&dgc_predicate,&dgc_predicate_memory,&map);
@@ -185,9 +191,9 @@ static void dgc_scope_begin(VkCommandBuffer cb)
 static void dgc_scope_end(VkCommandBuffer cb)
 {
    if(getenv("DGC_CONDITIONAL")){PFN_vkCmdEndConditionalRenderingEXT end=(void *)vkGetDeviceProcAddr(dgc_device,"vkCmdEndConditionalRenderingEXT");end(cb);}
-   if(dgc_query_pool&&!dgc_query_ended)vkCmdEndQuery(cb,dgc_query_pool,0);
+   if(dgc_query_pool&&dgc_query_started&&!dgc_query_ended)vkCmdEndQuery(cb,dgc_query_pool,0);
 }
-static void dgc_render_begin(VkCommandBuffer cb,const VkRenderPassBeginInfo *i,VkSubpassContents c){vkCmdBeginRenderPass(cb,i,c);dgc_scope_begin(cb);}
+static void dgc_render_begin(VkCommandBuffer cb,const VkRenderPassBeginInfo *i,VkSubpassContents c){dgc_render_info=*i;vkCmdBeginRenderPass(cb,i,c);dgc_scope_begin(cb);}
 static void dgc_render_end(VkCommandBuffer cb){dgc_scope_end(cb);vkCmdEndRenderPass(cb);}
 static void dgc_rendering_begin(VkCommandBuffer cb,const VkRenderingInfo *i){vkCmdBeginRendering(cb,i);dgc_scope_begin(cb);}
 static void dgc_rendering_end(VkCommandBuffer cb){dgc_scope_end(cb);vkCmdEndRendering(cb);}
@@ -286,8 +292,14 @@ static void dgc_draw(VkCommandBuffer cb, int count)
       VkCommandBufferBeginInfo begin={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
       CHECK(vkBeginCommandBuffer(dgc_preprocess[n],&begin));
       PFN_vkCmdPreprocessGeneratedCommandsEXT prepare=(void *)vkGetDeviceProcAddr(dgc_device,"vkCmdPreprocessGeneratedCommandsEXT");
+      if(getenv("DGC_PREPROCESS_OUTSIDE"))vkCmdEndRenderPass(cb);
       prepare(dgc_preprocess[n],&info,cb);
       CHECK(vkEndCommandBuffer(dgc_preprocess[n]));
+      if(getenv("DGC_PREPROCESS_OUTSIDE"))vkCmdBeginRenderPass(cb,&dgc_render_info,VK_SUBPASS_CONTENTS_INLINE);
+      if(dgc_query_pool&&!dgc_query_started&&getenv("DGC_QUERY_AFTER_PREPROCESS")) {
+         vkCmdBeginQuery(cb,dgc_query_pool,0,!strcmp(getenv("DGC_QUERY"),"occlusion")?VK_QUERY_CONTROL_PRECISE_BIT:0);
+         dgc_query_started=1;
+      }
       if(getenv("DGC_QUERY_CHANGE")&&!dgc_query_ended){vkCmdEndQuery(cb,dgc_query_pool,0);dgc_query_ended=1;}
       execute(cb,VK_TRUE,&info);
    } else execute(cb,VK_FALSE,&info);
