@@ -569,6 +569,8 @@ struct radv_cmd_buffer {
    uint64_t bc250_dgc_application_va;
    bool bc250_dgc_merged_constants;
    bool bc250_dgc_inherit_graphics_state;
+   uint64_t bc250_dgc_nonuniform_pc;
+   VkShaderStageFlags bc250_dgc_pc_stages[MAX_PUSH_CONSTANTS_SIZE / 4];
    /* Capture-only typed Task constant uploads for a reusable count IB. */
    struct {
       uint32_t offsets[2050];

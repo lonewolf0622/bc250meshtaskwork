@@ -27,6 +27,7 @@ struct radv_pipeline_layout {
    uint16_t dynamic_shader_stages;
 
    bool independent_sets;
+   VkShaderStageFlags bc250_pc_stages[MAX_PUSH_CONSTANTS_SIZE / 4];
 
    blake3_hash hash;
 };

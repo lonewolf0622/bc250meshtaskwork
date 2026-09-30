@@ -1397,6 +1397,8 @@ radv_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer, UNUSED VkCommandB
    radv_rra_accel_struct_buffers_unref(device, cmd_buffer->accel_struct_buffers);
 
    cmd_buffer->push_constant_stages = 0;
+   cmd_buffer->bc250_dgc_nonuniform_pc = 0;
+   memset(cmd_buffer->bc250_dgc_pc_stages, 0, sizeof(cmd_buffer->bc250_dgc_pc_stages));
    cmd_buffer->gang.flush_bits = 0;
    cmd_buffer->gang.sem.leader_value = 0;
    cmd_buffer->gang.sem.emitted_leader_value = 0;
@@ -6848,6 +6850,7 @@ static void
 radv_flush_constants(struct radv_cmd_buffer *cmd_buffer, VkShaderStageFlags stages, VkPipelineBindPoint bind_point)
 {
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   const struct radv_physical_device *pdev = radv_device_physical(device);
    struct radv_cmd_stream *cs = radv_get_pm4_cs(cmd_buffer);
    const struct radv_push_constant_state *push_constants = radv_get_push_constants_state(cmd_buffer, bind_point);
    uint64_t va = 0;
@@ -6892,7 +6895,21 @@ radv_flush_constants(struct radv_cmd_buffer *cmd_buffer, VkShaderStageFlags stag
 
          /* Avoid redundantly emitting the same values for merged stages. */
          if (shader && shader != prev_shader) {
-            radv_emit_push_constants_per_stage(device, cs, shader, (uint32_t *)cmd_buffer->push_constants, va, dgc_va);
+            /* Fragment shaders keep the application ABI while private Mesh
+             * consumers use the compatibility block. DGC root constants must
+             * reach both, including inlined Fragment constants. */
+            uint64_t fragment_va = stage == MESA_SHADER_FRAGMENT && !cmd_buffer->state.meta.inside_meta_op
+               ? cmd_buffer->bc250_dgc_application_va : 0;
+            if (!fragment_va && stage == MESA_SHADER_FRAGMENT && pdev->bc250_expose_dgc &&
+                cmd_buffer->bc250_inside_mesh_draw && !cmd_buffer->state.meta.inside_meta_op) {
+               const struct radv_graphics_pipeline *p = radv_bc250_mesh_pipeline(cmd_buffer);
+               if (p && p->base.shaders[MESA_SHADER_MESH]->info.ms.bc250_merge_k <= 1 &&
+                   (p->bc250_task_pipeline || p->bc250_ordered || p->bc250_direct_split_pieces ||
+                         (p->bc250_plan.flags & RADV_BC250_PLAN_SPLIT)))
+                  memcpy(&fragment_va, cmd_buffer->push_constants + 24, sizeof(fragment_va));
+            }
+            radv_emit_push_constants_per_stage(device, cs, shader, (uint32_t *)cmd_buffer->push_constants,
+               fragment_va ? fragment_va : va, fragment_va ? fragment_va : dgc_va);
 
             prev_shader = shader;
          }
@@ -8720,6 +8737,22 @@ VKAPI_ATTR void VKAPI_CALL
 radv_CmdPushConstants2(VkCommandBuffer commandBuffer, const VkPushConstantsInfo *pPushConstantsInfo)
 {
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
+   if (radv_device_physical(radv_cmd_buffer_device(cmd_buffer))->bc250_expose_dgc &&
+       !cmd_buffer->state.meta.inside_meta_op && !cmd_buffer->bc250_inside_mesh_draw) {
+      VK_FROM_HANDLE(radv_pipeline_layout, layout, pPushConstantsInfo->layout);
+      const VkShaderStageFlags graphics = VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_TASK_BIT_EXT |
+         VK_SHADER_STAGE_FRAGMENT_BIT;
+      for (unsigned i = 0; i < pPushConstantsInfo->size / 4; i++) {
+         unsigned word = pPushConstantsInfo->offset / 4 + i;
+         VkShaderStageFlags stages = layout->bc250_pc_stages[word] & graphics;
+         if (stages) cmd_buffer->bc250_dgc_pc_stages[word] = stages;
+         stages = cmd_buffer->bc250_dgc_pc_stages[word];
+         if ((pPushConstantsInfo->stageFlags & stages) == stages)
+            cmd_buffer->bc250_dgc_nonuniform_pc &= ~(1ull << word);
+         else if (memcmp(cmd_buffer->push_constants + word * 4, (const uint8_t *)pPushConstantsInfo->pValues + i * 4, 4))
+            cmd_buffer->bc250_dgc_nonuniform_pc |= 1ull << word;
+      }
+   }
    memcpy(cmd_buffer->push_constants + pPushConstantsInfo->offset, pPushConstantsInfo->pValues,
           pPushConstantsInfo->size);
    cmd_buffer->push_constant_stages |= pPushConstantsInfo->stageFlags;

@@ -106,7 +106,7 @@ static void dgc_draw(VkCommandBuffer cb,int task,int outside)
    unsigned draws=gate_many?64:1;
    VkIndirectCommandsLayoutTokenEXT token={.sType=VK_STRUCTURE_TYPE_INDIRECT_COMMANDS_LAYOUT_TOKEN_EXT,
       .type=gate_many?VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_MESH_TASKS_COUNT_EXT:VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_MESH_TASKS_EXT,.offset=gate_db?4:0};
-   VkIndirectCommandsPushConstantTokenEXT pc={.updateRange={VK_SHADER_STAGE_MESH_BIT_EXT|VK_SHADER_STAGE_TASK_BIT_EXT,0,4}};
+   VkIndirectCommandsPushConstantTokenEXT pc={.updateRange={VK_SHADER_STAGE_MESH_BIT_EXT|VK_SHADER_STAGE_TASK_BIT_EXT|VK_SHADER_STAGE_FRAGMENT_BIT,0,4}};
    VkIndirectCommandsLayoutTokenEXT tokens[]={
       {.sType=VK_STRUCTURE_TYPE_INDIRECT_COMMANDS_LAYOUT_TOKEN_EXT,.type=VK_INDIRECT_COMMANDS_TOKEN_TYPE_PUSH_CONSTANT_EXT,
        .offset=0,.data.pPushConstant=&pc},token};
@@ -231,8 +231,8 @@ int main(int argc, char **argv)
    dgc_device=dev;dgc_physical=pd;
    VkDescriptorSetLayout descriptor_layouts[2]={0};
    VkDescriptorSetLayoutBinding binding={.binding=0,.descriptorCount=1,
-      .stageFlags=VK_SHADER_STAGE_MESH_BIT_EXT|VK_SHADER_STAGE_TASK_BIT_EXT,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
-   VkPushConstantRange range={VK_SHADER_STAGE_MESH_BIT_EXT|VK_SHADER_STAGE_TASK_BIT_EXT,0,4};
+      .stageFlags=VK_SHADER_STAGE_MESH_BIT_EXT|VK_SHADER_STAGE_TASK_BIT_EXT|VK_SHADER_STAGE_FRAGMENT_BIT,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+   VkPushConstantRange range={VK_SHADER_STAGE_MESH_BIT_EXT|VK_SHADER_STAGE_TASK_BIT_EXT|VK_SHADER_STAGE_FRAGMENT_BIT,0,4};
    if(gate_db) {
       VkDescriptorSetLayoutCreateInfo set={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
          .flags=VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT,.bindingCount=1,.pBindings=&binding};

@@ -22,6 +22,7 @@ struct radv_indirect_command_layout {
    uint64_t push_constant_mask;
    uint32_t push_constant_offsets[MAX_PUSH_CONSTANTS_SIZE / 4];
    uint64_t sequence_index_mask;
+   bool bc250_pc_stages_valid;
 
    VkPipelineLayout pipeline_layout;
    VkPipeline pipeline;

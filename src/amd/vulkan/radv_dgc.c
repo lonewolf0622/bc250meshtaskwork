@@ -3413,6 +3413,20 @@ radv_CreateIndirectCommandsLayoutEXT(VkDevice _device, const VkIndirectCommandsL
    if (!layout)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+   layout->bc250_pc_stages_valid = true;
+   if (radv_device_physical(device)->bc250_expose_dgc) {
+      VK_FROM_HANDLE(radv_pipeline_layout, pl, pCreateInfo->pipelineLayout);
+      const VkShaderStageFlags graphics = VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_TASK_BIT_EXT |
+         VK_SHADER_STAGE_FRAGMENT_BIT;
+      for (unsigned i = 0; i < layout->vk.n_pc_layouts + !!(layout->vk.dgc_info & BITFIELD_BIT(MESA_VK_DGC_SI)); i++) {
+         const struct vk_indirect_command_push_constant_layout *pc = i < layout->vk.n_pc_layouts ?
+            &layout->vk.pc_layouts[i] : &layout->vk.si_layout;
+         for (unsigned word = pc->dst_offset_B / 4; word < (pc->dst_offset_B + pc->size_B) / 4; word++)
+            if (!pl || (pc->stages & pl->bc250_pc_stages[word] & graphics) != (pl->bc250_pc_stages[word] & graphics))
+               layout->bc250_pc_stages_valid = false;
+      }
+   }
+
    for (uint32_t i = 0; i < layout->vk.n_pc_layouts; i++) {
       for (uint32_t j = layout->vk.pc_layouts[i].dst_offset_B / 4, k = 0; k < layout->vk.pc_layouts[i].size_B / 4;
            j++, k++) {

@@ -34,6 +34,9 @@ for mode in ('db','legacydb'):
    capture=(dump/f'capture-{count}.bin').read_bytes();params=struct.unpack_from('<QQQQIIII',capture);seqs,stride,code,records=params[4:]
    for seq in range(seqs):
     bindings=json.loads((dump/f'bindings-{count}-{seq}.json').read_text())
+    constants=json.loads((dump/f'constants-{count}-{seq}.json').read_text())
+    assert constants['fragment_inline'] or constants['fragment_pointer']
+    assert constants['app']==params[1]+seq*stride+code+((4+params[7]*12+15)&~15)
     assert any(b['set']==0 and b['stage']==0 for b in bindings),bindings
     assert any(b['set']==3 and b['stage']==0 for b in bindings),bindings
     if task:assert {b['set'] for b in bindings if b['stage']==2} >= {0,3},bindings
@@ -46,10 +49,19 @@ for mode in ('db','legacydb'):
      if op==0x76:
       reg=0xb000+(words[i+1]&0xffff)*4
       for w in words[i+2:i+n]:regs[reg]=w;reg+=4
+     if op==0x63:
+      reg=0xb000+(words[i+3]&0xffff)*4
+      regs[reg]=('memory',words[i+1]|words[i+2]<<32)
      if op==0x4c:
       consumers+=1
       for b in bindings:
        if b['stage'] in (0,1):assert regs.get(b['reg'])==b['va']&0xffffffff,(b,regs.get(b['reg']))
+      reg=constants['fragment_inline']
+      for word in range(64):
+       if constants['fragment_mask']>>word&1:
+        assert regs.get(reg)==('memory',constants['app']+word*4),(constants,reg,regs.get(reg))
+        reg+=4
+      if constants['fragment_pointer']:assert regs.get(constants['fragment_pointer'])==constants['app']&0xffffffff
      if op==0x16 and task:
       producers+=1
       for b in bindings:

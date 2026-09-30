@@ -48,7 +48,7 @@ bc250_dgc_shape(const struct radv_indirect_command_layout *layout, const void *n
 {
    const VkGeneratedCommandsPipelineInfoEXT *pi = vk_find_struct_const(next, GENERATED_COMMANDS_PIPELINE_INFO_EXT);
    const VkGeneratedCommandsShaderInfoEXT *si = vk_find_struct_const(next, GENERATED_COMMANDS_SHADER_INFO_EXT);
-   if (!pi || si || !pi->pipeline || sequences > 1048576 ||
+   if (!pi || si || !pi->pipeline || !layout->bc250_pc_stages_valid || sequences > 1048576 ||
        (layout->vk.dgc_info & ~(BITFIELD_BIT(MESA_VK_DGC_DRAW_MESH) |
           BITFIELD_BIT(MESA_VK_DGC_PC) | BITFIELD_BIT(MESA_VK_DGC_SI))))
       return false;
@@ -226,6 +226,9 @@ bc250_dgc_state_valid(const struct radv_cmd_buffer *state, const VkGeneratedComm
    const VkGeneratedCommandsPipelineInfoEXT *pi = vk_find_struct_const(info->pNext, GENERATED_COMMANDS_PIPELINE_INFO_EXT);
    VK_FROM_HANDLE(radv_pipeline, p, pi ? pi->pipeline : VK_NULL_HANDLE);
    const struct radv_cmd_state *s = &state->state;
+   VK_FROM_HANDLE(radv_indirect_command_layout, layout, info->indirectCommandsLayout);
+   if (state->bc250_dgc_nonuniform_pc & ~layout->push_constant_mask)
+      return false;
    if (!p || state->qf != RADV_QUEUE_GENERAL || state->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY ||
        (state->vk.pool->flags & VK_COMMAND_POOL_CREATE_PROTECTED_BIT) ||
        (state->usage_flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT) ||
@@ -366,11 +369,14 @@ bc250_dgc_capture(struct radv_cmd_buffer *owner, const struct radv_cmd_buffer *s
    cmd->upload.map = snapshot + shape->code;
    cmd->upload.size = shape->data;
    unsigned app_offset = align(4 + shape->records * 12, 16);
-   if (layout->push_constant_mask) {
+   const struct radv_shader *fs = cmd->state.graphics_pipeline->base.shaders[MESA_SHADER_FRAGMENT];
+   bool app_constants = layout->push_constant_mask ||
+      (fs && (fs->info.loads_push_constants || fs->info.inline_push_constant_mask));
+   if (app_constants) {
       cmd->bc250_dgc_application_va = cmd->bc250_dgc_upload_va + app_offset;
       memcpy(cmd->upload.map + app_offset, state->push_constants, MAX_PUSH_CONSTANTS_SIZE);
    }
-   cmd->upload.offset = align(app_offset + (layout->push_constant_mask ? MAX_PUSH_CONSTANTS_SIZE : 0), 256);
+   cmd->upload.offset = align(app_offset + (app_constants ? MAX_PUSH_CONSTANTS_SIZE : 0), 256);
    unsigned fence_offset = align(cmd->upload.offset, 8);
    cmd->gfx9_fence_va = cmd->bc250_dgc_upload_va + fence_offset;
    cmd->gfx9_fence_idx = 0;
@@ -466,6 +472,17 @@ bc250_dgc_capture(struct radv_cmd_buffer *owner, const struct radv_cmd_buffer *s
                }
             }
             fprintf(f, "]\n");
+            fclose(f);
+         }
+         snprintf(path, sizeof(path), "%s/constants-%u-%u.json", dump, layout->vk.draw_count, seq);
+         f = fopen(path, "w");
+         const struct radv_shader *fragment = pipeline->base.shaders[MESA_SHADER_FRAGMENT];
+         if (f) {
+            fprintf(f, "{\"app\":%llu,\"fragment_inline\":%u,\"fragment_mask\":%llu,\"fragment_pointer\":%u}\n",
+               (unsigned long long)cmd->bc250_dgc_application_va,
+               fragment ? radv_get_user_sgpr_loc(fragment, AC_UD_INLINE_PUSH_CONSTANTS) : 0,
+               (unsigned long long)(fragment ? fragment->info.inline_push_constant_mask : 0),
+               fragment ? radv_get_user_sgpr_loc(fragment, AC_UD_PUSH_CONSTANTS) : 0);
             fclose(f);
          }
       }
