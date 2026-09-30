@@ -6510,12 +6510,17 @@ radv_bc250_draw_merge_indirect(struct radv_cmd_buffer *cmd_buffer, unsigned merg
  * fill in the BC-250 base settings and every validated direct-path switch that is not already set
  * (explicitly set variables always win). The values are the validated configuration (Mesh CTS
  * 3,558/3,558 on hardware, every pipeline direct). The switches themselves only act on GFX1013. */
+bool radv_bc250_directmesh_hybrid;
+
 void
 radv_bc250_directmesh_env(void)
 {
    const char *on = getenv("RADV_DIRECTMESH");
    if (!on || strcmp(on, "1"))
       return;
+   /* Hybrid Task hides GPL, shader objects and pipeline binaries. Remember whether the preset (and not
+    * the user) turned it on, so DXVK (no Mesh shaders in D3D9-11) keeps GPL (radv_physical_device.c). */
+   radv_bc250_directmesh_hybrid = getenv("RADV_BC250_HYBRID_TASK") == NULL;
    static const char *const settings[][2] = {
       /* BC-250 base: Mesh through hybrid Task; split/expansion stays the automatic fallback. */
       {"RADV_BC250_NATIVE_TASK", "0"}, {"RADV_BC250_HYBRID_TASK", "1"},

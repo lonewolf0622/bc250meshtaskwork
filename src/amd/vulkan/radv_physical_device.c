@@ -30,6 +30,7 @@
 #include "radv_entrypoints.h"
 #include "radv_instance.h"
 #include "radv_physical_device.h"
+#include "radv_bc250.h"
 #include "radv_pipeline_rt.h"
 #include "radv_video.h"
 #include "radv_wsi.h"
@@ -2767,8 +2768,13 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
       radv_compute_queue_enabled(pdev) &&
       (debug_get_bool_option("BC250_NATIVE_TASK_COMPILE", false) ||
        debug_get_bool_option("RADV_BC250_NATIVE_TASK", false));
+   /* RADV_DIRECTMESH=1: DXVK (D3D9-11, no Mesh shaders) keeps GPL, shader objects and pipeline binaries
+    * instead of the preset's hybrid Task. An explicit RADV_BC250_HYBRID_TASK still applies. */
+   const bool bc250_dxvk = instance->vk.app_info.engine_name && !strcmp(instance->vk.app_info.engine_name, "DXVK");
    pdev->bc250_hybrid_task = pdev->bc250_native_mesh &&
-      debug_get_bool_option("RADV_BC250_HYBRID_TASK", false);
+      debug_get_bool_option("RADV_BC250_HYBRID_TASK", false) && !(bc250_dxvk && radv_bc250_directmesh_hybrid);
+   if (pdev->bc250_native_mesh && bc250_dxvk && radv_bc250_directmesh_hybrid && getenv("BC250_TRACE_COMPILE"))
+      fprintf(stderr, "radv/bc250: DXVK: hybrid Task off, GPL/shader objects/pipeline binaries kept\n");
    pdev->bc250_fast_binding = pdev->bc250_native_mesh &&
       debug_get_bool_option("RADV_BC250_EXPOSE_FAST_BINDING", false);
    /* GFX1013 has no ROTATE_PC_PTR or LOAD_PROVOKING_VTX; the fragment shader
