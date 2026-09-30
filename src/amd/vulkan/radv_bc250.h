@@ -131,6 +131,8 @@ struct nir_shader;
 void radv_bc250_mesh_set_wave(struct nir_shader *nir, unsigned wave);
 /* RADV_BC250_MESH_PIECE_PRIMID: set only around the safe direct pieces split. */
 extern __thread bool radv_bc250_split_piece_primid;
+/* RADV_BC250_TASK_GRID_FOLD: set only around the Task-route split. */
+extern __thread bool radv_bc250_split_task_grid_fold;
 void radv_bc250_directmesh_env(void);
 bool radv_bc250_bary_cid_slot(const struct nir_shader *producer, const struct nir_shader *fs, int *slot);
 bool radv_bc250_split_mesh(struct nir_shader *mesh, struct nir_shader *task, struct nir_shader *fs, bool direct_split,

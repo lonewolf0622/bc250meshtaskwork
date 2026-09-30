@@ -2979,6 +2979,7 @@ bc250_slice_rebuild_deref(nir_builder *b, nir_deref_instr *d, nir_variable *targ
 
 __thread bool radv_bc250_split_refused_retry;
 __thread bool radv_bc250_split_piece_primid;
+__thread bool radv_bc250_split_task_grid_fold;
 
 /* RADV_BC250_MESH_PIECE_PRIMID: the Mesh shader writes PrimitiveId as one scalar 32-bit integer per
  * primitive. The split slices it like any other per-primitive output, so each piece exports the value
@@ -3181,6 +3182,10 @@ radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool d
     */
    if (!task && ((!direct_split && pieces != 1) || mesh->info.task_payload_size))
       return bc250_split_reject("mesh-only amplification/payload unsupported");
+   /* RADV_BC250_TASK_GRID_FOLD: per pipeline, the Mesh records are (pieces, x, y) instead of
+    * (x * pieces, y, z), so a launch count without a compile-time bound needs only the API bound
+    * x <= 65535. The flat launch order is unchanged. */
+   bool fold = false;
    if (task) {
       struct hash_table *ranges = _mesa_pointer_hash_table_create(NULL);
       bool launch_ok = true, has_launch = false;
@@ -3211,7 +3216,13 @@ radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool d
                      launch_ok &= nir_scalar_is_const(dim) && nir_scalar_as_uint(dim) == 1;
                }
                uint32_t upper = nir_unsigned_upper_bound(task, ranges, nir_scalar_chase_movs(nir_get_scalar(in->src[0].ssa, 0)));
-               launch_ok &= upper <= 65535 / pieces;
+               const bool x_ok = upper <= 65535 / pieces;
+               nir_scalar zs = nir_scalar_chase_movs(nir_get_scalar(in->src[0].ssa, 2));
+               if (!x_ok && radv_bc250_split_task_grid_fold && !direct_split &&
+                   nir_scalar_is_const(zs) && nir_scalar_as_uint(zs) == 1)
+                  fold = true;
+               else
+                  launch_ok &= x_ok;
             }
          }
       }
@@ -3220,6 +3231,8 @@ radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool d
          nir_print_shader(task, stderr);
          return bc250_split_reject("unproven task grid bound");
       }
+      if (fold && getenv("BC250_TRACE_COMPILE"))
+         fprintf(stderr, "BC250 TASK GRID FOLD: pieces=%u records=(pieces,x,y) x_bound=api65535\n", pieces);
 
    }
 
@@ -3252,6 +3265,9 @@ radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool d
                nir_def *stride = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 16), .range = 4);
                nir_def *offset = nir_imul(&b, nir_u2u64(&b, nir_load_draw_id(&b)), nir_u2u64(&b, stride));
                grid = nir_load_global(&b, 3, 32, nir_iadd(&b, input, offset), .align_mul = 4);
+            } else if (fold) {
+               nir_def *raw = nir_load_num_workgroups(&b);
+               grid = nir_vec3(&b, nir_channel(&b, raw, 1), nir_channel(&b, raw, 2), nir_imm_int(&b, 1));
             } else {
                nir_def *raw = nir_load_num_workgroups(&b);
                grid = nir_vec3(&b, nir_udiv_imm(&b, nir_channel(&b, raw, 0), pieces),
@@ -3279,6 +3295,12 @@ radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool d
             nir_def *rest = nir_isub(&b, linear, nir_imul(&b, zid, xy));
             nir_def *yid = nir_udiv(&b, rest, x);
             id = nir_vec3(&b, nir_isub(&b, rest, nir_imul(&b, yid, x)), yid, zid);
+         } else if (fold) {
+            /* Record (pieces, X, Y): flat index L = piece + pieces * (x + X * y). */
+            nir_def *a = nir_udiv_imm(&b, nir_load_workgroup_index(&b), pieces);
+            nir_def *X = nir_channel(&b, nir_load_num_workgroups(&b), 1);
+            nir_def *ay = nir_udiv(&b, a, X);
+            id = nir_vec3(&b, nir_isub(&b, a, nir_imul(&b, ay, X)), ay, nir_imm_int(&b, 0));
          } else {
             nir_def *raw = nir_load_workgroup_id(&b);
             id = nir_vec3(&b, nir_udiv_imm(&b, nir_channel(&b, raw, 0), pieces),
@@ -3321,6 +3343,7 @@ radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool d
       nir_variable_create(mesh, nir_var_mem_shared, glsl_uint_type(), "bc250_split_vertex_count") : NULL;
    b.cursor = nir_before_cf_list(&impl->body);
    nir_def *raw_x = direct_split ? bc250_split_flat_index(&b, pieces, piece_select) :
+                    fold ? nir_load_workgroup_index(&b) :
                                    nir_channel(&b, nir_load_workgroup_id(&b), 0);
    nir_def *base = nir_imul_imm(&b, nir_umod_imm(&b, raw_x, pieces), limit);
    nir_def *lane = nir_load_local_invocation_index(&b);
@@ -3609,6 +3632,15 @@ radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool d
                nir_def *old = in->src[0].ssa;
                nir_def *dims = nir_vec3(&tb, nir_imul_imm(&tb, nir_channel(&tb, old, 0), pieces),
                                         nir_channel(&tb, old, 1), nir_channel(&tb, old, 2));
+               if (fold) {
+                  /* API: x <= 65535 and x * y <= 2^22. An out-of-spec launch is dropped, never clamped. */
+                  nir_def *x = nir_channel(&tb, old, 0), *y = nir_channel(&tb, old, 1);
+                  nir_def *total = nir_imul(&tb, nir_u2u64(&tb, x), nir_u2u64(&tb, y));
+                  nir_def *valid = nir_iand(&tb, nir_ult_imm(&tb, x, 65536), nir_ule_imm(&tb, total, 1u << 22));
+                  nir_def *empty = nir_ieq_imm(&tb, nir_channel(&tb, old, 2), 0);
+                  dims = nir_vec3(&tb, nir_imm_int(&tb, pieces),
+                                  nir_bcsel(&tb, nir_iand(&tb, valid, nir_inot(&tb, empty)), x, nir_imm_int(&tb, 0)), y);
+               }
                nir_src_rewrite(&in->src[0], dims);
             }
          }
@@ -5224,9 +5256,12 @@ radv_bc250_prepare_task(struct radv_device *device,
          radv_bc250_mesh_culldist_split(&device->compiler_info, mesh)) ||
         stages[MESA_SHADER_MESH].bc250_fit_min_pieces > 1)) {
       unsigned pieces = 0;
-      if (!device->compiler_info.key.bc250_expand_primitives ||
-          !radv_bc250_split_mesh(mesh, task, stages[MESA_SHADER_FRAGMENT].nir, false, false, device->compiler_info.key.bc250_balanced_slices, device->compiler_info.key.bc250_parallel_cull, device->compiler_info.key.bc250_output_regions,
-                                 device->compiler_info.key.bc250_mesh_compact_lds, device->compiler_info.key.bc250_piece_prims, stages[MESA_SHADER_MESH].bc250_fit_min_pieces, &pieces))
+      radv_bc250_split_task_grid_fold = device->compiler_info.bc250x.task_grid_fold;
+      const bool split_ok = device->compiler_info.key.bc250_expand_primitives &&
+          radv_bc250_split_mesh(mesh, task, stages[MESA_SHADER_FRAGMENT].nir, false, false, device->compiler_info.key.bc250_balanced_slices, device->compiler_info.key.bc250_parallel_cull, device->compiler_info.key.bc250_output_regions,
+                                 device->compiler_info.key.bc250_mesh_compact_lds, device->compiler_info.key.bc250_piece_prims, stages[MESA_SHADER_MESH].bc250_fit_min_pieces, &pieces);
+      radv_bc250_split_task_grid_fold = false;
+      if (!split_ok)
          return VK_ERROR_FEATURE_NOT_PRESENT;
       stages[MESA_SHADER_MESH].bc250_split_mesh = true;
       stages[MESA_SHADER_MESH].bc250_split_pieces = pieces;
