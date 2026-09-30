@@ -58,6 +58,8 @@ run(['cc', '-Wall', '-Werror', '-I' + str(src / 'src/amd/vulkan'), '-o', 'valida
 run([out / 'validate-plan'], 'validate')
 run(['glslangValidator', '--target-env', 'vulkan1.3', '-S', 'frag', '-o', out / 'object-foreign.spv',
      src / 'tests/bc250-mesh/pipeline-plan/object-foreign.frag'], 'object-foreign-build')
+run(['glslangValidator', '--target-env', 'vulkan1.3', '-S', 'task', '-o', out / 'object-foreign-task.spv',
+     src / 'tests/bc250-mesh/pipeline-plan/object-foreign.task'], 'object-foreign-task-build')
 run(['glslangValidator', '--target-env', 'vulkan1.3', '-S', 'mesh', '-DVERTS=3', '-DPRIMS=1', '-DLANES=32',
      '-o', out / 'swap.mesh.spv', src / 'tests/bc250-mesh/compact/cmp.mesh'], 'swap-mesh')
 env['PLAN_SWAP_MESH'] = str(out / 'swap.mesh.spv')
@@ -118,34 +120,31 @@ for name, defs in [('plain', []), ('pieces', ['-DVERTS=128', '-DPRIMS=128', '-DL
     env['PLAN_SWAP_MESH'] = swap_mesh
     env.pop('RADV_BC250_GPL_SOURCE_LINK')
     env.pop('GPL_MODE')
+    env['RADV_BC250_SHADER_OBJECT_PLAN'] = '1'
+    object_args_case = [out / 'object-pipe', case / 'mesh.spv', case / 'frag.spv',
+                        case / 'task.spv' if name.startswith('task') else '-', '1']
+    objects = run(object_args_case, name + '-objects')
+    assert 'OBJECT_LINK result=0' in objects and 'OBJECT_BINARY_ROUNDTRIP' in objects
+    assert 'OBJECT_CORRUPT_TRUNCATED_LAYOUT_REFUSED' in objects and 'OBJECTS_BOUND' in objects and 'SUBMIT_OK' in objects
+    assert 'raw_unproven' not in objects
+    env['OBJECT_BAD_STATE'] = '1'
+    refused = subprocess.run(list(map(str, object_args_case)), env=env, capture_output=True, text=True)
+    (out / (name + '-objects-bad-state.log')).write_text(refused.stdout + refused.stderr)
+    assert refused.returncode == 1 and 'vkEndCommandBuffer(cb) = -8' in refused.stdout and 'SUBMIT_OK' not in refused.stdout
+    env.pop('OBJECT_BAD_STATE')
     if name in ('plain', 'bary'):
-        env['RADV_BC250_SHADER_OBJECT_PLAN'] = '1'
-        objects = run([out / 'object-pipe', case / 'mesh.spv', case / 'frag.spv', '-', '1'], name + '-objects')
-        assert 'OBJECT_LINK result=0' in objects and 'OBJECT_BINARY_ROUNDTRIP' in objects
-        assert 'OBJECT_CORRUPT_TRUNCATED_LAYOUT_REFUSED' in objects and 'OBJECTS_BOUND' in objects and 'SUBMIT_OK' in objects
-        assert 'raw_unproven' not in objects
-        env['OBJECT_BAD_STATE'] = '1'
-        refused = subprocess.run([str(out / 'object-pipe'), str(case / 'mesh.spv'), str(case / 'frag.spv'), '-', '1'],
-                                 env=env, capture_output=True, text=True)
-        (out / (name + '-objects-bad-state.log')).write_text(refused.stdout + refused.stderr)
-        assert refused.returncode == 1 and 'vkEndCommandBuffer(cb) = -8' in refused.stdout and 'SUBMIT_OK' not in refused.stdout
-        env.pop('OBJECT_BAD_STATE')
         env['OBJECT_FOREIGN_FS'] = str(out / 'object-foreign.spv')
-        refused = subprocess.run([str(out / 'object-pipe'), str(case / 'mesh.spv'), str(case / 'frag.spv'), '-', '1'],
-                                 env=env, capture_output=True, text=True)
+        refused = subprocess.run(list(map(str, object_args_case)), env=env, capture_output=True, text=True)
         (out / (name + '-objects-foreign.log')).write_text(refused.stdout + refused.stderr)
         assert refused.returncode == 1 and 'OBJECT_FOREIGN_PAIR_BOUND' in refused.stdout and 'vkEndCommandBuffer(cb) = -8' in refused.stdout
         env.pop('OBJECT_FOREIGN_FS')
-        env.pop('RADV_BC250_SHADER_OBJECT_PLAN')
-    else:
-        env['RADV_BC250_SHADER_OBJECT_PLAN'] = '1'
-        refused = subprocess.run([str(out / 'object-pipe'), str(case / 'mesh.spv'), str(case / 'frag.spv'),
-                                  str(case / 'task.spv') if name.startswith('task') else '-', '1'],
-                                 env=env, capture_output=True, text=True)
-        (out / (name + '-objects-refused.log')).write_text(refused.stdout + refused.stderr)
-        assert refused.returncode == 1 and 'SUBMIT_OK' not in refused.stdout
-        assert 'OBJECT_LINK result=-8' in refused.stdout or 'OBJECT_SHAPE_REFUSED' in refused.stdout
-        env.pop('RADV_BC250_SHADER_OBJECT_PLAN')
+    if name.startswith('task'):
+        env['OBJECT_FOREIGN_TASK'] = str(out / 'object-foreign-task.spv')
+        refused = subprocess.run(list(map(str, object_args_case)), env=env, capture_output=True, text=True)
+        (out / (name + '-objects-foreign-task.log')).write_text(refused.stdout + refused.stderr)
+        assert refused.returncode == 1 and 'OBJECT_FOREIGN_TASK_BOUND' in refused.stdout and 'vkEndCommandBuffer(cb) = -8' in refused.stdout
+        env.pop('OBJECT_FOREIGN_TASK')
+    env.pop('RADV_BC250_SHADER_OBJECT_PLAN')
     rows.append(dict(case=name, serialized_cache_hit=True, binary_roundtrip=True, submit_ok=True,
                      gpl_source_links=['fast_request', 'lto', 'nested']))
     print(name, 'PASS', flush=True)

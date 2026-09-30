@@ -15,7 +15,9 @@ static unsigned module_count;
 static VkDescriptorSetLayout object_sets[8];
 static VkPushConstantRange object_push[8];
 static unsigned object_set_count, object_push_count;
-static VkShaderEXT objects[2];
+static VkShaderEXT objects[3];
+static unsigned object_count;
+static VkShaderStageFlagBits object_stages[3];
 
 static VkResult
 object_module(VkDevice device, const VkShaderModuleCreateInfo *info, const VkAllocationCallbacks *alloc,
@@ -61,7 +63,7 @@ object_pipeline(VkDevice device, VkPipelineCache cache, uint32_t count,
    PFN_vkCreateShadersEXT create = (void *)fixture_get_proc(fixture_instance, "vkCreateShadersEXT");
    PFN_vkGetShaderBinaryDataEXT get = (void *)fixture_get_proc(fixture_instance, "vkGetShaderBinaryDataEXT");
    PFN_vkDestroyShaderEXT destroy = (void *)fixture_get_proc(fixture_instance, "vkDestroyShaderEXT");
-   if (count != 1 || infos->stageCount != 2)
+   if (count != 1 || (infos->stageCount != 2 && infos->stageCount != 3))
    {
       printf("OBJECT_SHAPE_REFUSED\n");
       return VK_ERROR_FEATURE_NOT_PRESENT;
@@ -71,15 +73,18 @@ object_pipeline(VkDevice device, VkPipelineCache cache, uint32_t count,
    VkResult result = create_pipeline(device, cache, count, infos, alloc, pipelines);
    if (result != VK_SUCCESS)
       return result;
-   VkShaderCreateInfoEXT shader_infos[2];
-   for (unsigned i = 0; i < 2; i++) {
+   object_count = infos->stageCount;
+   VkShaderCreateInfoEXT shader_infos[3];
+   for (unsigned i = 0; i < object_count; i++) {
       const VkPipelineShaderStageCreateInfo *stage = &infos->pStages[i];
+      object_stages[i] = stage->stage;
       shader_infos[i] = (VkShaderCreateInfoEXT){
          .sType = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT,
          .flags = VK_SHADER_CREATE_LINK_STAGE_BIT_EXT |
-            (stage->stage == VK_SHADER_STAGE_MESH_BIT_EXT ? VK_SHADER_CREATE_NO_TASK_SHADER_BIT_EXT : 0),
+            (stage->stage == VK_SHADER_STAGE_MESH_BIT_EXT && object_count == 2 ? VK_SHADER_CREATE_NO_TASK_SHADER_BIT_EXT : 0),
          .stage = stage->stage,
-         .nextStage = stage->stage == VK_SHADER_STAGE_MESH_BIT_EXT ? VK_SHADER_STAGE_FRAGMENT_BIT : 0,
+         .nextStage = stage->stage == VK_SHADER_STAGE_TASK_BIT_EXT ? VK_SHADER_STAGE_MESH_BIT_EXT :
+            stage->stage == VK_SHADER_STAGE_MESH_BIT_EXT ? VK_SHADER_STAGE_FRAGMENT_BIT : 0,
          .codeType = VK_SHADER_CODE_TYPE_SPIRV_EXT, .pName = stage->pName,
          .pSpecializationInfo = stage->pSpecializationInfo,
          .setLayoutCount = object_set_count, .pSetLayouts = object_sets,
@@ -93,18 +98,18 @@ object_pipeline(VkDevice device, VkPipelineCache cache, uint32_t count,
       shader_infos[i].pCode = modules[j].code;
       shader_infos[i].codeSize = modules[j].size;
    }
-   VkShaderCreateInfoEXT original_infos[2];
+   VkShaderCreateInfoEXT original_infos[3];
    memcpy(original_infos, shader_infos, sizeof(original_infos));
    const char *write_path = getenv("OBJECT_BINARY_WRITE"), *read_path = getenv("OBJECT_BINARY_READ");
-   void *data[2] = {NULL, NULL};
-   size_t sizes[2] = {0, 0};
+   void *data[3] = {NULL};
+   size_t sizes[3] = {0};
    if (!read_path) {
-      result = create(device, 2, shader_infos, alloc, objects);
+      result = create(device, object_count, shader_infos, alloc, objects);
       printf("OBJECT_LINK result=%d\n", result);
       if (result != VK_SUCCESS)
          return result;
    }
-   for (unsigned i = 0; !read_path && i < 2; i++) {
+   for (unsigned i = 0; !read_path && i < object_count; i++) {
       result = get(device, objects[i], &sizes[i], NULL);
       if (result != VK_SUCCESS)
          return result;
@@ -124,7 +129,7 @@ object_pipeline(VkDevice device, VkPipelineCache cache, uint32_t count,
       FILE *f = fopen(write_path, "wb");
       if (!f)
          return VK_ERROR_UNKNOWN;
-      for (unsigned i = 0; i < 2; i++) {
+      for (unsigned i = 0; i < object_count; i++) {
          uint64_t size = sizes[i];
          if (fwrite(&size, sizeof(size), 1, f) != 1 || fwrite(data[i], 1, sizes[i], f) != sizes[i])
             return VK_ERROR_UNKNOWN;
@@ -136,7 +141,7 @@ object_pipeline(VkDevice device, VkPipelineCache cache, uint32_t count,
       FILE *f = fopen(read_path, "rb");
       if (!f)
          return VK_ERROR_UNKNOWN;
-      for (unsigned i = 0; i < 2; i++) {
+      for (unsigned i = 0; i < object_count; i++) {
          uint64_t size;
          if (fread(&size, sizeof(size), 1, f) != 1 || !size || size > (UINT64_C(128) << 20))
             return VK_ERROR_UNKNOWN;
@@ -152,7 +157,7 @@ object_pipeline(VkDevice device, VkPipelineCache cache, uint32_t count,
       if (fgetc(f) != EOF || fclose(f))
          return VK_ERROR_UNKNOWN;
    }
-   result = create(device, 2, shader_infos, alloc, objects);
+   result = create(device, object_count, shader_infos, alloc, objects);
    if (getenv("OBJECT_EXPECT_REFUSAL")) {
       if (result == VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT &&
           objects[0] == VK_NULL_HANDLE && objects[1] == VK_NULL_HANDLE)
@@ -162,7 +167,7 @@ object_pipeline(VkDevice device, VkPipelineCache cache, uint32_t count,
    if (result != VK_SUCCESS)
       return result;
    printf("OBJECT_BINARY_ROUNDTRIP\n");
-   for (unsigned i = 0; i < 2; i++) {
+   for (unsigned i = 0; i < object_count; i++) {
       VkShaderEXT refused = VK_NULL_HANDLE;
       ((unsigned char *)data[i])[sizes[i] - 1] ^= 1;
       VkResult bad = create(device, 1, &shader_infos[i], alloc, &refused);
@@ -185,7 +190,7 @@ object_pipeline(VkDevice device, VkPipelineCache cache, uint32_t count,
    }
    printf("OBJECT_CORRUPT_TRUNCATED_LAYOUT_REFUSED\n");
    const char *foreign_path = getenv("OBJECT_FOREIGN_FS");
-   if (foreign_path) {
+   if (foreign_path && object_count == 2) {
       FILE *f = fopen(foreign_path, "rb");
       if (!f || fseek(f, 0, SEEK_END))
          return VK_ERROR_UNKNOWN;
@@ -207,6 +212,36 @@ object_pipeline(VkDevice device, VkPipelineCache cache, uint32_t count,
       destroy(device, foreign[0], alloc);
       printf("OBJECT_FOREIGN_PAIR_BOUND\n");
    }
+   const char *foreign_task = getenv("OBJECT_FOREIGN_TASK");
+   if (foreign_task && object_count == 3) {
+      FILE *f = fopen(foreign_task, "rb");
+      if (!f || fseek(f, 0, SEEK_END))
+         return VK_ERROR_UNKNOWN;
+      long size = ftell(f);
+      if (size <= 0 || fseek(f, 0, SEEK_SET))
+         return VK_ERROR_UNKNOWN;
+      void *code = malloc(size);
+      if (!code || fread(code, 1, size, f) != (size_t)size || fclose(f))
+         return VK_ERROR_UNKNOWN;
+      unsigned task = 0;
+      while (task < object_count && object_stages[task] != VK_SHADER_STAGE_TASK_BIT_EXT)
+         task++;
+      if (task == object_count)
+         return VK_ERROR_UNKNOWN;
+      original_infos[task].pCode = code;
+      original_infos[task].codeSize = size;
+      VkShaderEXT foreign[3] = {VK_NULL_HANDLE};
+      result = create(device, object_count, original_infos, alloc, foreign);
+      free(code);
+      if (result != VK_SUCCESS)
+         return result;
+      destroy(device, objects[task], alloc);
+      objects[task] = foreign[task];
+      for (unsigned i = 0; i < object_count; i++)
+         if (i != task)
+            destroy(device, foreign[i], alloc);
+      printf("OBJECT_FOREIGN_TASK_BOUND\n");
+   }
    return VK_SUCCESS;
 }
 
@@ -216,8 +251,7 @@ object_bind(VkCommandBuffer cb, VkPipelineBindPoint bind_point, VkPipeline pipel
    PFN_vkCmdBindPipeline bind = (void *)fixture_get_proc(fixture_instance, "vkCmdBindPipeline");
    PFN_vkCmdBindShadersEXT bind_objects = (void *)fixture_get_proc(fixture_instance, "vkCmdBindShadersEXT");
    bind(cb, bind_point, pipeline);
-   const VkShaderStageFlagBits stages[2] = {VK_SHADER_STAGE_MESH_BIT_EXT, VK_SHADER_STAGE_FRAGMENT_BIT};
-   bind_objects(cb, 2, stages, objects);
+   bind_objects(cb, object_count, object_stages, objects);
    if (getenv("OBJECT_BAD_STATE")) {
       PFN_vkCmdSetPolygonModeEXT set = (void *)fixture_get_proc(fixture_instance, "vkCmdSetPolygonModeEXT");
       set(cb, VK_POLYGON_MODE_LINE);

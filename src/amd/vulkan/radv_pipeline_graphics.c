@@ -3708,32 +3708,7 @@ radv_graphics_pipeline_compile(struct radv_graphics_pipeline *pipeline, const Vk
                                 &pipeline->base.gs_copy_shader, gs_copy_binary, &gs_copy_debug);
 
    if (device->bc250_env.pipeline_plan && pipeline->base.shaders[MESA_SHADER_MESH]) {
-      pipeline->bc250_plan = (struct radv_bc250_pipeline_plan) {
-         .version = RADV_BC250_PIPELINE_PLAN_VERSION,
-         .direct_pieces = pipeline->bc250_direct_split_pieces,
-         .payload_stride = pipeline->bc250_payload_stride,
-         .flags = (pipeline->bc250_task_pipeline ? RADV_BC250_PLAN_TASK : 0) |
-                  (pipeline->bc250_ordered ? RADV_BC250_PLAN_ORDERED : 0) |
-                  (pipeline->bc250_split_order_free ? RADV_BC250_PLAN_ORDER_FREE : 0) |
-                  (stages[MESA_SHADER_MESH].bc250_safe_owned ? RADV_BC250_PLAN_CORNERS : 0),
-         .bary_ref_mask = stages[MESA_SHADER_MESH].bc250_bary_ref_mask,
-         .per_primitive_locations = stages[MESA_SHADER_MESH].bc250_pp_locations,
-         .split_pieces = stages[MESA_SHADER_MESH].bc250_split_pieces,
-         .bary_slots = stages[MESA_SHADER_MESH].bc250_bary_ref_mask ?
-            (stages[MESA_SHADER_MESH].bc250_bary_raw_slot + 1) |
-            ((stages[MESA_SHADER_MESH].bc250_bary_flat_slot + 1) << 8) : 0,
-      };
-      static_assert(sizeof(compiler_info->key) == sizeof(pipeline->bc250_plan.route_key),
-                    "BC250 route policy must retain the complete 24-byte compiler key");
-      memcpy(pipeline->bc250_plan.route_key, &compiler_info->key, sizeof(compiler_info->key));
-      static_assert(sizeof(compiler_info->hw) == sizeof(pipeline->bc250_plan.hardware_key),
-                    "BC250 hardware policy must retain all compiler hardware bytes");
-      memcpy(pipeline->bc250_plan.hardware_key, &compiler_info->hw, sizeof(compiler_info->hw));
-      memcpy(pipeline->bc250_plan.mesh_hash, pipeline->base.shaders[MESA_SHADER_MESH]->hash,
-             sizeof(pipeline->bc250_plan.mesh_hash));
-      if (pipeline->base.shaders[MESA_SHADER_FRAGMENT])
-         memcpy(pipeline->bc250_plan.fragment_hash, pipeline->base.shaders[MESA_SHADER_FRAGMENT]->hash,
-                sizeof(pipeline->bc250_plan.fragment_hash));
+      radv_bc250_capture_pipeline_plan(device, pipeline, &stages[MESA_SHADER_MESH]);
       radv_bc250_graphics_state_hash(device, pCreateInfo, gfx_state, pipeline->bc250_plan.state_hash);
    }
 

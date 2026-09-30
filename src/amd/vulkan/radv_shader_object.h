@@ -14,6 +14,9 @@
 #include "radv_shader.h"
 #include "radv_bc250_pipeline_plan.h"
 
+struct radv_bc250_shader_object_context;
+struct radv_graphics_pipeline;
+
 struct radv_shader_object {
    struct vk_object_base base;
 
@@ -51,8 +54,11 @@ struct radv_shader_object {
    uint8_t bc250_hardware_key[8];
    uint8_t bc250_layout_hash[32];
    struct radv_bc250_pipeline_plan bc250_plan;
+   struct radv_bc250_shader_object_context *bc250_context;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(radv_shader_object, base, VkShaderEXT, VK_OBJECT_TYPE_SHADER_EXT);
+
+struct radv_graphics_pipeline *radv_bc250_shader_object_pipeline(const struct radv_shader_object *object);
 
 #endif /* RADV_SHADER_OBJECT_H */

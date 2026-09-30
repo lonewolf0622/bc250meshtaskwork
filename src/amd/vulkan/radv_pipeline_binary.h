@@ -32,6 +32,7 @@ struct radv_pipeline_binary {
 VK_DEFINE_NONDISP_HANDLE_CASTS(radv_pipeline_binary, base, VkPipelineBinaryKHR, VK_OBJECT_TYPE_PIPELINE_BINARY_KHR)
 
 bool radv_bc250_pipeline_binary_is_plan(const struct radv_pipeline_binary *binary);
+bool radv_bc250_shader_binary_valid(const void *data, size_t size, unsigned stage);
 VkResult radv_bc250_pipeline_binary_restore(struct radv_device *device,
                                            struct radv_graphics_pipeline *pipeline,
                                            const struct radv_pipeline_layout *layout,

@@ -9,6 +9,7 @@
 #include "nir/nir_serialize.h"
 #include "nir/radv_nir.h"
 #include "radv_pipeline_graphics.h"
+#include "radv_shader_object.h"
 #include "radv_pipeline_cache.h"
 #include "radv_pipeline_compute.h"
 #include "radv_constants.h"
@@ -22,6 +23,16 @@
 #include <math.h>
 #include <stdarg.h>
 #include <unistd.h>
+
+struct radv_graphics_pipeline *
+radv_bc250_mesh_pipeline(const struct radv_cmd_buffer *cmd_buffer)
+{
+   if (cmd_buffer->state.graphics_pipeline)
+      return cmd_buffer->state.graphics_pipeline;
+   const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   return device->bc250_env.shader_object_plan
+      ? radv_bc250_shader_object_pipeline(cmd_buffer->state.shader_objs[MESA_SHADER_MESH]) : NULL;
+}
 
 void
 radv_bc250_device_env_init(struct radv_device *device, const struct radv_physical_device *pdev)
@@ -5443,6 +5454,42 @@ radv_bc250_prepare_task(struct radv_device *device,
    return VK_SUCCESS;
 }
 
+void
+radv_bc250_capture_pipeline_plan(const struct radv_device *device, struct radv_graphics_pipeline *pipeline,
+                                 const struct radv_shader_stage *ms)
+{
+   struct radv_bc250_pipeline_plan *plan = &pipeline->bc250_plan;
+   *plan = (struct radv_bc250_pipeline_plan) {
+      .version = RADV_BC250_PIPELINE_PLAN_VERSION,
+      .direct_pieces = pipeline->bc250_direct_split_pieces,
+      .payload_stride = pipeline->bc250_payload_stride,
+      .flags = (pipeline->bc250_task_pipeline ? RADV_BC250_PLAN_TASK : 0) |
+               (pipeline->bc250_ordered ? RADV_BC250_PLAN_ORDERED : 0) |
+               (pipeline->bc250_split_order_free ? RADV_BC250_PLAN_ORDER_FREE : 0) |
+               (ms->bc250_safe_owned ? RADV_BC250_PLAN_CORNERS : 0),
+      .bary_ref_mask = ms->bc250_bary_ref_mask,
+      .per_primitive_locations = ms->bc250_pp_locations,
+      .split_pieces = ms->bc250_split_pieces,
+      .bary_slots = ms->bc250_bary_ref_mask ? (ms->bc250_bary_raw_slot + 1) |
+         ((ms->bc250_bary_flat_slot + 1) << 8) : 0,
+   };
+   static_assert(sizeof(device->compiler_info.key) == sizeof(plan->route_key),
+                 "BC250 route policy must retain the complete 24-byte compiler key");
+   static_assert(sizeof(device->compiler_info.hw) == sizeof(plan->hardware_key),
+                 "BC250 hardware policy must retain all compiler hardware bytes");
+   memcpy(plan->route_key, &device->compiler_info.key, sizeof(plan->route_key));
+   memcpy(plan->hardware_key, &device->compiler_info.hw, sizeof(plan->hardware_key));
+   memcpy(plan->mesh_hash, pipeline->base.shaders[MESA_SHADER_MESH]->hash, sizeof(plan->mesh_hash));
+   if (pipeline->base.shaders[MESA_SHADER_FRAGMENT])
+      memcpy(plan->fragment_hash, pipeline->base.shaders[MESA_SHADER_FRAGMENT]->hash, sizeof(plan->fragment_hash));
+   VK_FROM_HANDLE(radv_pipeline, producer, pipeline->bc250_task_pipeline);
+   VK_FROM_HANDLE(radv_pipeline, setup, pipeline->bc250_setup_pipeline);
+   if (producer)
+      memcpy(plan->producer_hash, producer->shaders[MESA_SHADER_COMPUTE]->hash, sizeof(plan->producer_hash));
+   if (setup)
+      memcpy(plan->setup_hash, setup->shaders[MESA_SHADER_COMPUTE]->hash, sizeof(plan->setup_hash));
+}
+
 /* Restore private compute executables from cache references, never from an
  * application Task shader or native task rings. Publish handles only after
  * the complete plan has been validated and reconstructed. */
@@ -5465,16 +5512,22 @@ radv_bc250_restore_cached_plan(struct radv_device *device, struct radv_graphics_
       return VK_ERROR_FEATURE_NOT_PRESENT;
 
    if (!(plan->flags & RADV_BC250_PLAN_TASK)) {
-      if (producer || setup)
+      if (producer || setup || memcmp(plan->producer_hash, absent_hash, sizeof(plan->producer_hash)) ||
+          (!plan->direct_pieces && memcmp(plan->setup_hash, absent_hash, sizeof(plan->setup_hash))))
          return VK_ERROR_FEATURE_NOT_PRESENT;
       if (plan->direct_pieces) {
          VkResult result = radv_bc250_prepare_direct_split(device, pipeline);
          if (result != VK_SUCCESS)
             return result;
+         VK_FROM_HANDLE(radv_pipeline, rebuilt, pipeline->bc250_setup_pipeline);
+         if (!rebuilt || memcmp(plan->setup_hash, rebuilt->shaders[MESA_SHADER_COMPUTE]->hash, sizeof(plan->setup_hash)))
+            return VK_ERROR_FEATURE_NOT_PRESENT;
       }
    } else {
       if (!layout || !producer || !setup || producer->info.stage != MESA_SHADER_COMPUTE ||
-          setup->info.stage != MESA_SHADER_COMPUTE)
+          setup->info.stage != MESA_SHADER_COMPUTE ||
+          memcmp(plan->producer_hash, producer->hash, sizeof(plan->producer_hash)) ||
+          memcmp(plan->setup_hash, setup->hash, sizeof(plan->setup_hash)))
          return VK_ERROR_FEATURE_NOT_PRESENT;
       VkPushConstantRange range = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
                                   .size = sizeof(struct bc250_constants)};
@@ -5770,7 +5823,7 @@ static void
 bc250_draw_task(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint32_t z,
                 uint64_t indirect_va, uint64_t count_va, uint32_t draw_id, uint64_t *shared_address)
 {
-   struct radv_graphics_pipeline *pipeline = cmd_buffer->state.graphics_pipeline;
+   struct radv_graphics_pipeline *pipeline = radv_bc250_mesh_pipeline(cmd_buffer);
    assert(pipeline && pipeline->bc250_task_pipeline);
    bc250_chain_begin(cmd_buffer, "hybrid_task", indirect_va, count_va, 1, 0);
    /* Native TASK may already have allocated an ACE gang for this command
@@ -6339,7 +6392,7 @@ radv_bc250_draw_split_indirect(struct radv_cmd_buffer *cmd_buffer, uint64_t inpu
       return;
    }
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
-   struct radv_graphics_pipeline *pipeline = cmd_buffer->state.graphics_pipeline;
+   struct radv_graphics_pipeline *pipeline = radv_bc250_mesh_pipeline(cmd_buffer);
    if (device->bc250_env.split_prep_free && pipeline->bc250_split_order_free &&
        bc250_split_order_free_now(cmd_buffer) && !radv_bc250_chain_enabled(device)) {
       bc250_draw_split_prep_free(cmd_buffer, pipeline, input, records, stride, count);
@@ -6413,7 +6466,7 @@ radv_bc250_draw_split(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y
    bc250_chain_begin(cmd_buffer, "direct_split_cpu_dimensions", 0, 0, 1, 16);
    if (!x || !y || !z)
       return;
-   struct radv_graphics_pipeline *pipeline = cmd_buffer->state.graphics_pipeline;
+   struct radv_graphics_pipeline *pipeline = radv_bc250_mesh_pipeline(cmd_buffer);
    unsigned offset;
    void *mapped;
    if (!radv_cmd_buffer_upload_alloc(cmd_buffer, MAX_PUSH_CONSTANTS_SIZE + 16, &offset, &mapped))

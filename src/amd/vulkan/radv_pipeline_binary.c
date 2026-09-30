@@ -187,8 +187,8 @@ radv_create_pipeline_binary_from_bc250_plan(struct radv_device *device,
    return VK_SUCCESS;
 }
 
-static bool
-radv_bc250_private_binary_valid(const void *data, size_t size)
+bool
+radv_bc250_shader_binary_valid(const void *data, size_t size, unsigned stage)
 {
    if (size < sizeof(struct radv_shader_binary_legacy))
       return false;
@@ -196,7 +196,7 @@ radv_bc250_private_binary_valid(const void *data, size_t size)
    memcpy(&legacy, data, sizeof(legacy));
    const uint64_t total = (uint64_t)sizeof(legacy) + legacy.code_size + legacy.ir_size +
                           legacy.disasm_size + legacy.stats_size + legacy.debug_info_size;
-   if (legacy.base.type != RADV_BINARY_TYPE_LEGACY || legacy.base.info.stage != MESA_SHADER_COMPUTE ||
+   if (legacy.base.type != RADV_BINARY_TYPE_LEGACY || legacy.base.info.stage != stage ||
        total != legacy.base.total_size || total > size || legacy.exec_size > legacy.code_size)
       return false;
    struct blob_reader debug;
@@ -238,7 +238,7 @@ radv_bc250_pipeline_binary_restore(struct radv_device *device, struct radv_graph
       shader_size[i] = size;
       blob_copy_bytes(&blob, hashes[i], sizeof(hashes[i]));
       shader_data[i] = blob_read_bytes(&blob, size);
-      if (blob.overrun || !radv_bc250_private_binary_valid(shader_data[i], size))
+      if (blob.overrun || !radv_bc250_shader_binary_valid(shader_data[i], size, MESA_SHADER_COMPUTE))
          return VK_ERROR_FEATURE_NOT_PRESENT;
    }
    if (blob.overrun || blob.current != blob.end)
