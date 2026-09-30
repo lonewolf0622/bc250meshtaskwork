@@ -3694,6 +3694,10 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
    else if (!compact_ix[1] || (compact_ix[2] != 2 && compact_ix[2] != 4) || !compact_ix[3] || compact_ix[3] > 256 ||
             compact_ix[0] + max_primitives * compact_ix[1] > shader->info.shared_size)
       compact_reason = "index staging";
+   else if (util_bitcount64(bary_ref_mask) == 1)
+      /* RADV_BC250_BARY_CORNER_ID exports export_index % 3 as the corner number: it needs private
+       * corners (slot 3p + c). The two-slot position reference is independent of vertex sharing. */
+      compact_reason = "one-slot barycentric corner number";
    bool compact = !compact_reason;
    if (compact)
       cross_invocation_access |= per_vertex_outputs;
