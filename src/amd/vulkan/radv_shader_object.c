@@ -20,6 +20,37 @@ struct radv_shader_object_metadata {
    uint32_t dynamic_offset_count;
 };
 
+#define RADV_BC250_OBJECT_MAGIC UINT64_C(0x354a424f30353242)
+
+static void
+radv_bc250_object_layout_hash(const VkShaderCreateInfoEXT *info, uint8_t hash[32])
+{
+   struct mesa_blake3 ctx;
+   _mesa_blake3_init(&ctx);
+   _mesa_blake3_update(&ctx, &info->setLayoutCount, sizeof(info->setLayoutCount));
+   const uint8_t absent[32] = {0};
+   for (unsigned i = 0; i < info->setLayoutCount; i++) {
+      VK_FROM_HANDLE(radv_descriptor_set_layout, layout, info->pSetLayouts[i]);
+      _mesa_blake3_update(&ctx, layout ? layout->hash : absent, sizeof(absent));
+   }
+   _mesa_blake3_update(&ctx, &info->pushConstantRangeCount, sizeof(info->pushConstantRangeCount));
+   for (unsigned i = 0; i < info->pushConstantRangeCount; i++) {
+      const VkPushConstantRange *range = &info->pPushConstantRanges[i];
+      _mesa_blake3_update(&ctx, &range->stageFlags, sizeof(range->stageFlags));
+      _mesa_blake3_update(&ctx, &range->offset, sizeof(range->offset));
+      _mesa_blake3_update(&ctx, &range->size, sizeof(range->size));
+   }
+   _mesa_blake3_final(&ctx, hash);
+}
+
+static void
+radv_bc250_shader_object_policy(struct radv_device *device, struct radv_shader_object *obj)
+{
+   obj->bc250_policy_valid = true;
+   memcpy(obj->bc250_route_key, &device->compiler_info.key, sizeof(obj->bc250_route_key));
+   memcpy(obj->bc250_hardware_key, &device->compiler_info.hw, sizeof(obj->bc250_hardware_key));
+}
+
 static void
 radv_shader_object_destroy_variant(struct radv_device *device, VkShaderCodeTypeEXT code_type,
                                    struct radv_shader *shader, struct radv_shader_binary *binary)
@@ -195,6 +226,7 @@ radv_shader_object_init_graphics(struct radv_shader_object *shader_obj, struct r
 
    struct radv_shader *shader = NULL;
    struct radv_shader_binary *binary = NULL;
+   VkResult result;
 
    if (!pCreateInfo->nextStage) {
       struct radv_shader *shaders[MESA_VULKAN_SHADER_STAGES] = {NULL};
@@ -202,8 +234,10 @@ radv_shader_object_init_graphics(struct radv_shader_object *shader_obj, struct r
       struct radv_shader_debug_info debug[MESA_VULKAN_SHADER_STAGES] = {0};
       struct radv_shader_debug_info gs_copy_debug = {0};
 
-      radv_graphics_shaders_compile(&device->compiler_info, NULL, stages, &gfx_state, false, NULL, false, debug,
-                                    binaries, &gs_copy_debug, &shader_obj->gs.copy_binary);
+      result = radv_graphics_shaders_compile(&device->compiler_info, NULL, stages, &gfx_state, false, NULL, false,
+                                             debug, binaries, &gs_copy_debug, &shader_obj->gs.copy_binary);
+      if (result != VK_SUCCESS)
+         goto fail;
       radv_graphics_shaders_create(device, NULL, true, shaders, binaries, debug, &shader_obj->gs.copy_shader,
                                    shader_obj->gs.copy_binary, &gs_copy_debug);
 
@@ -234,8 +268,10 @@ radv_shader_object_init_graphics(struct radv_shader_object *shader_obj, struct r
          radv_shader_stage_init(pCreateInfo, &stages[stage]);
          stages[stage].next_stage = next_stage;
 
-         radv_graphics_shaders_compile(&device->compiler_info, NULL, stages, &gfx_state, false, NULL, false, debug,
-                                       binaries, &gs_copy_debug, &shader_obj->gs.copy_binary);
+         result = radv_graphics_shaders_compile(&device->compiler_info, NULL, stages, &gfx_state, false, NULL, false,
+                                                debug, binaries, &gs_copy_debug, &shader_obj->gs.copy_binary);
+         if (result != VK_SUCCESS)
+            goto fail;
          radv_graphics_shaders_create(device, NULL, true, shaders, binaries, debug, &shader_obj->gs.copy_shader,
                                       shader_obj->gs.copy_binary, &gs_copy_debug);
 
@@ -272,6 +308,12 @@ radv_shader_object_init_graphics(struct radv_shader_object *shader_obj, struct r
    }
 
    return VK_SUCCESS;
+
+fail:
+   for (unsigned i = 0; i < MESA_VULKAN_SHADER_STAGES; i++)
+      ralloc_free(stages[i].nir);
+   ralloc_free(stages[MESA_SHADER_GEOMETRY].gs_copy_shader);
+   return result;
 }
 
 static VkResult
@@ -300,10 +342,15 @@ radv_shader_object_init_binary(struct radv_device *device, struct blob_reader *b
 {
    const char *binary_blake3 = blob_read_bytes(blob, BLAKE3_KEY_LEN);
    const uint32_t binary_size = blob_read_uint32(blob);
+   if (blob->overrun || binary_size < sizeof(struct radv_shader_binary) ||
+       binary_size > (size_t)(blob->end - blob->current))
+      return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
    const struct radv_shader_binary *binary = blob_read_bytes(blob, binary_size);
    unsigned char blake3[BLAKE3_KEY_LEN];
 
-   _mesa_blake3_compute(binary, binary->total_size, blake3);
+   if (binary->total_size != binary_size)
+      return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+   _mesa_blake3_compute(binary, binary_size, blake3);
    if (memcmp(blake3, binary_blake3, BLAKE3_KEY_LEN))
       return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
 
@@ -322,6 +369,9 @@ radv_shader_object_init(struct radv_shader_object *shader_obj, struct radv_devic
 
    shader_obj->stage = vk_to_mesa_shader_stage(pCreateInfo->stage);
    shader_obj->code_type = pCreateInfo->codeType;
+   if (device->bc250_env.shader_object_plan && pCreateInfo->codeType == VK_SHADER_CODE_TYPE_SPIRV_EXT &&
+       (shader_obj->stage == MESA_SHADER_MESH || shader_obj->stage == MESA_SHADER_TASK))
+      return VK_ERROR_FEATURE_NOT_PRESENT;
 
    if (pCreateInfo->codeType == VK_SHADER_CODE_TYPE_BINARY_EXT) {
       if (pCreateInfo->codeSize < VK_UUID_SIZE + sizeof(uint32_t)) {
@@ -338,6 +388,8 @@ radv_shader_object_init(struct radv_shader_object *shader_obj, struct radv_devic
 
       const struct radv_shader_object_metadata *md =
          (struct radv_shader_object_metadata *)blob_read_bytes(&blob, sizeof(struct radv_shader_object_metadata));
+      if (blob.overrun)
+         return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
 
       shader_obj->dynamic_offset_count = md->dynamic_offset_count;
 
@@ -382,6 +434,48 @@ radv_shader_object_init(struct radv_shader_object *shader_obj, struct radv_devic
                return result;
          }
       }
+      if (blob.overrun)
+         return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+      if (device->bc250_env.shader_object_plan) {
+         if (blob_read_uint64(&blob) != RADV_BC250_OBJECT_MAGIC ||
+             blob_read_uint32(&blob) != shader_obj->stage || blob_read_uint32(&blob))
+            return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+         blob_copy_bytes(&blob, shader_obj->bc250_route_key, sizeof(shader_obj->bc250_route_key));
+         blob_copy_bytes(&blob, shader_obj->bc250_hardware_key, sizeof(shader_obj->bc250_hardware_key));
+         blob_copy_bytes(&blob, shader_obj->bc250_layout_hash, sizeof(shader_obj->bc250_layout_hash));
+         blob_copy_bytes(&blob, &shader_obj->bc250_plan, sizeof(shader_obj->bc250_plan));
+         if (blob.overrun)
+            return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+         uint8_t hash[32];
+         radv_bc250_object_layout_hash(pCreateInfo, hash);
+         if (memcmp(hash, shader_obj->bc250_layout_hash, sizeof(hash)))
+            return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+         _mesa_blake3_compute(blob.data, blob.current - blob.data, hash);
+         const uint8_t *stored_hash = blob_read_bytes(&blob, sizeof(hash));
+         if (blob.overrun || blob.current != blob.end || memcmp(hash, stored_hash, sizeof(hash)) ||
+             memcmp(shader_obj->bc250_route_key, &device->compiler_info.key, sizeof(shader_obj->bc250_route_key)) ||
+             memcmp(shader_obj->bc250_hardware_key, &device->compiler_info.hw, sizeof(shader_obj->bc250_hardware_key)))
+            return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+         if (shader_obj->bc250_plan.version) {
+            const struct radv_bc250_pipeline_plan *plan = &shader_obj->bc250_plan;
+            const uint8_t *executable_hash = shader_obj->stage == MESA_SHADER_MESH ? plan->mesh_hash : plan->fragment_hash;
+            if (!radv_bc250_pipeline_plan_valid(plan) || !shader_obj->shader ||
+                (shader_obj->stage != MESA_SHADER_MESH && shader_obj->stage != MESA_SHADER_FRAGMENT) ||
+                (plan->flags & RADV_BC250_PLAN_TASK) || plan->direct_pieces || plan->split_pieces ||
+                memcmp(executable_hash, shader_obj->shader->hash, 32) ||
+                memcmp(plan->route_key, shader_obj->bc250_route_key, sizeof(plan->route_key)) ||
+                memcmp(plan->hardware_key, shader_obj->bc250_hardware_key, sizeof(plan->hardware_key)))
+               return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+         } else if (shader_obj->stage == MESA_SHADER_MESH || shader_obj->stage == MESA_SHADER_TASK) {
+            return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+         }
+         shader_obj->bc250_policy_valid = true;
+      } else if (blob.current != blob.end) {
+         /* A portable object must not silently lose its ownership checks when
+          * imported with the experimental switch disabled. */
+         if (blob_read_uint64(&blob) == RADV_BC250_OBJECT_MAGIC)
+            return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+      }
    } else {
       struct radv_shader_layout layout = {0};
 
@@ -399,6 +493,10 @@ radv_shader_object_init(struct radv_shader_object *shader_obj, struct radv_devic
 
       if (result != VK_SUCCESS)
          return result;
+      if (device->bc250_env.shader_object_plan) {
+         radv_bc250_shader_object_policy(device, shader_obj);
+         radv_bc250_object_layout_hash(pCreateInfo, shader_obj->bc250_layout_hash);
+      }
    }
 
    return VK_SUCCESS;
@@ -466,6 +564,16 @@ radv_shader_object_create_linked(VkDevice _device, uint32_t createInfoCount, con
       if (radv_device_physical(device)->bc250_native_mesh && s == MESA_SHADER_TASK)
          return VK_ERROR_FEATURE_NOT_PRESENT;
       radv_shader_stage_init(pCreateInfo, &stages[s]);
+   }
+
+   if (device->bc250_env.shader_object_plan && stages[MESA_SHADER_MESH].stage == MESA_SHADER_MESH) {
+      /* The first object proof is restricted to this state at every draw.
+       * Keeping unknown provoking/polygon state would prevent the existing
+       * owned-corner route from proving its output capacity. */
+      gfx_state.dynamic_provoking_vtx_mode = false;
+      gfx_state.bc250_ps_dynamic_provoking = false;
+      gfx_state.rs.polygon_mode_unknown = false;
+      gfx_state.rs.polygon_mode = VK_POLYGON_MODE_FILL;
    }
 
    /* Determine next stage. */
@@ -542,6 +650,39 @@ radv_shader_object_create_linked(VkDevice _device, uint32_t createInfoCount, con
    radv_graphics_shaders_create(device, NULL, true, shaders, binaries, debug, &gs_copy_shader, gs_copy_binary,
                                 &gs_copy_debug);
 
+   struct radv_bc250_pipeline_plan bc250_plan = {0};
+   if (device->bc250_env.shader_object_plan && stages[MESA_SHADER_MESH].stage != MESA_SHADER_NONE) {
+      struct radv_shader_stage *ms = &stages[MESA_SHADER_MESH];
+      if (!shaders[MESA_SHADER_MESH] || !shaders[MESA_SHADER_FRAGMENT] ||
+          !shaders[MESA_SHADER_MESH]->info.ms.bc250_safe_direct || ms->key.has_task_shader ||
+          ms->bc250_split_pieces || ms->bc250_task_replay || ms->bc250_ordered_export) {
+         for (unsigned s = 0; s < MESA_VULKAN_SHADER_STAGES; s++) {
+            if (shaders[s])
+               radv_shader_unref(device, shaders[s]);
+            free(binaries[s]);
+            ralloc_free(stages[s].nir);
+         }
+         if (gs_copy_shader)
+            radv_shader_unref(device, gs_copy_shader);
+         free(gs_copy_binary);
+         ralloc_free(stages[MESA_SHADER_GEOMETRY].gs_copy_shader);
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+      }
+      bc250_plan = (struct radv_bc250_pipeline_plan) {
+         .version = RADV_BC250_PIPELINE_PLAN_VERSION,
+         .flags = ms->bc250_safe_owned ? RADV_BC250_PLAN_CORNERS : 0,
+         .bary_ref_mask = ms->bc250_bary_ref_mask,
+         .per_primitive_locations = ms->bc250_pp_locations,
+         .bary_slots = ms->bc250_bary_ref_mask ? (ms->bc250_bary_raw_slot + 1) |
+            ((ms->bc250_bary_flat_slot + 1) << 8) : 0,
+      };
+      memcpy(bc250_plan.route_key, &device->compiler_info.key, sizeof(bc250_plan.route_key));
+      memcpy(bc250_plan.hardware_key, &device->compiler_info.hw, sizeof(bc250_plan.hardware_key));
+      memcpy(bc250_plan.mesh_hash, shaders[MESA_SHADER_MESH]->hash, sizeof(bc250_plan.mesh_hash));
+      memcpy(bc250_plan.fragment_hash, shaders[MESA_SHADER_FRAGMENT]->hash, sizeof(bc250_plan.fragment_hash));
+      _mesa_blake3_compute(&gfx_state, sizeof(gfx_state), bc250_plan.state_hash);
+   }
+
    for (unsigned i = 0; i < createInfoCount; i++) {
       const VkShaderCreateInfoEXT *pCreateInfo = &pCreateInfos[i];
       mesa_shader_stage s = vk_to_mesa_shader_stage(pCreateInfo->stage);
@@ -556,6 +697,12 @@ radv_shader_object_create_linked(VkDevice _device, uint32_t createInfoCount, con
       shader_obj->stage = s;
       shader_obj->code_type = pCreateInfo->codeType;
       shader_obj->dynamic_offset_count = stages[s].layout.dynamic_offset_count;
+      if (device->bc250_env.shader_object_plan) {
+         radv_bc250_shader_object_policy(device, shader_obj);
+         radv_bc250_object_layout_hash(pCreateInfo, shader_obj->bc250_layout_hash);
+         if (s == MESA_SHADER_MESH || s == MESA_SHADER_FRAGMENT)
+            shader_obj->bc250_plan = bc250_plan;
+      }
 
       if (s == MESA_SHADER_VERTEX) {
          if (stages[s].next_stage == MESA_SHADER_TESS_CTRL) {
@@ -726,6 +873,11 @@ radv_get_shader_object_size(const struct radv_shader_object *shader_obj)
       size += radv_get_shader_binary_size(shader_obj->gs.copy_binary);
    }
 
+   if (shader_obj->bc250_policy_valid)
+      size = align(size, 8) + 16 + sizeof(shader_obj->bc250_route_key) +
+         sizeof(shader_obj->bc250_hardware_key) + sizeof(shader_obj->bc250_layout_hash) +
+         sizeof(shader_obj->bc250_plan) + 32;
+
    return size;
 }
 
@@ -789,7 +941,22 @@ radv_GetShaderBinaryDataEXT(VkDevice _device, VkShaderEXT shader, size_t *pDataS
       radv_write_shader_binary(&blob, shader_obj->gs.copy_binary);
    }
 
+   if (shader_obj->bc250_policy_valid) {
+      blob_write_uint64(&blob, RADV_BC250_OBJECT_MAGIC);
+      blob_write_uint32(&blob, shader_obj->stage);
+      blob_write_uint32(&blob, 0);
+      blob_write_bytes(&blob, shader_obj->bc250_route_key, sizeof(shader_obj->bc250_route_key));
+      blob_write_bytes(&blob, shader_obj->bc250_hardware_key, sizeof(shader_obj->bc250_hardware_key));
+      blob_write_bytes(&blob, shader_obj->bc250_layout_hash, sizeof(shader_obj->bc250_layout_hash));
+      blob_write_bytes(&blob, &shader_obj->bc250_plan, sizeof(shader_obj->bc250_plan));
+      uint8_t hash[32];
+      _mesa_blake3_compute(blob.data, blob.size, hash);
+      blob_write_bytes(&blob, hash, sizeof(hash));
+   }
+
    assert(!blob.out_of_memory);
+   if (shader_obj->bc250_policy_valid)
+      *pDataSize = blob.size;
 
    return VK_SUCCESS;
 }

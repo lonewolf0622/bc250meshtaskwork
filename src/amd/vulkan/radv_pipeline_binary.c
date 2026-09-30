@@ -429,9 +429,17 @@ radv_create_pipeline_binary_from_pipeline(struct radv_device *device, const VkAl
          if (result != VK_SUCCESS)
             return result;
       }
-      if (device->bc250_env.pipeline_plan && pipeline->type == RADV_PIPELINE_GRAPHICS &&
-          pipeline->shaders[MESA_SHADER_MESH]) {
-         struct radv_graphics_pipeline *graphics = radv_pipeline_to_graphics(pipeline);
+      const bool complete_lib = pipeline->type == RADV_PIPELINE_GRAPHICS_LIB &&
+         device->bc250_env.gpl_binary_link &&
+         radv_pipeline_to_graphics_lib(pipeline)->lib_flags ==
+            (VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT |
+             VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT |
+             VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT |
+             VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT);
+      if (device->bc250_env.pipeline_plan &&
+          (pipeline->type == RADV_PIPELINE_GRAPHICS || complete_lib) && pipeline->shaders[MESA_SHADER_MESH]) {
+         struct radv_graphics_pipeline *graphics = complete_lib ?
+            &radv_pipeline_to_graphics_lib(pipeline)->base : radv_pipeline_to_graphics(pipeline);
          VK_FROM_HANDLE(radv_pipeline, producer, graphics->bc250_task_pipeline);
          VK_FROM_HANDLE(radv_pipeline, setup, graphics->bc250_setup_pipeline);
          result = radv_create_pipeline_binary_from_bc250_plan(device, pAllocator, &graphics->bc250_plan,

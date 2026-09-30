@@ -30,6 +30,8 @@ radv_bc250_device_env_init(struct radv_device *device, const struct radv_physica
    env->pipeline_plan = pdev->bc250_native_mesh && !pdev->bc250_native_task &&
       pdev->info.family == CHIP_GFX1013 && debug_get_bool_option("RADV_BC250_PIPELINE_PLAN", false);
    env->gpl_source_link = env->pipeline_plan && debug_get_bool_option("RADV_BC250_GPL_SOURCE_LINK", false);
+   env->gpl_binary_link = env->pipeline_plan && debug_get_bool_option("RADV_BC250_GPL_BINARY_LINK", false);
+   env->shader_object_plan = env->pipeline_plan && debug_get_bool_option("RADV_BC250_SHADER_OBJECT_PLAN", false);
    env->chain_trace = pdev->info.family == CHIP_GFX1013 && debug_get_bool_option("BC250_CHAIN_TRACE", false);
    env->chain_shader_only = debug_get_bool_option("BC250_CHAIN_SHADER_ONLY", false);
    env->chain_arguments_only = debug_get_bool_option("BC250_CHAIN_ARGUMENTS_ONLY", false);

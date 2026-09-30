@@ -14137,6 +14137,30 @@ radv_before_taskmesh_draw(struct radv_cmd_buffer *cmd_buffer, const struct radv_
    if (unlikely(!info->count))
       return false;
 
+   if (device->bc250_env.shader_object_plan && !cmd_buffer->state.graphics_pipeline) {
+      const struct radv_shader_object *ms = cmd_buffer->state.shader_objs[MESA_SHADER_MESH];
+      const struct radv_shader_object *fs = cmd_buffer->state.shader_objs[MESA_SHADER_FRAGMENT];
+      const struct radv_dynamic_state *dynamic = &cmd_buffer->state.dynamic;
+      const struct radv_bc250_pipeline_plan *plan = ms ? &ms->bc250_plan : NULL;
+      if (!ms || !fs || !ms->bc250_policy_valid || !fs->bc250_policy_valid ||
+          !ms->shader || !fs->shader || !radv_bc250_pipeline_plan_valid(plan) ||
+          memcmp(plan, &fs->bc250_plan, sizeof(*plan)) ||
+          memcmp(plan->mesh_hash, ms->shader->hash, sizeof(plan->mesh_hash)) ||
+          memcmp(plan->fragment_hash, fs->shader->hash, sizeof(plan->fragment_hash)) ||
+          memcmp(plan->route_key, &device->compiler_info.key, sizeof(plan->route_key)) ||
+          memcmp(plan->hardware_key, &device->compiler_info.hw, sizeof(plan->hardware_key)) ||
+          cmd_buffer->state.shader_objs[MESA_SHADER_TASK] ||
+          cmd_buffer->state.render.view_mask || cmd_buffer->state.render.vrs_att.iview ||
+          device->force_vrs_enabled || dynamic->vk.rs.polygon_mode != V_028814_X_DRAW_TRIANGLES ||
+          dynamic->vk.rs.provoking_vertex != VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT ||
+          dynamic->vk.fsr.fragment_size.width != 1 || dynamic->vk.fsr.fragment_size.height != 1 ||
+          dynamic->vk.fsr.combiner_ops[0] != VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR ||
+          dynamic->vk.fsr.combiner_ops[1] != VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR) {
+         vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return false;
+      }
+   }
+
    if (cmd_buffer->state.dirty & RADV_CMD_DIRTY_GRAPHICS_SHADERS) {
       radv_bind_graphics_shaders(cmd_buffer);
    }
@@ -17399,6 +17423,9 @@ radv_CmdBindShadersEXT(VkCommandBuffer commandBuffer, uint32_t stageCount, const
    for (uint32_t i = 0; i < stageCount; i++) {
       const mesa_shader_stage stage = vk_to_mesa_shader_stage(pStages[i]);
 
+      if (radv_cmd_buffer_device(cmd_buffer)->bc250_env.shader_object_plan)
+         bound_stages |= pStages[i];
+
       if (!pShaders) {
          cmd_buffer->state.shader_objs[stage] = NULL;
          continue;
@@ -17425,7 +17452,9 @@ radv_CmdBindShadersEXT(VkCommandBuffer commandBuffer, uint32_t stageCount, const
       /* Graphics shaders are handled at draw time because of shader variants. */
    }
 
-   cmd_buffer->state.dirty |= RADV_CMD_DIRTY_GRAPHICS_SHADERS;
+   if (!radv_cmd_buffer_device(cmd_buffer)->bc250_env.shader_object_plan ||
+       (bound_stages & RADV_GRAPHICS_STAGE_BITS))
+      cmd_buffer->state.dirty |= RADV_CMD_DIRTY_GRAPHICS_SHADERS;
 }
 
 VKAPI_ATTR void VKAPI_CALL

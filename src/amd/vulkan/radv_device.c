@@ -916,7 +916,7 @@ radv_device_init_cache_key(struct radv_device *device)
    if (bc250x)
       _mesa_blake3_update(&ctx, &bc250x, sizeof(bc250x));
    if (device->bc250_env.pipeline_plan) {
-      static const char tag[] = "bc250-pipeline-plan-v4";
+      static const char tag[] = "bc250-pipeline-plan-v5";
       _mesa_blake3_update(&ctx, tag, sizeof(tag));
    }
    _mesa_blake3_final(&ctx, device->cache_hash);
@@ -1225,7 +1225,7 @@ radv_device_init_compiler_info(struct radv_device *device)
     * That means the driver should compile shaders for the "worst" case of all features being
     * enabled, regardless of what features are actually enabled on the logical device.
     */
-   if (device->vk.enabled_features.shaderObject) {
+   if (device->vk.enabled_features.shaderObject || device->bc250_env.shader_object_plan) {
       image_2d_view_of_3d = pdev->info.gfx_level == GFX9;
       primitives_generated_query = true;
    }
@@ -1989,13 +1989,14 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
    radv_device_init_cache_key(device);
 
    if (device->vk.enabled_features.vertexInputDynamicState || device->vk.enabled_features.graphicsPipelineLibrary ||
-       device->vk.enabled_features.shaderObject) {
+       device->vk.enabled_features.shaderObject || device->bc250_env.shader_object_plan) {
       result = radv_device_init_vs_prologs(device);
       if (result != VK_SUCCESS)
          goto fail;
    }
 
    if (device->vk.enabled_features.graphicsPipelineLibrary || device->vk.enabled_features.shaderObject ||
+       device->bc250_env.shader_object_plan ||
        device->vk.enabled_features.extendedDynamicState3ColorBlendEnable ||
        device->vk.enabled_features.extendedDynamicState3ColorWriteMask ||
        device->vk.enabled_features.extendedDynamicState3AlphaToCoverageEnable ||

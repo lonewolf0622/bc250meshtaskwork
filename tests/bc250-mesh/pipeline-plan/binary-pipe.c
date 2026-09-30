@@ -117,6 +117,14 @@ binary_roundtrip(VkDevice device, VkPipelineCache cache, uint32_t count,
                                 .pNext = infos->pNext, .binaryCount = n, .pPipelineBinaries = binaries};
    info = *infos;
    info.pNext = &bi;
+   VkPipelineRasterizationStateCreateInfo changed_raster;
+   if (getenv("PLAN_BINARY_BAD_STATE")) {
+      if (!infos->pRasterizationState)
+         return VK_ERROR_UNKNOWN;
+      changed_raster = *infos->pRasterizationState;
+      changed_raster.polygonMode = VK_POLYGON_MODE_LINE;
+      info.pRasterizationState = &changed_raster;
+   }
    VkPipelineShaderStageCreateInfo stages[3];
    if (info.stageCount > 3)
       return VK_ERROR_FEATURE_NOT_PRESENT;

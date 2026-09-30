@@ -147,6 +147,8 @@ struct radv_shader_abort_data {
  * environment does not change after device creation. */
 struct radv_bc250_device_env {
    bool gpl_source_link; /* RADV_BC250_GPL_SOURCE_LINK: conservative final-source linking. */
+   bool gpl_binary_link; /* RADV_BC250_GPL_BINARY_LINK: complete executable libraries. */
+   bool shader_object_plan; /* RADV_BC250_SHADER_OBJECT_PLAN: linked executable ownership. */
    bool pipeline_plan; /* RADV_BC250_PIPELINE_PLAN: opt-in portable cache plan. */
    bool chain_trace;          /* BC250_CHAIN_TRACE on GFX1013 (radv_bc250_chain_enabled) */
    bool chain_shader_only;    /* BC250_CHAIN_SHADER_ONLY */

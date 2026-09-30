@@ -51,10 +51,13 @@ def run(args, name):
 run(['cc', '-O1', '-Wall', '-o', 'cache-pipe', src / 'tests/bc250-mesh/pipeline-plan/pipe.c', '-lvulkan'], 'pipe-build')
 run(['cc', '-O1', '-Wall', '-o', 'binary-pipe', src / 'tests/bc250-mesh/pipeline-plan/binary-pipe.c', '-ldl'], 'binary-build')
 run(['cc', '-O1', '-Wall', '-o', 'gpl-pipe', src / 'tests/bc250-mesh/pipeline-plan/gpl-pipe.c', '-ldl'], 'gpl-build')
+run(['cc', '-O1', '-Wall', '-o', 'object-pipe', src / 'tests/bc250-mesh/pipeline-plan/object-pipe.c', '-ldl'], 'object-build')
 env['TEST_ICD_LIBRARY'] = json.loads(Path(os.environ['ICD']).read_text())['ICD']['library_path']
 run(['cc', '-Wall', '-Werror', '-I' + str(src / 'src/amd/vulkan'), '-o', 'validate-plan',
      src / 'tests/bc250-mesh/pipeline-plan/validate.c'], 'validate-build')
 run([out / 'validate-plan'], 'validate')
+run(['glslangValidator', '--target-env', 'vulkan1.3', '-S', 'frag', '-o', out / 'object-foreign.spv',
+     src / 'tests/bc250-mesh/pipeline-plan/object-foreign.frag'], 'object-foreign-build')
 run(['glslangValidator', '--target-env', 'vulkan1.3', '-S', 'mesh', '-DVERTS=3', '-DPRIMS=1', '-DLANES=32',
      '-o', out / 'swap.mesh.spv', src / 'tests/bc250-mesh/compact/cmp.mesh'], 'swap-mesh')
 env['PLAN_SWAP_MESH'] = str(out / 'swap.mesh.spv')
@@ -78,6 +81,14 @@ for name, defs in [('plain', []), ('pieces', ['-DVERTS=128', '-DPRIMS=128', '-DL
                   case / 'task.spv' if name.startswith('task') else '-', '1'], name + '-binary')
     assert 'BINARY_FOREIGN_PLAN_REFUSED' in binary and 'BINARY_ROUNDTRIP count=3 result=0' in binary and 'SUBMIT_OK' in binary, (name, binary[-4000:])
     swap_mesh = env.pop('PLAN_SWAP_MESH')
+    env.update(PLAN_BINARY_BAD_STATE='1', PLAN_BINARY_EXPECT_REFUSAL='1')
+    bad_state = subprocess.run([str(out / 'binary-pipe'), str(case / 'mesh.spv'), str(case / 'frag.spv'),
+                               str(case / 'task.spv') if name.startswith('task') else '-', '1'],
+                              env=env, capture_output=True, text=True)
+    (out / (name + '-binary-bad-state.log')).write_text(bad_state.stdout + bad_state.stderr)
+    assert bad_state.returncode == 1 and 'BINARY_POLICY_PLAN_REFUSED' in bad_state.stdout and 'SUBMIT_OK' not in bad_state.stdout
+    env.pop('PLAN_BINARY_BAD_STATE')
+    env.pop('PLAN_BINARY_EXPECT_REFUSAL')
     env['RADV_BC250_GPL_SOURCE_LINK'] = '1'
     for mode in ('fast', 'lto', 'nested'):
         env['GPL_MODE'] = mode
@@ -96,10 +107,45 @@ for name, defs in [('plain', []), ('pieces', ['-DVERTS=128', '-DPRIMS=128', '-DL
         assert 'BINARY_ROUNDTRIP count=3 result=0' in imported and 'SUBMIT_OK' in imported
         assert shader_records(text) == shader_records(imported), (name, mode, 'binary shader identity')
 
+    env['RADV_BC250_GPL_BINARY_LINK'] = '1'
+    env['GPL_MODE'] = 'compiled'
+    linked = run([out / 'gpl-pipe', case / 'mesh.spv', case / 'frag.spv',
+                  case / 'task.spv' if name.startswith('task') else '-', '1'], name + '-gpl-compiled')
+    env.pop('RADV_BC250_GPL_BINARY_LINK')
+    assert 'GPL_BINARY_FAST_LINK result=0' in linked and 'GPL_BINARY_LTO_REFUSED' in linked and 'SUBMIT_OK' in linked
+    assert shader_records(text) == shader_records(linked), (name, 'compiled library shader identity')
 
     env['PLAN_SWAP_MESH'] = swap_mesh
     env.pop('RADV_BC250_GPL_SOURCE_LINK')
     env.pop('GPL_MODE')
+    if name in ('plain', 'bary'):
+        env['RADV_BC250_SHADER_OBJECT_PLAN'] = '1'
+        objects = run([out / 'object-pipe', case / 'mesh.spv', case / 'frag.spv', '-', '1'], name + '-objects')
+        assert 'OBJECT_LINK result=0' in objects and 'OBJECT_BINARY_ROUNDTRIP' in objects
+        assert 'OBJECT_CORRUPT_TRUNCATED_LAYOUT_REFUSED' in objects and 'OBJECTS_BOUND' in objects and 'SUBMIT_OK' in objects
+        assert 'raw_unproven' not in objects
+        env['OBJECT_BAD_STATE'] = '1'
+        refused = subprocess.run([str(out / 'object-pipe'), str(case / 'mesh.spv'), str(case / 'frag.spv'), '-', '1'],
+                                 env=env, capture_output=True, text=True)
+        (out / (name + '-objects-bad-state.log')).write_text(refused.stdout + refused.stderr)
+        assert refused.returncode == 1 and 'vkEndCommandBuffer(cb) = -8' in refused.stdout and 'SUBMIT_OK' not in refused.stdout
+        env.pop('OBJECT_BAD_STATE')
+        env['OBJECT_FOREIGN_FS'] = str(out / 'object-foreign.spv')
+        refused = subprocess.run([str(out / 'object-pipe'), str(case / 'mesh.spv'), str(case / 'frag.spv'), '-', '1'],
+                                 env=env, capture_output=True, text=True)
+        (out / (name + '-objects-foreign.log')).write_text(refused.stdout + refused.stderr)
+        assert refused.returncode == 1 and 'OBJECT_FOREIGN_PAIR_BOUND' in refused.stdout and 'vkEndCommandBuffer(cb) = -8' in refused.stdout
+        env.pop('OBJECT_FOREIGN_FS')
+        env.pop('RADV_BC250_SHADER_OBJECT_PLAN')
+    else:
+        env['RADV_BC250_SHADER_OBJECT_PLAN'] = '1'
+        refused = subprocess.run([str(out / 'object-pipe'), str(case / 'mesh.spv'), str(case / 'frag.spv'),
+                                  str(case / 'task.spv') if name.startswith('task') else '-', '1'],
+                                 env=env, capture_output=True, text=True)
+        (out / (name + '-objects-refused.log')).write_text(refused.stdout + refused.stderr)
+        assert refused.returncode == 1 and 'SUBMIT_OK' not in refused.stdout
+        assert 'OBJECT_LINK result=-8' in refused.stdout or 'OBJECT_SHAPE_REFUSED' in refused.stdout
+        env.pop('RADV_BC250_SHADER_OBJECT_PLAN')
     rows.append(dict(case=name, serialized_cache_hit=True, binary_roundtrip=True, submit_ok=True,
                      gpl_source_links=['fast_request', 'lto', 'nested']))
     print(name, 'PASS', flush=True)
@@ -129,3 +175,26 @@ for source, target in [('off', name) for name in policies if name != 'off'] + [(
     policy_rows.append(dict(source=source, target=target, refused=True))
 (out / 'policy-summary.json').write_text(json.dumps(policy_rows, indent=2) + '\n')
 print('hardware-policy cross-import refusals', len(policy_rows), 'PASS', flush=True)
+
+object_args = [str(out / 'object-pipe'), str(case / 'mesh.spv'), str(case / 'frag.spv'), '-', '1']
+object_env = dict(base_env, RADV_BC250_SHADER_OBJECT_PLAN='1')
+for name, flags in policies.items():
+    e = dict(object_env, **flags, OBJECT_BINARY_WRITE=str(out / ('object-policy-' + name + '.bin')))
+    result = subprocess.run(object_args, env=e, capture_output=True, text=True)
+    (out / ('object-policy-write-' + name + '.log')).write_text(result.stdout + result.stderr)
+    assert result.returncode == 0 and 'SUBMIT_OK' in result.stdout, (name, result.returncode, result.stderr[-2000:])
+object_rows = []
+for source, target in [('off', name) for name in policies if name != 'off'] + [(name, 'off') for name in policies if name != 'off']:
+    e = dict(object_env, **policies[target], OBJECT_BINARY_READ=str(out / ('object-policy-' + source + '.bin')),
+             OBJECT_EXPECT_REFUSAL='1')
+    result = subprocess.run(object_args, env=e, capture_output=True, text=True)
+    (out / ('object-policy-' + source + '-to-' + target + '.log')).write_text(result.stdout + result.stderr)
+    assert result.returncode == 1 and 'OBJECT_BINARY_POLICY_REFUSED' in result.stdout and 'SUBMIT_OK' not in result.stdout
+    object_rows.append(dict(source=source, target=target, refused=True))
+e = dict(object_env, RADV_BC250_SHADER_OBJECT_PLAN='0', **policies['off'],
+         OBJECT_BINARY_READ=str(out / 'object-policy-off.bin'), OBJECT_EXPECT_REFUSAL='1')
+result = subprocess.run(object_args, env=e, capture_output=True, text=True)
+(out / 'object-feature-off-refusal.log').write_text(result.stdout + result.stderr)
+assert result.returncode == 1 and 'OBJECT_BINARY_POLICY_REFUSED' in result.stdout and 'SUBMIT_OK' not in result.stdout
+(out / 'object-policy-summary.json').write_text(json.dumps(object_rows, indent=2) + '\n')
+print('object policy cross-import refusals', len(object_rows), 'PASS', flush=True)
