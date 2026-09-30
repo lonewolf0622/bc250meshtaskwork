@@ -6557,6 +6557,8 @@ radv_bc250_directmesh_env(void)
       {"RADV_BC250_MESH_PP_SHARE", "1"},
       /* Skip adaptive checks whose result is already known (gate LC1). */
       {"RADV_BC250_MESH_LEAN_CHECK", "1"},
+      /* GDDR6-class settings for this APU-reported GPU: wider NGG culling admission, 32B DCC blocks. */
+      {"RADV_BC250_NGGC_WIDE", "1"}, {"RADV_BC250_DCC_32B", "1"},
    };
    for (unsigned i = 0; i < ARRAY_SIZE(settings); i++)
       setenv(settings[i][0], settings[i][1], 0);
