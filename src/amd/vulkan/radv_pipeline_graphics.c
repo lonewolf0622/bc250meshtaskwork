@@ -2767,7 +2767,9 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
             owned_ms->bc250_expanded = true;
             owned_ms->bc250_private_tris = true;
          }
-         owned_ms->bc250_compact_owned = 1;
+         /* RADV_BC250_MESH_PP_SHARE needs the real provoking corner (0x5: dynamic, not shared). */
+         owned_ms->bc250_compact_owned = !compiler_info->bc250x.pp_share ? 1 :
+            gfx_state->dynamic_provoking_vtx_mode ? 0x5 : gfx_state->rs.provoking_vtx_last ? 0x4 : 0x1;
          if (getenv("BC250_TRACE_COMPILE"))
             fprintf(stderr, "BC250 MESH SAFE OWNED: logical_V=%u P=%u bound=%u task_transport=%u\n",
                     owned_ms->nir->info.mesh.max_vertices_out, owned_ms->nir->info.mesh.max_primitives_out,

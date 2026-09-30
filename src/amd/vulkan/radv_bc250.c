@@ -4683,7 +4683,10 @@ bc250_prepare_safe_pieces(struct radv_device *device, struct radv_graphics_pipel
    if (ordinary_piece)
       ms->bc250_safe_bary_tiny = ms->bc250_expanded = ms->bc250_private_tris = true;
    if (owned_corners) {
-      ms->bc250_compact_owned = 1;
+      /* RADV_BC250_MESH_PP_SHARE needs the real provoking corner (0x5: dynamic, not shared). */
+      ms->bc250_compact_owned = !device->compiler_info.bc250x.pp_share ? 1 :
+         gfx_state->key.gfx_state.dynamic_provoking_vtx_mode ? 0x5 :
+         gfx_state->key.gfx_state.rs.provoking_vtx_last ? 0x4 : 0x1;
       ms->bc250_pp_locations = payload;
       memcpy(ms->bc250_index_staging, staged, sizeof(staged));
    }

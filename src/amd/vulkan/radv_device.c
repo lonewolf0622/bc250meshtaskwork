@@ -1546,6 +1546,7 @@ radv_device_init_compiler_info(struct radv_device *device)
    const bool bc250_mesh = pdev->bc250_native_mesh && pdev->info.family == CHIP_GFX1013;
    info.bc250x.task_grid_fold = bc250_mesh && debug_get_bool_option("RADV_BC250_TASK_GRID_FOLD", false);
    info.bc250x.safe_pieces_ext = bc250_mesh && debug_get_bool_option("RADV_BC250_MESH_SAFE_PIECES_EXT", false);
+   info.bc250x.pp_share = bc250_mesh && debug_get_bool_option("RADV_BC250_MESH_PP_SHARE", false);
 
    device->compiler_info = info;
 }

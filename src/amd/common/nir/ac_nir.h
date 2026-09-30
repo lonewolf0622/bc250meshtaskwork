@@ -298,6 +298,10 @@ typedef struct {
     * cases, a workgroup whose survivors keep backjump <= 31 once the vertices they do not reference
     * are deleted exports only the referenced vertices, renumbered in increasing order. */
    bool bc250_safe_compact;
+   /* RADV_BC250_MESH_PP_SHARE (owned private corners): share vertices inside 10-triangle windows by the
+    * application's logical index (bc250_compact_index_staging); the provoking corner
+    * (bc250_compact_owned_corners 0x1 or 0x4) always gets its own copy. */
+   bool bc250_pp_share;
    bool bc250_safe_bary;
    bool bc250_safe_stats;
    bool bc250_safe_parallel;

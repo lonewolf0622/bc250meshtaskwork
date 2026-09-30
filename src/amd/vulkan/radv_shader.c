@@ -1119,6 +1119,9 @@ radv_lower_ngg(const struct radv_compiler_info *compiler_info, struct radv_shade
       options.bc250_safe_adaptive = options.bc250_safe_corners && compiler_info->key.bc250_mesh_safe_adaptive &&
          !ngg_stage->bc250_safe_owned;
       options.bc250_safe_compact = options.bc250_safe_adaptive && compiler_info->hw.bc250_mesh_safe_compact;
+      options.bc250_pp_share = options.bc250_safe_corners && ngg_stage->bc250_safe_owned &&
+         compiler_info->bc250x.pp_share &&
+         (ngg_stage->bc250_compact_owned == 0x1 || ngg_stage->bc250_compact_owned == 0x4);
       options.bc250_safe_fast |= options.bc250_safe_corners;
       options.bc250_safe_local = options.bc250_safe_fast &&
          ((compiler_info->key.bc250_mesh_direct_read & RADV_BC250_MESH_SAFE_LOCAL_KEY) || options.bc250_safe_corners);
@@ -1169,6 +1172,7 @@ radv_lower_ngg(const struct radv_compiler_info *compiler_info, struct radv_shade
          options.bc250_safe_corners = false;
          options.bc250_safe_adaptive = false;
          options.bc250_safe_compact = false;
+         options.bc250_pp_share = false;
          options.bc250_safe_parallel = false;
          if (getenv("BC250_TRACE_COMPILE"))
             fprintf(stderr, "BC250 MESH SAFE BARY TINY: proven private connectivity, no remap\n");

@@ -753,7 +753,10 @@ struct radv_compiler_info {
        * split piece (Task pieces included), wave64 for subgroup-free wave32 Mesh shaders, and
        * CullPrimitive (consumed by the split) no longer blocks the shared-vertex piece check. */
       uint32_t safe_pieces_ext : 1;
-      uint32_t padding : 30;
+      /* RADV_BC250_MESH_PP_SHARE: the owned private-corner route shares vertices inside 10-triangle
+       * windows; each triangle's provoking corner keeps its own copy (it carries the per-primitive data). */
+      uint32_t pp_share : 1;
+      uint32_t padding : 29;
    } bc250x;
 
    /* Debug/tracing */

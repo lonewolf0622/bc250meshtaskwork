@@ -180,6 +180,8 @@ typedef struct
     * flag (published flag bit 1): referenced vertices renumbered in order, survivors from indices. */
    bool safe_compact;
    nir_def *fast_compact;
+   /* RADV_BC250_MESH_PP_SHARE: shared-vertex plan for the owned private-corner route. */
+   bool pp_share;
    nir_variable *fast_prim_arg;
    uint32_t safe_direct_map_addr;
    uint32_t safe_direct_latest_addr;
@@ -1055,6 +1057,13 @@ static nir_def *
 ms_prim_exp_arg_ch1(nir_builder *b, nir_def *invocation_index, nir_def *num_vtx, lower_ngg_ms_state *s)
 {
    if (s->safe_direct) {
+      if (s->pp_share) {
+         /* RADV_BC250_MESH_PP_SHARE: the planned slot triple of surviving triangle r. */
+         nir_def *planned = nir_u2u32(b, nir_load_shared(b, 3, 8, nir_imul_imm(b, invocation_index, 3),
+                                                        .base = s->safe_direct_indices_addr));
+         nir_def *slot[3] = {nir_channel(b, planned, 0), nir_channel(b, planned, 1), nir_channel(b, planned, 2)};
+         return ac_nir_pack_ngg_prim_exp_arg(b, 3, slot, NULL, s->ac->gfx_level);
+      }
       if (s->options->bc250_safe_corners) {
          nir_def *first = nir_imul_imm(b, invocation_index, 3);
          nir_def *slots[3] = {first, nir_iadd_imm(b, first, 1), nir_iadd_imm(b, first, 2)};
@@ -2312,6 +2321,79 @@ ms_safe_local_vertices(nir_builder *b, lower_ngg_ms_state *s, nir_def *idx,
                    nir_u2u32(b, nir_bit_count(b, live_mask)));
 }
 
+/* RADV_BC250_MESH_PP_SHARE, owned private corners. Key k = 3j + c is corner c of the j-th surviving triangle
+ * (lane j), x[c] its private expanded vertex and L[c] the application's logical vertex (index staging). Each
+ * key refers to the smallest key with the same valid logical vertex in its 10-triangle window, as
+ * ms_safe_local_vertices does; the provoking corner of every triangle (and every invalid index) refers to
+ * itself. A fresh key gets the next export slot, whose source is its own private vertex x: every copy of L
+ * carries the same per-vertex values, and a provoking copy carries its own triangle's per-primitive values,
+ * which flat interpolation reads only there. Every slot is referenced by the triangle that created it, and a
+ * reference stays inside the window (at most 30 keys back), so the triangle-wide backjump stays <= 31.
+ * Primitive and corner order are unchanged. Writes the slot map and the slot triples; returns (V', P'). */
+static nir_def *
+ms_pps_vertices(nir_builder *b, lower_ngg_ms_state *s, nir_def **L, nir_def **valid, nir_def **x, nir_def *live,
+                unsigned provoking)
+{
+   const unsigned table = s->options->bc250_compact_index_staging[3];
+   const unsigned bits = MAX2(util_logbase2_ceil(table), 1);
+   nir_def *lane = nir_load_subgroup_invocation(b);
+   nir_def *zero = nir_imm_int(b, 0);
+   nir_def *live_mask = nir_ballot(b, 1, 64, live);
+   nir_def *start = nir_imul_imm(b, nir_udiv_imm(b, lane, 10), 10);
+   nir_def *interval = nir_ishl(b, nir_imm_int64(b, 1023), start);
+   nir_def *owner[3] = {nir_imm_int(b, 192), nir_imm_int(b, 192), nir_imm_int(b, 192)};
+   for (unsigned d = 0; d < 3; ++d) {
+      nir_def *candidates = nir_iand(b, nir_ballot(b, 1, 64, nir_iand(b, live, valid[d])), interval);
+      nir_def *matches[3];
+      for (unsigned c = 0; c < 3; ++c)
+         matches[c] = candidates;
+      for (unsigned k = 0; k < bits; ++k) {
+         nir_def *plane = nir_ballot(b, 1, 64, nir_ine_imm(b, nir_iand_imm(b, L[d], 1u << k), 0));
+         for (unsigned c = 0; c < 3; ++c) {
+            nir_def *set = nir_ine_imm(b, nir_iand_imm(b, L[c], 1u << k), 0);
+            matches[c] = nir_iand(b, matches[c], nir_bcsel(b, set, plane, nir_inot(b, plane)));
+         }
+      }
+      for (unsigned c = 0; c < 3; ++c) {
+         /* find_lsb(0) = -1 gives an unsigned key above every valid key. */
+         nir_def *key = nir_iadd_imm(b, nir_imul_imm(b, nir_find_lsb(b, matches[c]), 3), d);
+         owner[c] = nir_umin(b, owner[c], key);
+      }
+   }
+   nir_def *owner_p[3], *owner_c[3], *fresh[3];
+   nir_def *fresh_bits = zero, *fresh_count = zero;
+   for (unsigned c = 0; c < 3; ++c) {
+      nir_def *self = nir_iadd_imm(b, nir_imul_imm(b, lane, 3), c);
+      if (c == provoking)
+         owner[c] = self;
+      else
+         owner[c] = nir_bcsel(b, valid[c], owner[c], self);
+      owner_p[c] = nir_bcsel(b, live, nir_udiv_imm(b, owner[c], 3), zero);
+      owner_c[c] = nir_umod_imm(b, owner[c], 3);
+      fresh[c] = nir_iand(b, live, nir_ieq(b, owner[c], self));
+      fresh_bits = nir_ior(b, fresh_bits, nir_ishl_imm(b, nir_b2i32(b, fresh[c]), c));
+      fresh_count = nir_iadd(b, fresh_count, nir_b2i32(b, fresh[c]));
+   }
+   nir_def *prefix = nir_exclusive_scan(b, fresh_count, .reduction_op = nir_op_iadd);
+   nir_def *slots[3];
+   for (unsigned c = 0; c < 3; ++c) {
+      nir_def *base = nir_shuffle(b, prefix, owner_p[c]);
+      nir_def *owned = nir_shuffle(b, fresh_bits, owner_p[c]);
+      nir_def *below = nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), owner_c[c]), -1);
+      slots[c] = nir_iadd(b, base, nir_bit_count(b, nir_iand(b, owned, below)));
+      nir_if *create = nir_push_if(b, fresh[c]);
+      nir_store_shared(b, nir_u2u8(b, x[c]), slots[c], .base = s->safe_direct_map_addr);
+      nir_pop_if(b, create);
+   }
+   nir_if *accepted = nir_push_if(b, live);
+   nir_def *p = nir_mbcnt_amd(b, live_mask, zero);
+   nir_store_shared(b, nir_u2u8(b, nir_vec3(b, slots[0], slots[1], slots[2])), nir_imul_imm(b, p, 3),
+                    .base = s->safe_direct_indices_addr);
+   nir_pop_if(b, accepted);
+   return nir_vec2(b, nir_read_invocation(b, nir_iadd(b, prefix, fresh_count), nir_imm_int(b, s->wave_size - 1)),
+                   nir_u2u32(b, nir_bit_count(b, live_mask)));
+}
+
 /* If the surviving connectivity already obeys W31, deleting holes in increasing
  * original-index order can only shorten every backjump. Reuse the checker's
  * coverage masks instead of building any duplicate-vertex plan. This also
@@ -2465,6 +2547,28 @@ ms_safe_fast_check_wave(nir_builder *b, lower_ngg_ms_state *s, nir_def *vc, nir_
       /* RADV_BC250_MESH_SAFE_COMPACT, between cases 1 and 2: the survivors reference fewer vertices
        * (culled or split away) but keep backjump <= 31 once the others are deleted: export only the
        * referenced vertices, in increasing API order, and the survivors in order. */
+      if (s->pp_share) {
+         /* RADV_BC250_MESH_PP_SHARE (owned corners, never adaptive): the logical vertex of each corner. */
+         const uint32_t *ix = s->options->bc250_compact_index_staging;
+         nir_def *L[3], *valid[3], *x[3];
+         nir_def *limit = nir_iadd_imm(b, vc, -1);
+         nir_if *load = nir_push_if(b, live);
+         nir_def *loaded[3];
+         for (unsigned c = 0; c < 3; ++c) {
+            nir_def *addr = nir_iadd_imm(b, nir_imul_imm(b, lane, ix[1]), c * ix[2]);
+            loaded[c] = nir_u2u32(b, nir_load_shared(b, 1, ix[2] * 8, addr, .base = ix[0], .align_mul = ix[2]));
+         }
+         nir_pop_if(b, load);
+         for (unsigned c = 0; c < 3; ++c)
+            L[c] = nir_if_phi(b, loaded[c], zero);
+         for (unsigned c = 0; c < 3; ++c) {
+            valid[c] = nir_iand(b, live, nir_ult_imm(b, L[c], ix[3]));
+            x[c] = nir_umin(b, nir_channel(b, idx, c), limit);
+         }
+         nir_def *planned = ms_pps_vertices(b, s, L, valid, x, live,
+                                            s->options->bc250_compact_owned_corners == 0x4 ? 2 : 0);
+         return nir_vec3(b, nir_channel(b, planned, 0), nir_channel(b, planned, 1), zero);
+      }
       nir_if *compact = NULL;
       nir_def *compact_result = NULL;
       if (s->safe_compact) {
@@ -3874,6 +3978,7 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
    uint32_t safe_direct_map_addr = 0, safe_direct_latest_addr = 0;
    uint32_t safe_direct_indices_addr = 0, safe_direct_counts_addr = 0;
    bool safe_compact = false;
+   bool pp_share = false;
    if (safe_direct) {
       assert(!layout.scratch_ring.vtx_attr.mask && !layout.scratch_ring.prm_attr.mask);
       /* Direct-read removes LDS copies by cloning the original per-vertex
@@ -3900,6 +4005,19 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
        * room (or with barycentric reference slots, whose corner numbers need private corners) the
        * shader keeps the three adaptive cases. The vertex map needs at most 3 * survivors entries,
        * within the corner bound. */
+      /* RADV_BC250_MESH_PP_SHARE: the slot triples follow the counts (the map fits the corner bound). The
+       * one-slot barycentric corner number needs private corners (slot 3p + c). */
+      const uint32_t *pix = options->bc250_compact_index_staging;
+      if (options->bc250_pp_share && !options->bc250_safe_adaptive && util_bitcount64(bary_ref_mask) != 1 &&
+          /* Up to 32 logical vertices: the plane match stays within the existing register budget (larger
+           * tables, e.g. 256-vertex pieces, nearly doubled the VGPRs in wave64). */
+          pix[1] && (pix[2] == 2 || pix[2] == 4) && pix[3] && pix[3] <= 32 &&
+          pix[0] + max_primitives * pix[1] <= shader->info.shared_size && max_primitives <= options->wave_size &&
+          layout.lds.total_size + 3 * max_primitives <= 32 * 1024) {
+         pp_share = true;
+         safe_direct_indices_addr = layout.lds.total_size;
+         layout.lds.total_size += 3 * max_primitives;
+      }
       if (options->bc250_safe_compact && !bary_ref_mask &&
           layout.lds.total_size + 3 * max_primitives <= 32 * 1024) {
          safe_compact = true;
@@ -3919,6 +4037,9 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
                  options->bc250_safe_local ? "before check and local remap" : "before parallel remap");
       if (options->bc250_safe_check && getenv("BC250_TRACE_COMPILE"))
          fprintf(stderr, "BC250 MESH SAFE CHECK: wave-local counts, one publication\n");
+      if (options->bc250_pp_share && getenv("BC250_TRACE_COMPILE"))
+         fprintf(stderr, "BC250 MESH PP SHARE: %s provoking=%u table=%u\n", pp_share ? "applied" : "not applied",
+                 options->bc250_compact_owned_corners, options->bc250_compact_index_staging[3]);
       if (safe_compact && getenv("BC250_TRACE_COMPILE"))
          fprintf(stderr, "BC250 MESH SAFE COMPACT: referenced vertices renumbered, W=31\n");
       if (options->bc250_safe_corners && getenv("BC250_TRACE_COMPILE"))
@@ -3987,6 +4108,7 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
       .safe_direct_indices_addr = safe_direct_indices_addr,
       .safe_direct_counts_addr = safe_direct_counts_addr,
       .safe_compact = safe_compact,
+      .pp_share = pp_share,
    };
 
    u_foreach_bit64(slot, bary_ref_mask) {
