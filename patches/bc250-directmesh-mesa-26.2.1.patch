@@ -75,10 +75,10 @@ index 41e5d9b..a0f3477 100644
     info->has_export_conflict_bug = info->gfx_level == GFX11;
  
 diff --git a/src/amd/common/nir/ac_nir.h b/src/amd/common/nir/ac_nir.h
-index 14bbd6b..031366d 100644
+index 14bbd6b..62577b3 100644
 --- a/src/amd/common/nir/ac_nir.h
 +++ b/src/amd/common/nir/ac_nir.h
-@@ -243,10 +243,92 @@ typedef struct {
+@@ -243,10 +243,96 @@ typedef struct {
     bool export_primitive_id_per_prim;
     uint32_t instance_rate_inputs;
  
@@ -134,6 +134,10 @@ index 14bbd6b..031366d 100644
 +    * workgroup whose API connectivity references every vertex with backjump <= 31 exports its shared vertices and
 +    * every primitive without shader culling; any other workgroup exports the private corners. */
 +   bool bc250_safe_adaptive;
++   /* RADV_BC250_MESH_SAFE_COMPACT (with bc250_safe_adaptive): before the shared-plus-all and corner
++    * cases, a workgroup whose survivors keep backjump <= 31 once the vertices they do not reference
++    * are deleted exports only the referenced vertices, renumbered in increasing order. */
++   bool bc250_safe_compact;
 +   bool bc250_safe_bary;
 +   bool bc250_safe_stats;
 +   bool bc250_safe_parallel;
@@ -193,7 +197,7 @@ index 916da8c..7f987b2 100644
  ac_nir_create_output_phis(nir_builder *b,
                            const uint64_t outputs_written,
 diff --git a/src/amd/common/nir/ac_nir_lower_ngg_mesh.c b/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
-index ef332e8..da18be3 100644
+index ef332e8..66307bb 100644
 --- a/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
 +++ b/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
 @@ -9,6 +9,11 @@
@@ -220,7 +224,7 @@ index ef332e8..da18be3 100644
        ms_out_part prm_attr;
        uint32_t indices_addr;
        uint32_t cull_flags_addr;
-@@ -117,13 +127,144 @@ typedef struct
+@@ -117,13 +127,148 @@ typedef struct
     bool insert_layer_output;
     /* True if cull flags are used */
     bool uses_cull_flags;
@@ -273,6 +277,10 @@ index ef332e8..da18be3 100644
 +   bool counts_in_all_lanes;
 +   bool safe_direct;
 +   nir_def *fast_clean;
++   /* RADV_BC250_MESH_SAFE_COMPACT: enabled for this shader (LDS permitting), and the per-workgroup
++    * flag (published flag bit 1): referenced vertices renumbered in order, survivors from indices. */
++   bool safe_compact;
++   nir_def *fast_compact;
 +   nir_variable *fast_prim_arg;
 +   uint32_t safe_direct_map_addr;
 +   uint32_t safe_direct_latest_addr;
@@ -365,7 +373,7 @@ index ef332e8..da18be3 100644
  static void
  ms_store_prim_indices(nir_builder *b,
                        nir_intrinsic_instr *intrin,
-@@ -136,6 +277,10 @@ ms_store_prim_indices(nir_builder *b,
+@@ -136,6 +281,10 @@ ms_store_prim_indices(nir_builder *b,
     assert(nir_src_is_const(*nir_get_io_offset_src(intrin)));
     assert(nir_src_as_uint(*nir_get_io_offset_src(intrin)) == 0);
  
@@ -376,7 +384,7 @@ index ef332e8..da18be3 100644
     const unsigned write_mask = nir_intrinsic_write_mask(intrin);
     const unsigned component_offset = nir_intrinsic_component(intrin);
     nir_def *store_val = intrin->src[0].ssa;
-@@ -188,10 +333,10 @@ ms_store_cull_flag(nir_builder *b,
+@@ -188,10 +337,10 @@ ms_store_cull_flag(nir_builder *b,
     }
  
     nir_def *arr_index = nir_get_io_arrayed_index_src(intrin)->ssa;
@@ -390,7 +398,7 @@ index ef332e8..da18be3 100644
  }
  
  static nir_def *
-@@ -211,6 +356,26 @@ ms_arrayed_output_base_addr(nir_builder *b,
+@@ -211,6 +360,26 @@ ms_arrayed_output_base_addr(nir_builder *b,
     return nir_iadd_nuw(b, arr_index_off, io_off);
  }
  
@@ -417,7 +425,7 @@ index ef332e8..da18be3 100644
  static void
  update_ms_output_info(const nir_io_semantics io_sem,
                        const nir_src *base_offset_src,
-@@ -310,7 +475,15 @@ ms_store_arrayed_output(nir_builder *b,
+@@ -310,7 +479,15 @@ ms_store_arrayed_output(nir_builder *b,
     nir_def *base_addr_off = nir_imul_imm(b, base_offset, 16u);
     nir_def *addr = nir_iadd_nuw(b, base_addr, base_addr_off);
  
@@ -434,7 +442,7 @@ index ef332e8..da18be3 100644
        nir_store_shared(b, store_val, addr, .base = const_off,
                       .write_mask = write_mask, .align_mul = 16,
                       .align_offset = const_off % 16);
-@@ -394,6 +567,59 @@ ms_store_arrayed_output_intrin(nir_builder *b,
+@@ -394,6 +571,59 @@ ms_store_arrayed_output_intrin(nir_builder *b,
     }
  }
  
@@ -494,7 +502,7 @@ index ef332e8..da18be3 100644
  static nir_def *
  ms_load_arrayed_output(nir_builder *b,
                         nir_def *arr_index,
-@@ -404,6 +630,12 @@ ms_load_arrayed_output(nir_builder *b,
+@@ -404,6 +634,12 @@ ms_load_arrayed_output(nir_builder *b,
                         unsigned load_bit_size,
                         lower_ngg_ms_state *s)
  {
@@ -507,7 +515,7 @@ index ef332e8..da18be3 100644
     ms_out_mode out_mode;
     const ms_out_part *out = ms_get_out_layout_part(location, &b->shader->info, &out_mode, s);
  
-@@ -417,7 +649,13 @@ ms_load_arrayed_output(nir_builder *b,
+@@ -417,7 +653,13 @@ ms_load_arrayed_output(nir_builder *b,
     nir_def *base_addr_off = nir_imul_imm(b, base_offset, 16);
     nir_def *addr = nir_iadd_nuw(b, base_addr, base_addr_off);
  
@@ -522,7 +530,7 @@ index ef332e8..da18be3 100644
        return nir_load_shared(b, num_components, load_bit_size, addr, .align_mul = 16,
                               .align_offset = (component_offset * 4) % 16,
                               .base = const_off);
-@@ -653,6 +891,20 @@ ms_emit_legacy_workgroup_index(nir_builder *b, lower_ngg_ms_state *s)
+@@ -653,6 +895,20 @@ ms_emit_legacy_workgroup_index(nir_builder *b, lower_ngg_ms_state *s)
     s->workgroup_index = nir_read_first_invocation(b, workgroup_index);
  }
  
@@ -543,7 +551,7 @@ index ef332e8..da18be3 100644
  static void
  set_ms_final_output_counts(nir_builder *b,
                             lower_ngg_ms_state *s,
-@@ -671,13 +923,26 @@ set_ms_final_output_counts(nir_builder *b,
+@@ -671,13 +927,26 @@ set_ms_final_output_counts(nir_builder *b,
     *out_num_prm = num_prm;
     *out_num_vtx = num_vtx;
  
@@ -572,7 +580,7 @@ index ef332e8..da18be3 100644
        /* Output counts are workgroup-uniform and all waves execute the API shader.
         * All waves calculated the same output count values, so we don't
         * have to distribute the value from the first active invocation.
-@@ -691,7 +956,8 @@ set_ms_final_output_counts(nir_builder *b,
+@@ -691,7 +960,8 @@ set_ms_final_output_counts(nir_builder *b,
         * allocating space for vertices/primitives.
         */
        nir_if *if_wave_0 = nir_push_if(b, nir_ieq_imm(b, nir_load_subgroup_id(b), 0));
@@ -582,7 +590,7 @@ index ef332e8..da18be3 100644
        nir_pop_if(b, if_wave_0);
        return;
     }
-@@ -716,7 +982,8 @@ set_ms_final_output_counts(nir_builder *b,
+@@ -716,7 +986,8 @@ set_ms_final_output_counts(nir_builder *b,
                              .memory_semantics = NIR_MEMORY_ACQ_REL,
                              .memory_modes = nir_var_mem_shared);
  
@@ -592,7 +600,7 @@ index ef332e8..da18be3 100644
     }
     nir_push_else(b, if_wave_0);
     {
-@@ -783,12 +1050,46 @@ ms_emit_attribute_ring_output_stores(nir_builder *b, const uint64_t outputs_mask
+@@ -783,12 +1054,54 @@ ms_emit_attribute_ring_output_stores(nir_builder *b, const uint64_t outputs_mask
  static nir_def *
  ms_prim_exp_arg_ch1(nir_builder *b, nir_def *invocation_index, nir_def *num_vtx, lower_ngg_ms_state *s)
  {
@@ -606,8 +614,16 @@ index ef332e8..da18be3 100644
 +         if (s->options->bc250_safe_adaptive && s->fast_clean) {
 +            nir_def *mapped = nir_u2u32(b, nir_load_shared(b, 3, 8, first, .base = s->safe_direct_map_addr));
 +            nir_def *api[3] = {nir_channel(b, mapped, 0), nir_channel(b, mapped, 1), nir_channel(b, mapped, 2)};
-+            return nir_bcsel(b, s->fast_clean, ac_nir_pack_ngg_prim_exp_arg(b, 3, api, NULL, s->ac->gfx_level),
-+                             corners);
++            nir_def *arg = nir_bcsel(b, s->fast_clean, ac_nir_pack_ngg_prim_exp_arg(b, 3, api, NULL, s->ac->gfx_level),
++                                     corners);
++            if (s->fast_compact) {
++               /* RADV_BC250_MESH_SAFE_COMPACT: the renumbered survivor indices. */
++               nir_def *ranked = nir_u2u32(b, nir_load_shared(b, 3, 8, first, .base = s->safe_direct_indices_addr));
++               nir_def *slot[3] = {nir_channel(b, ranked, 0), nir_channel(b, ranked, 1), nir_channel(b, ranked, 2)};
++               arg = nir_bcsel(b, s->fast_compact, ac_nir_pack_ngg_prim_exp_arg(b, 3, slot, NULL, s->ac->gfx_level),
++                               arg);
++            }
++            return arg;
 +         }
 +         return corners;
 +      }
@@ -640,7 +656,7 @@ index ef332e8..da18be3 100644
        nir_def *indices[3] = {0};
        for (unsigned c = 0; c < s->vertices_per_prim; ++c)
           indices[c] = nir_load_var(b, s->out_variables[VARYING_SLOT_PRIMITIVE_INDICES * 4 + c]);
-@@ -798,12 +1099,13 @@ ms_prim_exp_arg_ch1(nir_builder *b, nir_def *invocation_index, nir_def *num_vtx,
+@@ -798,12 +1111,13 @@ ms_prim_exp_arg_ch1(nir_builder *b, nir_def *invocation_index, nir_def *num_vtx,
        indices_loaded = nir_u2u32(b, indices_loaded);
     }
  
@@ -656,7 +672,7 @@ index ef332e8..da18be3 100644
  
        cull_flag = nir_i2b(b, loaded_cull_flag);
     }
-@@ -894,6 +1196,7 @@ ms_invocation_query(nir_builder *b,
+@@ -894,6 +1208,7 @@ ms_invocation_query(nir_builder *b,
     {
        nir_if *if_pipeline_query = nir_push_if(b, nir_load_pipeline_stat_query_enabled_amd(b));
        {
@@ -664,7 +680,7 @@ index ef332e8..da18be3 100644
           nir_atomic_add_shader_invocation_count_amd(b, nir_imm_int(b, s->api_workgroup_size));
        }
        nir_pop_if(b, if_pipeline_query);
-@@ -901,14 +1204,58 @@ ms_invocation_query(nir_builder *b,
+@@ -901,14 +1216,58 @@ ms_invocation_query(nir_builder *b,
     nir_pop_if(b, if_invocation_index_zero);
  }
  
@@ -724,7 +740,7 @@ index ef332e8..da18be3 100644
                               !s->has_param_exports, false, s->per_vertex_outputs | VARYING_BIT_POS,
                               &s->out, row);
     }
-@@ -929,6 +1276,11 @@ static void
+@@ -929,6 +1288,11 @@ static void
  emit_ms_primitive(nir_builder *b, nir_def *index, nir_def *row, bool exports, bool parameters,
                    uint64_t per_primitive_outputs, lower_ngg_ms_state *s)
  {
@@ -736,7 +752,7 @@ index ef332e8..da18be3 100644
     ms_emit_arrayed_outputs(b, index, per_primitive_outputs, s);
  
     /* Insert layer output store if the pipeline uses multiview but the API shader doesn't write it. */
-@@ -940,7 +1292,22 @@ emit_ms_primitive(nir_builder *b, nir_def *index, nir_def *row, bool exports, bo
+@@ -940,7 +1304,22 @@ emit_ms_primitive(nir_builder *b, nir_def *index, nir_def *row, bool exports, bo
     if (exports) {
        const uint64_t outputs_mask = per_primitive_outputs & MS_PRIM_ARG_EXP_MASK;
        nir_def *num_vtx = nir_load_var(b, s->vertex_count_var);
@@ -760,7 +776,7 @@ index ef332e8..da18be3 100644
        nir_def *prim_exp_arg_ch2 = ms_prim_exp_arg_ch2(b, outputs_mask, s);
  
        nir_def *prim_exp_arg = prim_exp_arg_ch2 ?
-@@ -1008,24 +1375,1319 @@ emit_ms_outputs(nir_builder *b, nir_def *invocation_index, nir_def *row_start,
+@@ -1008,24 +1387,1376 @@ emit_ms_outputs(nir_builder *b, nir_def *invocation_index, nir_def *row_start,
     }
  }
  
@@ -815,9 +831,7 @@ index ef332e8..da18be3 100644
 +   ms_autocull_old_vtx = ms_autocull_old_prims + 4,
 +   ms_autocull_map = ms_autocull_old_vtx + 4,
 +};
- 
--   nir_barrier(b, .execution_scope=SCOPE_WORKGROUP, .memory_scope=SCOPE_WORKGROUP,
--                         .memory_semantics=NIR_MEMORY_ACQ_REL, .memory_modes=nir_var_shader_out|nir_var_mem_shared);
++
 +static unsigned
 +ms_autocull_prim_waves(nir_builder *b, lower_ngg_ms_state *s)
 +{
@@ -1761,6 +1775,43 @@ index ef332e8..da18be3 100644
 +                   nir_inot(b, nir_vote_any(b, 1, nir_ior(b, range_bad, r2_bad))));
 +}
 +
++/* RADV_BC250_MESH_SAFE_COMPACT: whether the live triangles, with the vertices they do not reference
++ * deleted and the rest renumbered in increasing order (their rank), keep indices < vc and the
++ * triangle-wide backjump <= 31 on the new numbers. Every exported vertex is then referenced by
++ * construction. Ranks are monotone, so the running maximum of the ranks is the rank of the running
++ * maximum. Fills the coverage words for ms_safe_local_remove_holes. Wave-uniform. */
++static nir_def *
++ms_adaptive_compact_ok(nir_builder *b, lower_ngg_ms_state *s, nir_def *idx, nir_def *live, nir_def *vc,
++                       nir_def **words, nir_def **used)
++{
++   nir_def *zero = nir_imm_int(b, 0);
++   nir_def *v[3] = {nir_channel(b, idx, 0), nir_channel(b, idx, 1), nir_channel(b, idx, 2)};
++   nir_def *hi = nir_umax(b, v[0], nir_umax(b, v[1], v[2]));
++   nir_def *lo = nir_umin(b, v[0], nir_umin(b, v[1], v[2]));
++   nir_def *range_bad = nir_iand(b, live, nir_uge(b, hi, vc));
++   const unsigned count = DIV_ROUND_UP(b->shader->info.mesh.max_vertices_out, 32);
++   assert(count <= 8);
++   *used = zero;
++   for (unsigned w = 0; w < 8; ++w) {
++      if (w >= count) {
++         words[w] = zero;
++         continue;
++      }
++      nir_def *bits = zero;
++      for (unsigned c = 0; c < 3; ++c) {
++         nir_def *in_word = nir_ieq_imm(b, nir_ushr_imm(b, v[c], 5), w);
++         bits = nir_ior(b, bits, nir_bcsel(b, in_word, nir_ishl(b, nir_imm_int(b, 1), v[c]), zero));
++      }
++      words[w] = nir_reduce(b, nir_bcsel(b, live, bits, zero), .reduction_op = nir_op_ior);
++      *used = nir_iadd(b, *used, nir_bit_count(b, words[w]));
++   }
++   nir_def *rank_hi = ms_safe_parallel_rank(b, hi, words);
++   nir_def *rank_lo = ms_safe_parallel_rank(b, lo, words);
++   nir_def *prefix = nir_inclusive_scan(b, nir_bcsel(b, live, rank_hi, zero), .reduction_op = nir_op_umax);
++   nir_def *r2_bad = nir_iand(b, live, nir_ult(b, nir_iadd_imm(b, rank_lo, 31), prefix));
++   return nir_inot(b, nir_vote_any(b, 1, nir_ior(b, range_bad, r2_bad)));
++}
++
 +static nir_def *
 +ms_safe_fast_check_wave(nir_builder *b, lower_ngg_ms_state *s, nir_def *vc, nir_def *pc)
 +{
@@ -1808,6 +1859,19 @@ index ef332e8..da18be3 100644
 +         use_all = nir_iand(b, nir_inot(b, post), nir_iand(b, pre, few));
 +         shared = nir_ior(b, post, use_all);
 +      }
++      /* RADV_BC250_MESH_SAFE_COMPACT, between cases 1 and 2: the survivors reference fewer vertices
++       * (culled or split away) but keep backjump <= 31 once the others are deleted: export only the
++       * referenced vertices, in increasing API order, and the survivors in order. */
++      nir_if *compact = NULL;
++      nir_def *compact_result = NULL;
++      if (s->safe_compact) {
++         nir_def *words[8], *used;
++         nir_def *ok = nir_iand(b, nir_inot(b, shared), ms_adaptive_compact_ok(b, s, idx, live, vc, words, &used));
++         compact = nir_push_if(b, ok);
++         nir_def *holes = ms_safe_local_remove_holes(b, s, idx, live, words, used);
++         compact_result = nir_vec3(b, nir_channel(b, holes, 0), nir_channel(b, holes, 1), nir_imm_int(b, 2));
++         nir_push_else(b, compact);
++      }
 +      nir_def *sel = nir_bcsel(b, use_all, live_all, live);
 +      nir_def *mask = nir_ballot(b, 1, 64, sel);
 +      nir_def *first = nir_imul_imm(b, nir_mbcnt_amd(b, mask, zero), 3);
@@ -1820,7 +1884,12 @@ index ef332e8..da18be3 100644
 +      nir_def *corner_result = nir_vec3(b, nir_imul_imm(b, prims, 3), prims, zero);
 +      if (!s->options->bc250_safe_adaptive)
 +         return corner_result;
-+      return nir_bcsel(b, shared, nir_vec3(b, vc, prims, nir_imm_int(b, 1)), corner_result);
++      nir_def *result = nir_bcsel(b, shared, nir_vec3(b, vc, prims, nir_imm_int(b, 1)), corner_result);
++      if (compact) {
++         nir_pop_if(b, compact);
++         result = nir_if_phi(b, compact_result, result);
++      }
++      return result;
 +   }
 +   nir_def *v[3] = {nir_channel(b, idx, 0), nir_channel(b, idx, 1), nir_channel(b, idx, 2)};
 +   nir_store_var(b, s->fast_prim_arg, ac_nir_pack_ngg_prim_exp_arg(b, 3, v, NULL, s->ac->gfx_level), 1);
@@ -1961,6 +2030,8 @@ index ef332e8..da18be3 100644
 +   s->fast_clean = s->options->bc250_safe_adaptive ?
 +                      nir_ine_imm(b, nir_iand_imm(b, nir_channel(b, result, 2), 1), 0) :
 +                   s->options->bc250_safe_corners ? NULL : nir_ine_imm(b, nir_channel(b, result, 2), 0);
++   if (s->safe_compact)
++      s->fast_compact = nir_ine_imm(b, nir_iand_imm(b, nir_channel(b, result, 2), 2), 0);
 +   s->counts_in_all_lanes = true;
 +}
 +
@@ -2049,7 +2120,9 @@ index ef332e8..da18be3 100644
 +                       .base = s->safe_direct_counts_addr, .align_mul = 4);
 +      nir_pop_if(b, first);
 +   }
-+
+ 
+-   nir_barrier(b, .execution_scope=SCOPE_WORKGROUP, .memory_scope=SCOPE_WORKGROUP,
+-                         .memory_semantics=NIR_MEMORY_ACQ_REL, .memory_modes=nir_var_shader_out|nir_var_mem_shared);
 +   const bool local_producer = s->options->bc250_safe_check && s->api_workgroup_size <= s->wave_size;
 +   nir_barrier(b, .execution_scope = local_producer ? SCOPE_SUBGROUP : SCOPE_WORKGROUP,
 +               .memory_scope = SCOPE_WORKGROUP, .memory_semantics = NIR_MEMORY_ACQ_REL,
@@ -2087,7 +2160,7 @@ index ef332e8..da18be3 100644
  
     nir_def *row_start = NULL;
     if (s->ac->gfx_level >= GFX11)
-@@ -1085,14 +2747,68 @@ emit_ms_finale(nir_builder *b, lower_ngg_ms_state *s)
+@@ -1085,14 +2816,68 @@ emit_ms_finale(nir_builder *b, lower_ngg_ms_state *s)
        emit_ms_outputs(b, invocation_index, row_start, num_prm, true, false,
                        per_primitive_outputs, &emit_ms_primitive, s);
     }
@@ -2157,7 +2230,7 @@ index ef332e8..da18be3 100644
  
     /* Handle barriers manually when the API workgroup
      * size is less than the HW workgroup size.
-@@ -1147,14 +2863,46 @@ handle_smaller_ms_api_workgroup(nir_builder *b,
+@@ -1147,14 +2932,46 @@ handle_smaller_ms_api_workgroup(nir_builder *b,
                 nir_intrinsic_set_memory_scope(intrin, SCOPE_SUBGROUP);
              }
  
@@ -2205,7 +2278,7 @@ index ef332e8..da18be3 100644
     /* Extract the full control flow of the shader. */
     nir_cf_list extracted;
     nir_cf_extract(&extracted, nir_before_impl(b->impl),
-@@ -1169,7 +2917,7 @@ handle_smaller_ms_api_workgroup(nir_builder *b,
+@@ -1169,7 +2986,7 @@ handle_smaller_ms_api_workgroup(nir_builder *b,
        /* First invocation stores 0 to number of API waves in flight. */
        nir_if *if_first_in_workgroup = nir_push_if(b, nir_ieq_imm(b, invocation_index, 0));
        {
@@ -2214,7 +2287,7 @@ index ef332e8..da18be3 100644
        }
        nir_pop_if(b, if_first_in_workgroup);
  
-@@ -1186,14 +2934,25 @@ handle_smaller_ms_api_workgroup(nir_builder *b,
+@@ -1186,14 +3003,25 @@ handle_smaller_ms_api_workgroup(nir_builder *b,
        b->cursor = nir_after_cf_list(&if_has_api_ms_invocation->then_list);
  
        if (need_additional_barriers) {
@@ -2247,7 +2320,7 @@ index ef332e8..da18be3 100644
  
           nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
                                 .memory_scope = SCOPE_WORKGROUP,
-@@ -1218,6 +2977,11 @@ handle_smaller_ms_api_workgroup(nir_builder *b,
+@@ -1218,6 +3046,11 @@ handle_smaller_ms_api_workgroup(nir_builder *b,
        {
           nir_if *if_elected = nir_push_if(b, nir_elect(b, 1));
           {
@@ -2259,7 +2332,7 @@ index ef332e8..da18be3 100644
              nir_loop *loop = nir_push_loop(b);
              {
                 nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
-@@ -1226,7 +2990,17 @@ handle_smaller_ms_api_workgroup(nir_builder *b,
+@@ -1226,7 +3059,17 @@ handle_smaller_ms_api_workgroup(nir_builder *b,
                                       .memory_modes = nir_var_shader_out | nir_var_mem_shared);
  
                 nir_def *loaded = nir_load_shared(b, 1, 32, zero, .base = api_waves_in_flight_addr);
@@ -2278,7 +2351,7 @@ index ef332e8..da18be3 100644
              }
              nir_pop_loop(b, loop);
           }
-@@ -1250,7 +3024,8 @@ ms_calculate_arrayed_output_layout(ms_out_mem_layout *l,
+@@ -1250,7 +3093,8 @@ ms_calculate_arrayed_output_layout(ms_out_mem_layout *l,
                                     unsigned max_vertices,
                                     unsigned max_primitives)
  {
@@ -2288,7 +2361,7 @@ index ef332e8..da18be3 100644
     uint32_t lds_prm_attr_size = util_bitcount64(l->lds.prm_attr.mask) * max_primitives * 16;
     l->lds.prm_attr.addr = align(l->lds.vtx_attr.addr + lds_vtx_attr_size, 16);
     l->lds.total_size = l->lds.prm_attr.addr + lds_prm_attr_size;
-@@ -1265,7 +3040,8 @@ static ms_out_mem_layout
+@@ -1265,7 +3109,8 @@ static ms_out_mem_layout
  ms_calculate_output_layout(const struct ac_compiler_info *info, unsigned api_shared_size,
                             uint64_t per_vertex_output_mask, uint64_t per_primitive_output_mask,
                             uint64_t cross_invocation_output_access, unsigned max_vertices,
@@ -2298,7 +2371,7 @@ index ef332e8..da18be3 100644
  {
     /* These outputs always need export instructions and can't use the attributes ring. */
     const uint64_t always_export_mask =
-@@ -1317,6 +3093,10 @@ ms_calculate_output_layout(const struct ac_compiler_info *info, unsigned api_sha
+@@ -1317,6 +3162,10 @@ ms_calculate_output_layout(const struct ac_compiler_info *info, unsigned api_sha
      */
     l.lds.vtx_attr.addr = align(l.lds.total_size, 16);
     l.lds.vtx_attr.mask = lds_per_vertex_output_mask;
@@ -2309,7 +2382,7 @@ index ef332e8..da18be3 100644
     l.lds.prm_attr.mask = lds_per_primitive_output_mask;
     ms_calculate_arrayed_output_layout(&l, max_vertices, max_primitives);
  
-@@ -1328,9 +3108,12 @@ ms_calculate_output_layout(const struct ac_compiler_info *info, unsigned api_sha
+@@ -1328,9 +3177,12 @@ ms_calculate_output_layout(const struct ac_compiler_info *info, unsigned api_sha
      * Move the outputs that do not fit LDS, to VRAM.
      * Start with per-primitive attributes, because those are grouped at the end.
      */
@@ -2325,7 +2398,7 @@ index ef332e8..da18be3 100644
        if (l.lds.prm_attr.mask)
           ms_move_output(&l.lds.prm_attr, &l.scratch_ring.prm_attr);
        else if (l.lds.vtx_attr.mask)
-@@ -1341,7 +3124,10 @@ ms_calculate_output_layout(const struct ac_compiler_info *info, unsigned api_sha
+@@ -1341,7 +3193,10 @@ ms_calculate_output_layout(const struct ac_compiler_info *info, unsigned api_sha
        ms_calculate_arrayed_output_layout(&l, max_vertices, max_primitives);
     }
  
@@ -2337,7 +2410,7 @@ index ef332e8..da18be3 100644
        /* Indices: flat array of 8-bit vertex indices for each primitive. */
        l.lds.indices_addr = align(l.lds.total_size, 16);
        l.lds.total_size = l.lds.indices_addr + max_primitives * vertices_per_prim;
-@@ -1358,6 +3144,406 @@ ms_calculate_output_layout(const struct ac_compiler_info *info, unsigned api_sha
+@@ -1358,6 +3213,406 @@ ms_calculate_output_layout(const struct ac_compiler_info *info, unsigned api_sha
     return l;
  }
  
@@ -2744,7 +2817,7 @@ index ef332e8..da18be3 100644
  bool
  ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *options,
                        bool *out_needs_scratch_ring)
-@@ -1365,8 +3551,15 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
+@@ -1365,8 +3620,15 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
     unsigned vertices_per_prim =
        mesa_vertices_per_prim(shader->info.mesh.primitive_type);
  
@@ -2761,7 +2834,7 @@ index ef332e8..da18be3 100644
     uint64_t per_primitive_outputs =
        shader->info.per_primitive_outputs & shader->info.outputs_written;
  
-@@ -1379,11 +3572,279 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
+@@ -1379,11 +3641,292 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
  
     unsigned max_vertices = shader->info.mesh.max_vertices_out;
     unsigned max_primitives = shader->info.mesh.max_primitives_out;
@@ -2995,6 +3068,7 @@ index ef332e8..da18be3 100644
 +
 +   uint32_t safe_direct_map_addr = 0, safe_direct_latest_addr = 0;
 +   uint32_t safe_direct_indices_addr = 0, safe_direct_counts_addr = 0;
++   bool safe_compact = false;
 +   if (safe_direct) {
 +      assert(!layout.scratch_ring.vtx_attr.mask && !layout.scratch_ring.prm_attr.mask);
 +      /* Direct-read removes LDS copies by cloning the original per-vertex
@@ -3017,6 +3091,16 @@ index ef332e8..da18be3 100644
 +      }
 +      layout.lds.total_size = safe_direct_counts_addr + 8 +
 +         (options->bc250_safe_autocull && !options->bc250_safe_local ? 12 : 0);
++      /* RADV_BC250_MESH_SAFE_COMPACT: the renumbered survivor indices follow the counts. Without the
++       * room (or with barycentric reference slots, whose corner numbers need private corners) the
++       * shader keeps the three adaptive cases. The vertex map needs at most 3 * survivors entries,
++       * within the corner bound. */
++      if (options->bc250_safe_compact && !bary_ref_mask &&
++          layout.lds.total_size + 3 * max_primitives <= 32 * 1024) {
++         safe_compact = true;
++         safe_direct_indices_addr = layout.lds.total_size;
++         layout.lds.total_size += 3 * max_primitives;
++      }
 +      assert(layout.lds.total_size <= 32 * 1024);
 +      if (options->bc250_safe_direct_index_staging) {
 +         uint32_t *ix = options->bc250_safe_direct_index_staging;
@@ -3030,6 +3114,8 @@ index ef332e8..da18be3 100644
 +                 options->bc250_safe_local ? "before check and local remap" : "before parallel remap");
 +      if (options->bc250_safe_check && getenv("BC250_TRACE_COMPILE"))
 +         fprintf(stderr, "BC250 MESH SAFE CHECK: wave-local counts, one publication\n");
++      if (safe_compact && getenv("BC250_TRACE_COMPILE"))
++         fprintf(stderr, "BC250 MESH SAFE COMPACT: referenced vertices renumbered, W=31\n");
 +      if (options->bc250_safe_corners && getenv("BC250_TRACE_COMPILE"))
 +         fprintf(stderr, "BC250 MESH SAFE CORNERS: private surviving corners, W=2, bound=%u\n", 3 * max_primitives);
 +      if (options->bc250_safe_local && getenv("BC250_TRACE_COMPILE"))
@@ -3043,7 +3129,7 @@ index ef332e8..da18be3 100644
     shader->info.shared_size = layout.lds.total_size;
     *out_needs_scratch_ring = layout.scratch_ring.vtx_attr.mask || layout.scratch_ring.prm_attr.mask;
  
-@@ -1394,9 +3855,6 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
+@@ -1394,9 +3937,6 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
      * Therefore, we must make sure that when the API workgroup size is smaller,
      * we don't run the API shader on more HW invocations than is necessary.
      */
@@ -3053,7 +3139,7 @@ index ef332e8..da18be3 100644
  
     nir_custom_divergence_analysis(shader,
        api_workgroup_size <= options->wave_size ? 0 : nir_divergence_across_subgroups);
-@@ -1416,14 +3874,39 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
+@@ -1416,14 +3956,40 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
        .insert_layer_output =
           options->multiview && !(shader->info.outputs_written & VARYING_BIT_LAYER),
        .uses_cull_flags = uses_cull,
@@ -3083,6 +3169,7 @@ index ef332e8..da18be3 100644
 +      .safe_direct_latest_addr = safe_direct_latest_addr,
 +      .safe_direct_indices_addr = safe_direct_indices_addr,
 +      .safe_direct_counts_addr = safe_direct_counts_addr,
++      .safe_compact = safe_compact,
     };
  
 +   u_foreach_bit64(slot, bary_ref_mask) {
@@ -3093,7 +3180,7 @@ index ef332e8..da18be3 100644
     nir_function_impl *impl = nir_shader_get_entrypoint(shader);
     assert(impl);
  
-@@ -1435,6 +3918,12 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
+@@ -1435,6 +4001,12 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
     nir_builder builder = nir_builder_at(nir_before_impl(impl));
     nir_builder *b = &builder; /* This is to avoid the & */
  
@@ -3106,7 +3193,7 @@ index ef332e8..da18be3 100644
     handle_smaller_ms_api_workgroup(b, &state);
     if (!fast_launch_2)
        ms_emit_legacy_workgroup_index(b, &state);
-@@ -1444,6 +3933,10 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
+@@ -1444,6 +4016,10 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
  
     emit_ms_finale(b, &state);
  
@@ -3869,10 +3956,10 @@ index 64a7924..c47c8c2 100644
  static inline void
 diff --git a/src/amd/vulkan/radv_bc250.c b/src/amd/vulkan/radv_bc250.c
 new file mode 100644
-index 0000000..f94e498
+index 0000000..b244a06
 --- /dev/null
 +++ b/src/amd/vulkan/radv_bc250.c
-@@ -0,0 +1,6411 @@
+@@ -0,0 +1,6537 @@
 +/* SPDX-License-Identifier: MIT
 + * Experimental BC250 TASK scheduling on the graphics queue.
 + * No ACE queue, task rings, native TASK packets, or device-generation spoofing.
@@ -4665,6 +4752,39 @@ index 0000000..f94e498
 +         return true;
 +   }
 +   return false;
++}
++
++/* RADV_BC250_MESH_SAFE_PIECES_EXT: a wave32 Mesh shader can run in wave64 unchanged when no subgroup size
++ * was required and nothing observes the subgroup: no subgroup operation, subgroup id, subgroup count,
++ * subgroup size or invocation. */
++bool
++radv_bc250_mesh_wave64_promotable(const struct radv_shader_stage *stage)
++{
++   const nir_shader *nir = stage->nir;
++   if (!nir || nir->info.stage != MESA_SHADER_MESH || nir->info.min_subgroup_size != 32 ||
++       nir->info.max_subgroup_size != 32 || stage->key.subgroup_required_size)
++      return false;
++   nir_foreach_function_impl(impl, nir) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++            const nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
++            if (in->intrinsic == nir_intrinsic_load_subgroup_id || in->intrinsic == nir_intrinsic_load_num_subgroups ||
++                bc250_merge_is_subgroup_op(in))
++               return false;
++         }
++      }
++   }
++   return true;
++}
++
++void
++radv_bc250_mesh_set_wave(nir_shader *nir, unsigned wave)
++{
++   nir->info.min_subgroup_size = wave;
++   nir->info.max_subgroup_size = wave;
++   nir->info.api_subgroup_size = wave;
 +}
 +
 +/* The outermost array deref of an output store, or NULL when the path is not
@@ -6364,8 +6484,9 @@ index 0000000..f94e498
 +   const unsigned vertices = corners * mesh->info.mesh.max_primitives_out;
 +   const unsigned threads = mesh->info.workgroup_size[0] * mesh->info.workgroup_size[1] *
 +                            mesh->info.workgroup_size[2];
++   const unsigned attribute_copies = radv_bc250_owned_lds_direct ? 0 : 16 * slots * vertices;
 +   return vertices == mesh->info.mesh.max_vertices_out && vertices <= ((corners == 3 || last) ? 256 : 32) && threads <= 256 &&
-+      align(mesh->info.shared_size, 16) + 128 + 16 * slots * vertices +
++      align(mesh->info.shared_size, 16) + 128 + attribute_copies +
 +         3 * mesh->info.mesh.max_primitives_out < 30 * 1024;
 +}
 +
@@ -6820,6 +6941,30 @@ index 0000000..f94e498
 +}
 +
 +__thread bool radv_bc250_split_refused_retry;
++__thread bool radv_bc250_split_piece_primid;
++__thread bool radv_bc250_split_task_grid_fold;
++__thread bool radv_bc250_owned_lds_direct;
++
++/* RADV_BC250_MESH_PIECE_PRIMID: the Mesh shader writes PrimitiveId as one scalar 32-bit integer per
++ * primitive. The split slices it like any other per-primitive output, so each piece exports the value
++ * the application wrote. */
++static bool
++bc250_split_primid_sliceable(const nir_shader *mesh)
++{
++   if (!(mesh->info.outputs_written & mesh->info.per_primitive_outputs & VARYING_BIT_PRIMITIVE_ID))
++      return false;
++   unsigned found = 0;
++   nir_foreach_shader_out_variable(var, mesh) {
++      if (var->data.location != VARYING_SLOT_PRIMITIVE_ID)
++         continue;
++      const struct glsl_type *elem = glsl_type_is_array(var->type) ? glsl_get_array_element(var->type) : NULL;
++      if (!var->data.per_primitive || !elem || !glsl_type_is_scalar(elem) || !glsl_type_is_32bit(elem) ||
++          !glsl_type_is_integer(elem) || glsl_get_length(var->type) != mesh->info.mesh.max_primitives_out)
++         return false;
++      found++;
++   }
++   return found == 1;
++}
 +
 +bool
 +radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool direct_split, bool piece_select,
@@ -6859,7 +7004,14 @@ index 0000000..f94e498
 +   if (!topo_ok || mesh->info.mesh.nv ||
 +       mesh->info.mesh.max_primitives_out > 256 || pieces < 1 || pieces > 5 || (!fs && !split_any))
 +      return bc250_split_reject("topology/capacity/stage");
-+   if (fs && fs->info.inputs_read & (VARYING_BIT_PRIMITIVE_ID | VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT))
++   uint64_t primitive_inputs = VARYING_BIT_PRIMITIVE_ID | VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT;
++   if (radv_bc250_split_piece_primid && direct_split && !task && fs &&
++       (fs->info.inputs_read & VARYING_BIT_PRIMITIVE_ID) && bc250_split_primid_sliceable(mesh)) {
++      primitive_inputs &= ~VARYING_BIT_PRIMITIVE_ID;
++      if (getenv("BC250_TRACE_COMPILE"))
++         fprintf(stderr, "BC250 MESH PIECE PRIMID: written PrimitiveId sliced with the pieces\n");
++   }
++   if (fs && fs->info.inputs_read & primitive_inputs)
 +      return bc250_split_reject("fragment primitive system input");
 +
 +   /* SPIR-V PrimitiveId inputs are system values, not ordinary varyings. */
@@ -6994,6 +7146,10 @@ index 0000000..f94e498
 +    */
 +   if (!task && ((!direct_split && pieces != 1) || mesh->info.task_payload_size))
 +      return bc250_split_reject("mesh-only amplification/payload unsupported");
++   /* RADV_BC250_TASK_GRID_FOLD: per pipeline, the Mesh records are (pieces, x, y) instead of
++    * (x * pieces, y, z), so a launch count without a compile-time bound needs only the API bound
++    * x <= 65535. The flat launch order is unchanged. */
++   bool fold = false;
 +   if (task) {
 +      struct hash_table *ranges = _mesa_pointer_hash_table_create(NULL);
 +      bool launch_ok = true, has_launch = false;
@@ -7024,7 +7180,13 @@ index 0000000..f94e498
 +                     launch_ok &= nir_scalar_is_const(dim) && nir_scalar_as_uint(dim) == 1;
 +               }
 +               uint32_t upper = nir_unsigned_upper_bound(task, ranges, nir_scalar_chase_movs(nir_get_scalar(in->src[0].ssa, 0)));
-+               launch_ok &= upper <= 65535 / pieces;
++               const bool x_ok = upper <= 65535 / pieces;
++               nir_scalar zs = nir_scalar_chase_movs(nir_get_scalar(in->src[0].ssa, 2));
++               if (!x_ok && radv_bc250_split_task_grid_fold && !direct_split &&
++                   nir_scalar_is_const(zs) && nir_scalar_as_uint(zs) == 1)
++                  fold = true;
++               else
++                  launch_ok &= x_ok;
 +            }
 +         }
 +      }
@@ -7033,6 +7195,8 @@ index 0000000..f94e498
 +         nir_print_shader(task, stderr);
 +         return bc250_split_reject("unproven task grid bound");
 +      }
++      if (fold && getenv("BC250_TRACE_COMPILE"))
++         fprintf(stderr, "BC250 TASK GRID FOLD: pieces=%u records=(pieces,x,y) x_bound=api65535\n", pieces);
 +
 +   }
 +
@@ -7065,6 +7229,9 @@ index 0000000..f94e498
 +               nir_def *stride = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 16), .range = 4);
 +               nir_def *offset = nir_imul(&b, nir_u2u64(&b, nir_load_draw_id(&b)), nir_u2u64(&b, stride));
 +               grid = nir_load_global(&b, 3, 32, nir_iadd(&b, input, offset), .align_mul = 4);
++            } else if (fold) {
++               nir_def *raw = nir_load_num_workgroups(&b);
++               grid = nir_vec3(&b, nir_channel(&b, raw, 1), nir_channel(&b, raw, 2), nir_imm_int(&b, 1));
 +            } else {
 +               nir_def *raw = nir_load_num_workgroups(&b);
 +               grid = nir_vec3(&b, nir_udiv_imm(&b, nir_channel(&b, raw, 0), pieces),
@@ -7092,6 +7259,12 @@ index 0000000..f94e498
 +            nir_def *rest = nir_isub(&b, linear, nir_imul(&b, zid, xy));
 +            nir_def *yid = nir_udiv(&b, rest, x);
 +            id = nir_vec3(&b, nir_isub(&b, rest, nir_imul(&b, yid, x)), yid, zid);
++         } else if (fold) {
++            /* Record (pieces, X, Y): flat index L = piece + pieces * (x + X * y). */
++            nir_def *a = nir_udiv_imm(&b, nir_load_workgroup_index(&b), pieces);
++            nir_def *X = nir_channel(&b, nir_load_num_workgroups(&b), 1);
++            nir_def *ay = nir_udiv(&b, a, X);
++            id = nir_vec3(&b, nir_isub(&b, a, nir_imul(&b, ay, X)), ay, nir_imm_int(&b, 0));
 +         } else {
 +            nir_def *raw = nir_load_workgroup_id(&b);
 +            id = nir_vec3(&b, nir_udiv_imm(&b, nir_channel(&b, raw, 0), pieces),
@@ -7134,6 +7307,7 @@ index 0000000..f94e498
 +      nir_variable_create(mesh, nir_var_mem_shared, glsl_uint_type(), "bc250_split_vertex_count") : NULL;
 +   b.cursor = nir_before_cf_list(&impl->body);
 +   nir_def *raw_x = direct_split ? bc250_split_flat_index(&b, pieces, piece_select) :
++                    fold ? nir_load_workgroup_index(&b) :
 +                                   nir_channel(&b, nir_load_workgroup_id(&b), 0);
 +   nir_def *base = nir_imul_imm(&b, nir_umod_imm(&b, raw_x, pieces), limit);
 +   nir_def *lane = nir_load_local_invocation_index(&b);
@@ -7422,6 +7596,15 @@ index 0000000..f94e498
 +               nir_def *old = in->src[0].ssa;
 +               nir_def *dims = nir_vec3(&tb, nir_imul_imm(&tb, nir_channel(&tb, old, 0), pieces),
 +                                        nir_channel(&tb, old, 1), nir_channel(&tb, old, 2));
++               if (fold) {
++                  /* API: x <= 65535 and x * y <= 2^22. An out-of-spec launch is dropped, never clamped. */
++                  nir_def *x = nir_channel(&tb, old, 0), *y = nir_channel(&tb, old, 1);
++                  nir_def *total = nir_imul(&tb, nir_u2u64(&tb, x), nir_u2u64(&tb, y));
++                  nir_def *valid = nir_iand(&tb, nir_ult_imm(&tb, x, 65536), nir_ule_imm(&tb, total, 1u << 22));
++                  nir_def *empty = nir_ieq_imm(&tb, nir_channel(&tb, old, 2), 0);
++                  dims = nir_vec3(&tb, nir_imm_int(&tb, pieces),
++                                  nir_bcsel(&tb, nir_iand(&tb, valid, nir_inot(&tb, empty)), x, nir_imm_int(&tb, 0)), y);
++               }
 +               nir_src_rewrite(&in->src[0], dims);
 +            }
 +         }
@@ -8402,8 +8585,24 @@ index 0000000..f94e498
 +      nir_shader_gather_info(mesh, nir_shader_get_entrypoint(mesh));
 +   }
 +   mesh->info.mesh.max_primitives_out = 64;
-+   const bool plain = original->info.min_subgroup_size == 64 &&
++   /* RADV_BC250_MESH_SAFE_PIECES_EXT: a subgroup-free wave32 shader takes the wave64 pieces, and
++    * CullPrimitive, which the split consumes (surviving triangles are compacted), does not block the
++    * shared-vertex check of the unsplit clone; the check after the split still applies. */
++   const bool pieces_ext = device->compiler_info.bc250x.safe_pieces_ext && !owned_corners;
++   const bool wave64_promote = pieces_ext && radv_bc250_mesh_wave64_promotable(ms);
++   if (wave64_promote)
++      radv_bc250_mesh_set_wave(mesh, 64);
++   const uint64_t cull_bit = pieces_ext ? (mesh->info.per_primitive_outputs & VARYING_BIT_CULL_PRIMITIVE) : 0;
++   const uint64_t saved_pp = mesh->info.per_primitive_outputs, saved_written = mesh->info.outputs_written;
++   mesh->info.per_primitive_outputs &= ~cull_bit;
++   mesh->info.outputs_written &= ~cull_bit;
++   const bool plain = (original->info.min_subgroup_size == 64 || wave64_promote) &&
 +                      bc250_safe_direct_candidate(mesh, true, 16, false);
++   mesh->info.per_primitive_outputs = saved_pp;
++   mesh->info.outputs_written = saved_written;
++   if (getenv("BC250_TRACE_COMPILE") && (wave64_promote || cull_bit))
++      fprintf(stderr, "BC250 MESH SAFE PIECES EXT: wave64=%u cull_primitive=%u plain=%u\n",
++              wave64_promote, cull_bit != 0, plain);
 +   const bool ordinary_piece = device->compiler_info.key.bc250_mesh_safe_bary_last &&
 +                               original->info.min_subgroup_size == 32 && owned_corners;
 +   mesh->info.mesh.max_primitives_out = original_p;
@@ -8416,9 +8615,13 @@ index 0000000..f94e498
 +   }
 +   uint32_t staged[4] = {0};
 +   uint64_t payload = 0;
-+   if ((!plain && !owned_corners) || !radv_bc250_split_mesh(mesh, NULL, fragment, true, false, true, false,
-+                                        device->compiler_info.key.bc250_output_regions, true, 64,
-+                                        ms->bc250_fit_min_pieces, &pieces) ||
++   radv_bc250_split_piece_primid = device->compiler_info.hw.bc250_mesh_piece_primid && owned_corners;
++   const bool piece_split = (plain || owned_corners) &&
++      radv_bc250_split_mesh(mesh, NULL, fragment, true, false, true, false,
++                            device->compiler_info.key.bc250_output_regions, true, 64,
++                            ms->bc250_fit_min_pieces, &pieces);
++   radv_bc250_split_piece_primid = false;
++   if (!piece_split ||
 +       pieces < 2 || (owned_corners ?
 +          !radv_bc250_mesh_safe_owned(&mesh, &fragment, true, bary, ordinary_piece, ordinary_piece,
 +             device->compiler_info.key.bc250_bary_io16, ordinary_piece,
@@ -9017,9 +9220,12 @@ index 0000000..f94e498
 +         radv_bc250_mesh_culldist_split(&device->compiler_info, mesh)) ||
 +        stages[MESA_SHADER_MESH].bc250_fit_min_pieces > 1)) {
 +      unsigned pieces = 0;
-+      if (!device->compiler_info.key.bc250_expand_primitives ||
-+          !radv_bc250_split_mesh(mesh, task, stages[MESA_SHADER_FRAGMENT].nir, false, false, device->compiler_info.key.bc250_balanced_slices, device->compiler_info.key.bc250_parallel_cull, device->compiler_info.key.bc250_output_regions,
-+                                 device->compiler_info.key.bc250_mesh_compact_lds, device->compiler_info.key.bc250_piece_prims, stages[MESA_SHADER_MESH].bc250_fit_min_pieces, &pieces))
++      radv_bc250_split_task_grid_fold = device->compiler_info.bc250x.task_grid_fold;
++      const bool split_ok = device->compiler_info.key.bc250_expand_primitives &&
++          radv_bc250_split_mesh(mesh, task, stages[MESA_SHADER_FRAGMENT].nir, false, false, device->compiler_info.key.bc250_balanced_slices, device->compiler_info.key.bc250_parallel_cull, device->compiler_info.key.bc250_output_regions,
++                                 device->compiler_info.key.bc250_mesh_compact_lds, device->compiler_info.key.bc250_piece_prims, stages[MESA_SHADER_MESH].bc250_fit_min_pieces, &pieces);
++      radv_bc250_split_task_grid_fold = false;
++      if (!split_ok)
 +         return VK_ERROR_FEATURE_NOT_PRESENT;
 +      stages[MESA_SHADER_MESH].bc250_split_mesh = true;
 +      stages[MESA_SHADER_MESH].bc250_split_pieces = pieces;
@@ -10271,6 +10477,13 @@ index 0000000..f94e498
 +      {"RADV_BC250_MESH_ALLOW_POS1", "1"}, {"RADV_BC250_MESH_SPLIT_ANY", "1"},
 +      {"RADV_BC250_MESH_NESTED_SLICE", "1"}, {"RADV_BC250_MESH_SAFE_SPLIT_PIECES", "1"},
 +      {"RADV_BC250_MESH_SAFE_ADAPTIVE", "1"},
++      /* Never the raw route: a Mesh pipeline without a protected route is refused. */
++      {"RADV_BC250_MESH_FAIL_CLOSED", "1"},
++      /* More shapes admitted to the safe routes (gates PP1, TG1, PX1). */
++      {"RADV_BC250_MESH_DEAD_PAYLOAD", "1"}, {"RADV_BC250_MESH_PIECE_PRIMID", "1"},
++      {"RADV_BC250_MESH_SAFE_PIECES_EXT", "1"}, {"RADV_BC250_TASK_GRID_FOLD", "1"},
++      /* Renumbered referenced vertices after culling instead of private corners (gate CM1). */
++      {"RADV_BC250_MESH_SAFE_COMPACT", "1"},
 +   };
 +   for (unsigned i = 0; i < ARRAY_SIZE(settings); i++)
 +      setenv(settings[i][0], settings[i][1], 0);
@@ -10286,10 +10499,10 @@ index 0000000..f94e498
 +}
 diff --git a/src/amd/vulkan/radv_bc250.h b/src/amd/vulkan/radv_bc250.h
 new file mode 100644
-index 0000000..fa8d62c
+index 0000000..253c3a1
 --- /dev/null
 +++ b/src/amd/vulkan/radv_bc250.h
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,163 @@
 +/* SPDX-License-Identifier: MIT */
 +#ifndef RADV_BC250_H
 +#define RADV_BC250_H
@@ -10417,6 +10630,18 @@ index 0000000..fa8d62c
 +/* Set only while radv_graphics_pipeline_init retries a pipeline every other route refused
 + * (RADV_BC250_MESH_SPLIT_ANY): Mesh-only lines/points may then split. */
 +extern __thread bool radv_bc250_split_refused_retry;
++struct radv_shader_stage;
++bool radv_bc250_mesh_wave64_promotable(const struct radv_shader_stage *stage);
++struct nir_shader;
++void radv_bc250_mesh_set_wave(struct nir_shader *nir, unsigned wave);
++/* RADV_BC250_MESH_PIECE_PRIMID: set only around the safe direct pieces split. */
++extern __thread bool radv_bc250_split_piece_primid;
++/* RADV_BC250_MESH_SAFE_PIECES_EXT: set only around the owned admission of a split piece with every
++ * direct-read part on. The private-corner LDS estimate then leaves out the per-vertex attribute copies
++ * (read directly at export); an actual overflow still spills to the scratch ring and is refused. */
++extern __thread bool radv_bc250_owned_lds_direct;
++/* RADV_BC250_TASK_GRID_FOLD: set only around the Task-route split. */
++extern __thread bool radv_bc250_split_task_grid_fold;
 +void radv_bc250_directmesh_env(void);
 +bool radv_bc250_bary_cid_slot(const struct nir_shader *producer, const struct nir_shader *fs, int *slot);
 +bool radv_bc250_split_mesh(struct nir_shader *mesh, struct nir_shader *task, struct nir_shader *fs, bool direct_split,
@@ -13007,7 +13232,7 @@ index 1781807..3e318e1 100644
 +
  #endif /* RADV_CMD_BUFFER_H */
 diff --git a/src/amd/vulkan/radv_device.c b/src/amd/vulkan/radv_device.c
-index 6d023d3..1d8cfa0 100644
+index 6d023d3..a56b1f8 100644
 --- a/src/amd/vulkan/radv_device.c
 +++ b/src/amd/vulkan/radv_device.c
 @@ -8,8 +8,10 @@
@@ -13038,9 +13263,15 @@ index 6d023d3..1d8cfa0 100644
  
     uint32_t ptr_size = sizeof(void *);
  
-@@ -908,6 +911,13 @@ radv_device_init_cache_key(struct radv_device *device)
+@@ -907,7 +910,19 @@ radv_device_init_cache_key(struct radv_device *device)
+    _mesa_blake3_update(&ctx, device->compiler_info.ac, sizeof(struct ac_compiler_info));
     _mesa_blake3_update(&ctx, &device->compiler_info.hw, sizeof(device->compiler_info.hw));
     _mesa_blake3_update(&ctx, &device->compiler_info.key, sizeof(device->compiler_info.key));
++   STATIC_ASSERT(sizeof(device->compiler_info.bc250x) == 4);
++   uint32_t bc250x;
++   memcpy(&bc250x, &device->compiler_info.bc250x, sizeof(bc250x));
++   if (bc250x)
++      _mesa_blake3_update(&ctx, &bc250x, sizeof(bc250x));
     _mesa_blake3_final(&ctx, device->cache_hash);
 +   if (debug_get_bool_option("BC250_CAPTURE_POLICY_SHADERS", false)) {
 +      fprintf(stderr, "BC250POLICYCACHE cu=%u hash=", device->compiler_info.key.bc250_compute_cu_mode);
@@ -13052,7 +13283,7 @@ index 6d023d3..1d8cfa0 100644
  }
  
  static void
-@@ -1130,6 +1140,37 @@ radv_device_is_cache_disabled(const struct radv_device *device)
+@@ -1130,6 +1145,37 @@ radv_device_is_cache_disabled(const struct radv_device *device)
     return false;
  }
  
@@ -13090,7 +13321,7 @@ index 6d023d3..1d8cfa0 100644
  static void
  radv_device_init_compiler_info(struct radv_device *device)
  {
-@@ -1163,7 +1204,8 @@ radv_device_init_compiler_info(struct radv_device *device)
+@@ -1163,7 +1209,8 @@ radv_device_init_compiler_info(struct radv_device *device)
     }
  
     bool image_2d_view_of_3d = device->vk.enabled_features.image2DViewOf3D && pdev->info.gfx_level == GFX9;
@@ -13100,7 +13331,7 @@ index 6d023d3..1d8cfa0 100644
     bool primitives_generated_query = radv_uses_primitives_generated_query(device);
  
     /* The Vulkan spec says:
-@@ -1179,6 +1221,8 @@ radv_device_init_compiler_info(struct radv_device *device)
+@@ -1179,6 +1226,8 @@ radv_device_init_compiler_info(struct radv_device *device)
        primitives_generated_query = true;
     }
  
@@ -13109,7 +13340,7 @@ index 6d023d3..1d8cfa0 100644
     struct radv_compiler_info info = {
        /* Hardware info */
        .ac = &pdev->info.compiler_info,
-@@ -1188,6 +1232,21 @@ radv_device_init_compiler_info(struct radv_device *device)
+@@ -1188,6 +1237,29 @@ radv_device_init_compiler_info(struct radv_device *device)
              .instr_prefetch_distance = pdev->info.instr_prefetch_distance,
              .address_prt_wa_control_bit = pdev->info.address_prt_wa_control_bit,
              .rbplus_allowed = pdev->info.rbplus_allowed,
@@ -13128,10 +13359,18 @@ index 6d023d3..1d8cfa0 100644
 +            /* On by default: exact barrier total for waves without API invocations (radv_shader.h). */
 +            .bc250_mesh_wave_sync = pdev->bc250_native_mesh &&
 +               debug_get_bool_option("RADV_BC250_MESH_WAVE_SYNC", true),
++            .bc250_mesh_safe_compact = pdev->bc250_native_mesh && pdev->info.family == CHIP_GFX1013 &&
++               debug_get_bool_option("RADV_BC250_MESH_SAFE_COMPACT", false),
++            .bc250_mesh_dead_payload = pdev->bc250_native_mesh && pdev->info.family == CHIP_GFX1013 &&
++               debug_get_bool_option("RADV_BC250_MESH_DEAD_PAYLOAD", false),
++            .bc250_mesh_piece_primid = pdev->bc250_native_mesh && pdev->info.family == CHIP_GFX1013 &&
++               debug_get_bool_option("RADV_BC250_MESH_PIECE_PRIMID", false),
++            .bc250_mesh_fail_closed = pdev->bc250_native_mesh && pdev->info.family == CHIP_GFX1013 &&
++               debug_get_bool_option("RADV_BC250_MESH_FAIL_CLOSED", false),
           },
        /* Misc values included as part of the cache key */
        .key =
-@@ -1199,6 +1258,174 @@ radv_device_init_compiler_info(struct radv_device *device)
+@@ -1199,6 +1271,174 @@ radv_device_init_compiler_info(struct radv_device *device)
              .nggc_max_ps_params = nggc_max_ps_params,
              .no_ngg_gs = instance->drirc.performance.disable_ngg_gs,
              .load_grid_size_from_user_sgpr = pdev->load_grid_size_from_user_sgpr,
@@ -13306,7 +13545,7 @@ index 6d023d3..1d8cfa0 100644
              .emulate_ngg_gs_query_pipeline_stat = pdev->emulate_ngg_gs_query_pipeline_stat,
              .primitives_generated_query = primitives_generated_query,
              .mesh_shader_queries = mesh_shader_queries,
-@@ -1238,6 +1465,12 @@ radv_device_init_compiler_info(struct radv_device *device)
+@@ -1238,6 +1478,12 @@ radv_device_init_compiler_info(struct radv_device *device)
              .ps_wave_size = pdev->ps_wave_size,
              .cs_wave_size = pdev->cs_wave_size,
              .rt_wave_size = pdev->rt_wave_size,
@@ -13319,7 +13558,18 @@ index 6d023d3..1d8cfa0 100644
           },
        /* Debug/tracing */
        .debug =
-@@ -1329,7 +1562,10 @@ radv_create_winsys(struct radv_device *device)
+@@ -1297,6 +1543,10 @@ radv_device_init_compiler_info(struct radv_device *device)
+ 
+    radv_get_nir_options(&info);
+ 
++   const bool bc250_mesh = pdev->bc250_native_mesh && pdev->info.family == CHIP_GFX1013;
++   info.bc250x.task_grid_fold = bc250_mesh && debug_get_bool_option("RADV_BC250_TASK_GRID_FOLD", false);
++   info.bc250x.safe_pieces_ext = bc250_mesh && debug_get_bool_option("RADV_BC250_MESH_SAFE_PIECES_EXT", false);
++
+    device->compiler_info = info;
+ }
+ 
+@@ -1329,7 +1579,10 @@ radv_create_winsys(struct radv_device *device)
     const bool is_virtio =
        pdev->drm_device_type == RADV_DRM_DEVICE_AMDGPU_VPIPE || pdev->drm_device_type == RADV_DRM_DEVICE_VIRTIO;
  
@@ -13331,7 +13581,7 @@ index 6d023d3..1d8cfa0 100644
                                        &device->ws);
  
     if (fd != -1)
-@@ -1342,6 +1578,13 @@ radv_create_winsys(struct radv_device *device)
+@@ -1342,6 +1595,13 @@ radv_create_winsys(struct radv_device *device)
  static void
  radv_destroy_device(struct radv_device *device, const VkAllocationCallbacks *pAllocator)
  {
@@ -13345,7 +13595,7 @@ index 6d023d3..1d8cfa0 100644
     radv_device_finish_utrace(device);
     radv_device_finish_perf_counter(device);
  
-@@ -1409,6 +1652,57 @@ radv_destroy_device(struct radv_device *device, const VkAllocationCallbacks *pAl
+@@ -1409,6 +1669,57 @@ radv_destroy_device(struct radv_device *device, const VkAllocationCallbacks *pAl
     vk_free(&device->vk.alloc, device);
  }
  
@@ -13403,7 +13653,7 @@ index 6d023d3..1d8cfa0 100644
  VKAPI_ATTR VkResult VKAPI_CALL
  radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCreateInfo,
                    const VkAllocationCallbacks *pAllocator, VkDevice *pDevice)
-@@ -1443,6 +1737,9 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
+@@ -1443,6 +1754,9 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
        return result;
     }
  
@@ -13413,7 +13663,7 @@ index 6d023d3..1d8cfa0 100644
     result = radv_create_winsys(device);
     if (result != VK_SUCCESS)
        goto fail;
-@@ -1526,11 +1823,13 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
+@@ -1526,11 +1840,13 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
     bool video_enc_queue = false;
  
     /* Create one context per queue priority. */
@@ -13428,7 +13678,7 @@ index 6d023d3..1d8cfa0 100644
        enum radv_queue_family qf = vk_queue_to_radv(pdev, queue_create->queueFamilyIndex);
  
        if (qf == RADV_QUEUE_VIDEO_DEC)
-@@ -1542,8 +1841,22 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
+@@ -1542,8 +1858,22 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
           continue;
  
        result = device->ws->ctx_create(device->ws, priority, &device->hw_ctx[priority]);
@@ -13451,7 +13701,7 @@ index 6d023d3..1d8cfa0 100644
     }
  
     /* Use extra context to allow use of both VCN instances for transcoding. */
-@@ -1692,6 +2005,12 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
+@@ -1692,6 +2022,12 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
        device->capture_replay_arena_vas = _mesa_hash_table_u64_create(NULL);
     }
  
@@ -14201,7 +14451,7 @@ index 5680d92..a34d0b1 100644
 +
  #endif /* RADV_PIPELINE_CACHE_H */
 diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipeline_graphics.c
-index 68813f9..3ce2986 100644
+index 68813f9..a4849a7 100644
 --- a/src/amd/vulkan/radv_pipeline_graphics.c
 +++ b/src/amd/vulkan/radv_pipeline_graphics.c
 @@ -10,6 +10,7 @@
@@ -14470,7 +14720,7 @@ index 68813f9..3ce2986 100644
     for (unsigned s = 0; s < MESA_VULKAN_SHADER_STAGES; s++) {
        if (stages[s].stage == MESA_SHADER_NONE)
           continue;
-@@ -2452,20 +2644,347 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
+@@ -2452,20 +2644,388 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
              .lower_view_index_to_zero = !gfx_state->has_multiview_view_index,
              .lower_view_index_to_device_index = stages[s].key.view_index_from_device_index,
           };
@@ -14541,7 +14791,11 @@ index 68813f9..3ce2986 100644
 +       (radv_bc250_mesh_has_per_primitive_data(owned_ms->nir) ||
 +        (owned_ms->nir->info.outputs_written & (RADV_BC250_CLIPCULL_OUTPUTS | VARYING_BIT_CULL_PRIMITIVE)))) ||
 +       owned_ms->nir->info.mesh.primitive_type != MESA_PRIM_TRIANGLES ||
-+       owned_ms->nir->info.mesh.max_primitives_out > 85) &&
++       owned_ms->nir->info.mesh.max_primitives_out > 85 ||
++       /* RADV_BC250_MESH_SAFE_PIECES_EXT: every split piece (Task pieces included) takes the
++        * private-corner export, not only pieces with barycentrics or per-primitive data. */
++       (compiler_info->bc250x.safe_pieces_ext && compiler_info->key.bc250_mesh_safe_bary_last &&
++        owned_ms->bc250_split_mesh && debug_get_bool_option("RADV_BC250_MESH_SAFE_SPLIT_PIECES", false))) &&
 +      owned_ms->nir->info.mesh.max_vertices_out <= 256;
 +   /* RADV_BC250_MESH_SAFE_SPLIT_PIECES (default 0): every split piece (Task replay or the direct
 +    * Mesh-only split) is its own workgroup exporting its own slice, like the one-piece case, so it
@@ -14549,6 +14803,17 @@ index 68813f9..3ce2986 100644
 +   const bool safe_split_pieces = debug_get_bool_option("RADV_BC250_MESH_SAFE_SPLIT_PIECES", false) &&
 +      compiler_info->key.bc250_mesh_safe_bary_last && tiny_bary && owned_ms->bc250_split_mesh;
 +   const bool no_fs_ok = safe_split_pieces && !stages[MESA_SHADER_FRAGMENT].nir;
++   /* RADV_BC250_MESH_SAFE_PIECES_EXT: an unsplit subgroup-free wave32 Mesh shader with 33..64 primitives
++    * (above the wave32 owned capacity) tries the owned route in wave64; if it is not admitted it keeps
++    * wave32 and its route. */
++   bool owned_wave64 = false;
++   if (compiler_info->bc250x.safe_pieces_ext && owned_ms->nir && !owned_ms->bc250_split_mesh &&
++       !owned_ms->bc250_safe_fast && !owned_ms->bc250_safe_owned &&
++       owned_ms->nir->info.mesh.max_primitives_out > 32 && owned_ms->nir->info.mesh.max_primitives_out <= 64 &&
++       radv_bc250_mesh_wave64_promotable(owned_ms)) {
++      radv_bc250_mesh_set_wave(owned_ms->nir, 64);
++      owned_wave64 = true;
++   }
 +   if (compiler_info->key.bc250_mesh_safe_owned && !retained_shaders &&
 +       (private_bary || no_fs_ok || !radv_bc250_mesh_fs_refused(compiler_info, stages[MESA_SHADER_FRAGMENT].nir)) &&
 +       (!owned_ms->bc250_split_mesh || safe_split_pieces ||
@@ -14567,13 +14832,18 @@ index 68813f9..3ce2986 100644
 +                                            !gfx_state->rs.provoking_vtx_last))))
 +            break;
 +         const bool use_tiny = tiny_bary && !attempt;
-+         if (!radv_bc250_mesh_safe_owned(&owned_ms->nir, &stages[MESA_SHADER_FRAGMENT].nir,
++         radv_bc250_owned_lds_direct = compiler_info->bc250x.safe_pieces_ext && use_tiny &&
++            owned_ms->bc250_split_mesh &&
++            (compiler_info->key.bc250_mesh_direct_read & RADV_BC250_DIRECT_READ_ALL) == RADV_BC250_DIRECT_READ_ALL;
++         const bool owned_ok = radv_bc250_mesh_safe_owned(&owned_ms->nir, &stages[MESA_SHADER_FRAGMENT].nir,
 +                                        compiler_info->key.bc250_mesh_safe_corners,
 +                                        private_bary, use_tiny, compiler_info->key.bc250_mesh_safe_bary_last,
 +                                        compiler_info->key.bc250_bary_io16, safe_split_pieces,
 +                                        compiler_info->key.mesh_shader_queries,
 +                                        compiler_info->key.bc250_mesh_direct_read & RADV_BC250_DIRECT_READ_ALL,
-+                                        owned_ms->bc250_index_staging, &owned_ms->bc250_pp_locations))
++                                        owned_ms->bc250_index_staging, &owned_ms->bc250_pp_locations);
++         radv_bc250_owned_lds_direct = false;
++         if (!owned_ok)
 +            continue;
 +         owned_ms->bc250_safe_owned = true;
 +         owned_ms->bc250_safe_bary_tiny = use_tiny;
@@ -14592,6 +14862,12 @@ index 68813f9..3ce2986 100644
 +                    3 * owned_ms->nir->info.mesh.max_primitives_out, owned_ms->bc250_task_replay);
 +         break;
 +      }
++   }
++   if (owned_wave64) {
++      if (!owned_ms->bc250_safe_owned)
++         radv_bc250_mesh_set_wave(owned_ms->nir, 32);
++      else if (getenv("BC250_TRACE_COMPILE"))
++         fprintf(stderr, "BC250 MESH SAFE PIECES EXT: owned route in wave64\n");
 +   }
 +
 +   const bool bc250_merge_clipcull = stages[MESA_SHADER_MESH].nir && !compiler_info->hw.bc250_mesh_allow_pos1 &&
@@ -14749,6 +15025,21 @@ index 68813f9..3ce2986 100644
 +      }
 +   }
 +
++   /* RADV_BC250_MESH_FAIL_CLOSED: every protected route has been decided by now. A Mesh shader on
++    * none of them would draw the API connectivity unchecked (the route the hang rules forbid):
++    * refuse it. The refused-pipeline retry may still split it; otherwise pipeline creation fails. */
++   if (compiler_info->hw.bc250_mesh_fail_closed && stages[MESA_SHADER_MESH].nir &&
++       !stages[MESA_SHADER_MESH].bc250_safe_direct && !stages[MESA_SHADER_MESH].bc250_ordered_export &&
++       !stages[MESA_SHADER_MESH].bc250_split_mesh && !stages[MESA_SHADER_MESH].bc250_expanded &&
++       stages[MESA_SHADER_MESH].bc250_merge_k <= 1) {
++      if (getenv("BC250_TRACE_COMPILE"))
++         fprintf(stderr, "BC250 MESH FAIL CLOSED: no protected route (V=%u P=%u prim=%u), refused\n",
++                 stages[MESA_SHADER_MESH].nir->info.mesh.max_vertices_out,
++                 stages[MESA_SHADER_MESH].nir->info.mesh.max_primitives_out,
++                 stages[MESA_SHADER_MESH].nir->info.mesh.primitive_type);
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++   }
++
 +   /* RADV_BC250_MESH_AMD size and reuse parts: they apply to AMD-route Mesh
 +    * shaders and, switched on alone, to the other native mesh-only shaders
 +    * that the base driver did not split (expanded or not), with T taken from the final
@@ -14827,7 +15118,7 @@ index 68813f9..3ce2986 100644
     }
  
     if (retained_shaders) {
-@@ -2508,6 +3027,37 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
+@@ -2508,6 +3068,37 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
  
        radv_nir_shader_info_init(i, next_stage, &stages[i].info);
     }
@@ -14865,7 +15156,7 @@ index 68813f9..3ce2986 100644
  
     /* Determine if shaders uses NGG before linking because it's needed for some NIR pass. */
     radv_fill_shader_info_ngg(compiler_info, stages, active_nir_stages);
-@@ -2534,7 +3084,7 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
+@@ -2534,7 +3125,7 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
        unsigned num_raster_vertices_per_prim = radv_get_num_raster_vertices_per_prim(stages, gfx_state);
  
        NIR_PASS(_, stages[MESA_SHADER_FRAGMENT].nir, radv_nir_lower_fs_barycentric, gfx_state,
@@ -14874,7 +15165,7 @@ index 68813f9..3ce2986 100644
  
        /* frag_depth = gl_FragCoord.z broadcasts to all samples of the fragment shader invocation,
         * so only optimize it away if we know there is only one sample per invocation.
-@@ -2562,7 +3112,15 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
+@@ -2562,7 +3153,15 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
               */
              if (var->data.location == VARYING_SLOT_PRIMITIVE_ID || var->data.location == VARYING_SLOT_VIEWPORT ||
                  var->data.location == VARYING_SLOT_LAYER) {
@@ -14891,7 +15182,7 @@ index 68813f9..3ce2986 100644
              }
           }
        }
-@@ -2673,6 +3231,10 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
+@@ -2673,6 +3272,10 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
     /* Optimize varyings on lowered shader I/O (more efficient than optimizing I/O derefs). */
     radv_graphics_shaders_link_varyings(stages, compiler_info->ac->gfx_level);
  
@@ -14902,7 +15193,7 @@ index 68813f9..3ce2986 100644
     /* Optimize constant clip/cull distance after linking to operate on scalar io in the last
      * pre raster stage.
      */
-@@ -2720,7 +3282,10 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
+@@ -2720,7 +3323,10 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
  
        struct radv_shader_stage *fs_stage = &stages[MESA_SHADER_FRAGMENT];
  
@@ -14914,7 +15205,7 @@ index 68813f9..3ce2986 100644
           stages[i].info.force_vrs_per_vertex = false;
  
           if (stages[i].info.outinfo.writes_primitive_shading_rate ||
-@@ -2748,6 +3313,32 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
+@@ -2748,6 +3354,32 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
        stages[i].feedback.duration += os_time_get_nano() - stage_start;
     }
  
@@ -14947,7 +15238,7 @@ index 68813f9..3ce2986 100644
     if (stages[MESA_SHADER_VERTEX].nir || stages[MESA_SHADER_TESS_EVAL].nir) {
        struct radv_shader_stage *es_stage =
           stages[MESA_SHADER_TESS_EVAL].nir ? &stages[MESA_SHADER_TESS_EVAL] : &stages[MESA_SHADER_VERTEX];
-@@ -2766,6 +3357,7 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
+@@ -2766,6 +3398,7 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
     /* Compile NIR shaders to AMD assembly. */
     radv_graphics_shaders_nir_to_asm(compiler_info, cache, stages, gfx_state, active_nir_stages, debug, binaries,
                                      gs_copy_debug, gs_copy_binary);
@@ -14955,7 +15246,7 @@ index 68813f9..3ce2986 100644
  }
  
  void
-@@ -2933,6 +3525,9 @@ radv_graphics_pipeline_compile(struct radv_graphics_pipeline *pipeline, const Vk
+@@ -2933,6 +3566,9 @@ radv_graphics_pipeline_compile(struct radv_graphics_pipeline *pipeline, const Vk
     struct radv_shader_binary *binaries[MESA_VULKAN_SHADER_STAGES] = {NULL};
     struct radv_shader_binary *gs_copy_binary = NULL;
     bool skip_shaders_cache = radv_pipeline_skip_shaders_cache(device, &pipeline->base);
@@ -14965,7 +15256,7 @@ index 68813f9..3ce2986 100644
     struct radv_shader_stage *stages = gfx_state->stages;
     const VkPipelineCreationFeedbackCreateInfo *creation_feedback =
        vk_find_struct_const(pCreateInfo->pNext, PIPELINE_CREATION_FEEDBACK_CREATE_INFO);
-@@ -2969,9 +3564,32 @@ radv_graphics_pipeline_compile(struct radv_graphics_pipeline *pipeline, const Vk
+@@ -2969,9 +3605,32 @@ radv_graphics_pipeline_compile(struct radv_graphics_pipeline *pipeline, const Vk
        }
     }
  
@@ -15000,7 +15291,7 @@ index 68813f9..3ce2986 100644
        if (found_in_application_cache)
           pipeline_feedback.flags |= VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT;
  
-@@ -3007,12 +3625,19 @@ radv_graphics_pipeline_compile(struct radv_graphics_pipeline *pipeline, const Vk
+@@ -3007,12 +3666,19 @@ radv_graphics_pipeline_compile(struct radv_graphics_pipeline *pipeline, const Vk
        retained_shaders = &gfx_pipeline_lib->retained_shaders;
     }
  
@@ -15021,7 +15312,7 @@ index 68813f9..3ce2986 100644
     radv_graphics_shaders_create(device, cache, skip_shaders_cache, pipeline->base.shaders, binaries, debug,
                                  &pipeline->base.gs_copy_shader, gs_copy_binary, &gs_copy_debug);
  
-@@ -3101,6 +3726,7 @@ radv_get_vgt_shader_key(const struct radv_device *device, struct radv_shader **s
+@@ -3101,6 +3767,7 @@ radv_get_vgt_shader_key(const struct radv_device *device, struct radv_shader **s
     key.tess = !!shaders[MESA_SHADER_TESS_CTRL];
     key.gs = !!shaders[MESA_SHADER_GEOMETRY];
     key.mesh = !!shaders[MESA_SHADER_MESH];
@@ -15029,7 +15320,7 @@ index 68813f9..3ce2986 100644
     if (last_vgt_shader->info.is_ngg) {
        key.ngg = 1;
        key.ngg_passthrough = last_vgt_shader->info.is_ngg_passthrough;
-@@ -3213,6 +3839,107 @@ radv_graphics_pipeline_import_binaries(struct radv_device *device, struct radv_g
+@@ -3213,6 +3880,107 @@ radv_graphics_pipeline_import_binaries(struct radv_device *device, struct radv_g
     return VK_SUCCESS;
  }
  
@@ -15137,7 +15428,7 @@ index 68813f9..3ce2986 100644
  static VkResult
  radv_graphics_pipeline_init(struct radv_graphics_pipeline *pipeline, struct radv_device *device,
                              struct vk_pipeline_cache *cache, const VkGraphicsPipelineCreateInfo *pCreateInfo)
-@@ -3251,8 +3978,43 @@ radv_graphics_pipeline_init(struct radv_graphics_pipeline *pipeline, struct radv
+@@ -3251,8 +4019,43 @@ radv_graphics_pipeline_init(struct radv_graphics_pipeline *pipeline, struct radv
        result = radv_graphics_pipeline_import_binaries(device, pipeline, binary_info);
     } else {
        if (gfx_state.compilation_required) {
@@ -15181,7 +15472,7 @@ index 68813f9..3ce2986 100644
        }
     }
  
-@@ -3318,6 +4080,10 @@ radv_graphics_pipeline_create(VkDevice _device, VkPipelineCache _cache, const Vk
+@@ -3318,6 +4121,10 @@ radv_graphics_pipeline_create(VkDevice _device, VkPipelineCache _cache, const Vk
        return result;
     }
  
@@ -15192,7 +15483,7 @@ index 68813f9..3ce2986 100644
     radv_pipeline_report_pso_history(device, &pipeline->base);
  
     *pPipeline = radv_pipeline_to_handle(&pipeline->base);
-@@ -3328,6 +4094,12 @@ radv_graphics_pipeline_create(VkDevice _device, VkPipelineCache _cache, const Vk
+@@ -3328,6 +4135,12 @@ radv_graphics_pipeline_create(VkDevice _device, VkPipelineCache _cache, const Vk
  void
  radv_destroy_graphics_pipeline(struct radv_device *device, struct radv_graphics_pipeline *pipeline)
  {
@@ -15205,7 +15496,7 @@ index 68813f9..3ce2986 100644
     for (unsigned i = 0; i < MESA_VULKAN_SHADER_STAGES; ++i) {
        if (pipeline->base.shaders[i])
           radv_shader_unref(device, pipeline->base.shaders[i]);
-@@ -3430,6 +4202,9 @@ radv_graphics_lib_pipeline_create(VkDevice _device, VkPipelineCache _cache,
+@@ -3430,6 +4243,9 @@ radv_graphics_lib_pipeline_create(VkDevice _device, VkPipelineCache _cache,
        return result;
     }
  
@@ -15215,7 +15506,7 @@ index 68813f9..3ce2986 100644
     radv_pipeline_report_pso_history(device, &pipeline->base.base);
  
     *pPipeline = radv_pipeline_to_handle(&pipeline->base.base);
-@@ -3463,7 +4238,35 @@ radv_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache, ui
+@@ -3463,7 +4279,35 @@ radv_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache, ui
     VkResult result = VK_SUCCESS;
     unsigned i = 0;
  
@@ -15251,7 +15542,7 @@ index 68813f9..3ce2986 100644
        const VkPipelineCreateFlagBits2 create_flags = vk_graphics_pipeline_create_flags(&pCreateInfos[i]);
        VkResult r;
        if (create_flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) {
-@@ -3478,8 +4281,11 @@ radv_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache, ui
+@@ -3478,8 +4322,11 @@ radv_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache, ui
           if (create_flags & VK_PIPELINE_CREATE_2_EARLY_RETURN_ON_FAILURE_BIT)
              break;
        }
@@ -15836,7 +16127,7 @@ index 632f8c9..ef5e60d 100644
     enum amd_ip_type ip_type;
     int queue_index;
 diff --git a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
-index 32d6d61..e83a94a 100644
+index 32d6d61..be37d96 100644
 --- a/src/amd/vulkan/radv_shader.c
 +++ b/src/amd/vulkan/radv_shader.c
 @@ -9,6 +9,7 @@
@@ -15847,7 +16138,42 @@ index 32d6d61..e83a94a 100644
  #include "meta/radv_meta.h"
  #include "nir/nir.h"
  #include "nir/nir_builder.h"
-@@ -856,6 +857,21 @@ radv_shader_spirv_to_nir(const struct radv_compiler_info *compiler_info, struct
+@@ -836,6 +837,34 @@ radv_shader_spirv_to_nir(const struct radv_compiler_info *compiler_info, struct
+       if (nir->info.stage == MESA_SHADER_TASK || nir->info.stage == MESA_SHADER_MESH)
+          var_modes |= nir_var_mem_task_payload;
+ 
++      /* RADV_BC250_MESH_DEAD_PAYLOAD: with no access at all, the payload declaration has no effect.
++       * Dropping only some unused variables would move the others, so it is all or nothing. */
++      bool declared = false;
++      nir_foreach_variable_with_modes (var, nir, nir_var_mem_task_payload)
++         declared = true;
++      if (compiler_info->hw.bc250_mesh_dead_payload && nir->info.stage == MESA_SHADER_MESH && declared) {
++         bool accessed = false;
++         nir_foreach_function_impl (impl, nir) {
++            nir_foreach_block (block, impl) {
++               nir_foreach_instr (instr, block) {
++                  if (instr->type == nir_instr_type_deref &&
++                      nir_deref_mode_may_be(nir_instr_as_deref(instr), nir_var_mem_task_payload))
++                     accessed = true;
++                  else if (instr->type == nir_instr_type_intrinsic &&
++                           (nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_task_payload ||
++                            nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_store_task_payload))
++                     accessed = true;
++               }
++            }
++         }
++         if (!accessed) {
++            nir_foreach_variable_with_modes_safe (var, nir, nir_var_mem_task_payload)
++               exec_node_remove(&var->node);
++            if (getenv("BC250_TRACE_COMPILE"))
++               fprintf(stderr, "BC250 MESH DEAD PAYLOAD: unused task payload declaration dropped\n");
++         }
++      }
++
+       NIR_PASS(_, nir, nir_opt_shared_vars_to_subgroup, 1, nir->info.max_subgroup_size);
+ 
+       NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, var_modes, shared_var_info);
+@@ -856,6 +885,21 @@ radv_shader_spirv_to_nir(const struct radv_compiler_info *compiler_info, struct
      */
     NIR_PASS(_, nir, nir_opt_large_constants, glsl_get_natural_size_align_bytes, 16);
  
@@ -15869,7 +16195,7 @@ index 32d6d61..e83a94a 100644
     /* Lower primitive shading rate to match HW requirements. */
     if ((nir->info.stage == MESA_SHADER_VERTEX || nir->info.stage == MESA_SHADER_GEOMETRY ||
          nir->info.stage == MESA_SHADER_MESH) &&
-@@ -1038,10 +1054,131 @@ radv_lower_ngg(const struct radv_compiler_info *compiler_info, struct radv_shade
+@@ -1038,10 +1082,133 @@ radv_lower_ngg(const struct radv_compiler_info *compiler_info, struct radv_shade
        options.has_gen_prim_query = info->ms.has_query;
        options.has_ms_gs_invocations_query = info->ms.has_query;
        options.multiview = gfx_state->has_multiview_view_index;
@@ -15909,6 +16235,7 @@ index 32d6d61..e83a94a 100644
 +       * it needs neither coverage checks nor the general W31 planner. */
 +      options.bc250_safe_adaptive = options.bc250_safe_corners && compiler_info->key.bc250_mesh_safe_adaptive &&
 +         !ngg_stage->bc250_safe_owned;
++      options.bc250_safe_compact = options.bc250_safe_adaptive && compiler_info->hw.bc250_mesh_safe_compact;
 +      options.bc250_safe_fast |= options.bc250_safe_corners;
 +      options.bc250_safe_local = options.bc250_safe_fast &&
 +         ((compiler_info->key.bc250_mesh_direct_read & RADV_BC250_MESH_SAFE_LOCAL_KEY) || options.bc250_safe_corners);
@@ -15958,6 +16285,7 @@ index 32d6d61..e83a94a 100644
 +         options.bc250_safe_check = false;
 +         options.bc250_safe_corners = false;
 +         options.bc250_safe_adaptive = false;
++         options.bc250_safe_compact = false;
 +         options.bc250_safe_parallel = false;
 +         if (getenv("BC250_TRACE_COMPILE"))
 +            fprintf(stderr, "BC250 MESH SAFE BARY TINY: proven private connectivity, no remap\n");
@@ -16001,7 +16329,7 @@ index 32d6d61..e83a94a 100644
        ngg_stage->info.ngg_wave_id_en = scratch_ring;
     } else {
        UNREACHABLE("invalid SW stage passed to radv_lower_ngg");
-@@ -1249,6 +1386,16 @@ insert_block(struct radv_device *device, union radv_shader_arena_block *hole, ui
+@@ -1249,6 +1416,16 @@ insert_block(struct radv_device *device, union radv_shader_arena_block *hole, ui
   * this should allocate blocks for shaders fast and with no fragmentation, while still allowing
   * free'd memory to be re-used.
   */
@@ -16018,7 +16346,7 @@ index 32d6d61..e83a94a 100644
  union radv_shader_arena_block *
  radv_alloc_shader_memory(struct radv_device *device, uint32_t size, bool replayable, void *ptr)
  {
-@@ -1279,6 +1426,7 @@ radv_alloc_shader_memory(struct radv_device *device, uint32_t size, bool replaya
+@@ -1279,6 +1456,7 @@ radv_alloc_shader_memory(struct radv_device *device, uint32_t size, bool replaya
              remove_hole(free_list, hole);
              hole->freelist.next = ptr;
              mtx_unlock(&device->shader_arena_mutex);
@@ -16026,7 +16354,7 @@ index 32d6d61..e83a94a 100644
              return hole;
           } else {
              union radv_shader_arena_block *alloc = alloc_block_obj(device);
-@@ -1299,6 +1447,7 @@ radv_alloc_shader_memory(struct radv_device *device, uint32_t size, bool replaya
+@@ -1299,6 +1477,7 @@ radv_alloc_shader_memory(struct radv_device *device, uint32_t size, bool replaya
              add_hole(free_list, hole);
  
              mtx_unlock(&device->shader_arena_mutex);
@@ -16034,7 +16362,7 @@ index 32d6d61..e83a94a 100644
              return alloc;
           }
        }
-@@ -1317,6 +1466,7 @@ radv_alloc_shader_memory(struct radv_device *device, uint32_t size, bool replaya
+@@ -1317,6 +1496,7 @@ radv_alloc_shader_memory(struct radv_device *device, uint32_t size, bool replaya
     ++device->shader_arena_shift;
     list_addtail(&arena->list, &device->shader_arenas);
  
@@ -16042,7 +16370,7 @@ index 32d6d61..e83a94a 100644
     mtx_unlock(&device->shader_arena_mutex);
     return alloc;
  
-@@ -1349,6 +1499,10 @@ radv_free_shader_memory(struct radv_device *device, union radv_shader_arena_bloc
+@@ -1349,6 +1529,10 @@ radv_free_shader_memory(struct radv_device *device, union radv_shader_arena_bloc
  
     mtx_lock(&device->shader_arena_mutex);
  
@@ -16053,7 +16381,7 @@ index 32d6d61..e83a94a 100644
     union radv_shader_arena_block *hole_prev = get_hole(alloc->arena, alloc->list.prev);
     union radv_shader_arena_block *hole_next = get_hole(alloc->arena, alloc->list.next);
  
-@@ -1475,6 +1629,8 @@ radv_replay_shader_arena_block(struct radv_device *device, const struct radv_ser
+@@ -1475,6 +1659,8 @@ radv_replay_shader_arena_block(struct radv_device *device, const struct radv_ser
  
  out:
     mtx_unlock(&device->shader_arena_mutex);
@@ -16062,7 +16390,7 @@ index 32d6d61..e83a94a 100644
     return ret_block;
  }
  
-@@ -1652,8 +1808,10 @@ radv_get_num_pos_exports(const struct radv_shader_info *info, unsigned *clip_dis
+@@ -1652,8 +1838,10 @@ radv_get_num_pos_exports(const struct radv_shader_info *info, unsigned *clip_dis
  
     /* Clip and cull distances are packed by ac_nir_export_position. */
     unsigned num_clip_dist_comps = util_bitcount(info->outinfo.clip_dist_mask);
@@ -16075,7 +16403,7 @@ index 32d6d61..e83a94a 100644
     unsigned clip_cull_mask = BITFIELD_MASK(num_clip_dist_comps + num_cull_dist_comps);
  
     if (clip_cull_mask & 0x0f)
-@@ -1666,6 +1824,70 @@ radv_get_num_pos_exports(const struct radv_shader_info *info, unsigned *clip_dis
+@@ -1666,6 +1854,70 @@ radv_get_num_pos_exports(const struct radv_shader_info *info, unsigned *clip_dis
     return num;
  }
  
@@ -16146,7 +16474,7 @@ index 32d6d61..e83a94a 100644
  static void
  radv_precompute_registers_hw_vs(struct radv_device *device, struct radv_shader *shader)
  {
-@@ -1906,6 +2128,10 @@ radv_precompute_registers_hw_ngg(struct radv_device *device, struct radv_shader
+@@ -1906,6 +2158,10 @@ radv_precompute_registers_hw_ngg(struct radv_device *device, struct radv_shader
  
     regs->ngg.ge_ngg_subgrp_cntl =
        S_028B4C_PRIM_AMP_FACTOR(info->ngg_info.prim_amp_factor) | S_028B4C_THDS_PER_SUBGRP(0); /* for fast launch */
@@ -16157,7 +16485,7 @@ index 32d6d61..e83a94a 100644
  
     regs->vgt_gs_instance_cnt = S_028B90_CNT(gs_num_invocations) | S_028B90_ENABLE(gs_num_invocations > 1) |
                                 S_028B90_EN_MAX_VERT_OUT_PER_GS_INSTANCE(info->ngg_info.max_vert_out_per_gs_instance);
-@@ -1940,6 +2166,17 @@ radv_precompute_registers_hw_ms(struct radv_device *device, struct radv_shader *
+@@ -1940,6 +2196,17 @@ radv_precompute_registers_hw_ms(struct radv_device *device, struct radv_shader *
     radv_precompute_registers_hw_ngg(device, shader);
  
     regs->vgt_gs_max_vert_out = pdev->info.gfx_level >= GFX11 ? info->ngg_info.max_out_verts : info->workgroup_size;
@@ -16175,7 +16503,7 @@ index 32d6d61..e83a94a 100644
  
     regs->ngg.ms.spi_shader_gs_meshlet_dim = S_00B2B0_MESHLET_NUM_THREAD_X(info->cs.block_size[0] - 1) |
                                              S_00B2B0_MESHLET_NUM_THREAD_Y(info->cs.block_size[1] - 1) |
-@@ -2762,6 +2999,61 @@ radv_shader_binary_upload(struct radv_device *device, const struct radv_shader_b
+@@ -2762,6 +3029,61 @@ radv_shader_binary_upload(struct radv_device *device, const struct radv_shader_b
        }
     }
  
@@ -16237,7 +16565,7 @@ index 32d6d61..e83a94a 100644
     return true;
  }
  
-@@ -2928,6 +3220,11 @@ radv_shader_upload(struct radv_device *device, struct radv_shader *shader, const
+@@ -2928,6 +3250,11 @@ radv_shader_upload(struct radv_device *device, struct radv_shader *shader, const
        if (!radv_shader_binary_upload(device, binary, shader, dest_ptr))
           return false;
     }
@@ -16249,7 +16577,7 @@ index 32d6d61..e83a94a 100644
     return true;
  }
  
-@@ -3420,6 +3717,9 @@ radv_aco_fill_compiler_options(struct aco_compiler_options *aco_info, const stru
+@@ -3420,6 +3747,9 @@ radv_aco_fill_compiler_options(struct aco_compiler_options *aco_info, const stru
     aco_info->wgp_mode = should_use_wgp;
     aco_info->compiler_info = compiler_info->ac;
     aco_info->is_opengl = false;
@@ -16259,7 +16587,7 @@ index 32d6d61..e83a94a 100644
     aco_info->optimisations_disabled = stage_key->optimisations_disabled;
     aco_info->gfx_level = compiler_info->ac->gfx_level;
     aco_info->family = compiler_info->debug.family;
-@@ -3450,6 +3750,16 @@ radv_shader_nir_to_asm(const struct radv_compiler_info *compiler_info, struct ra
+@@ -3450,6 +3780,16 @@ radv_shader_nir_to_asm(const struct radv_compiler_info *compiler_info, struct ra
     const struct radv_shader_args *args = &pl_stage->args;
  
     bool wgp_mode = radv_should_use_wgp_mode(compiler_info->ac->gfx_level, stage, info);
@@ -16277,7 +16605,7 @@ index 32d6d61..e83a94a 100644
     for (unsigned i = 0; i < shader_count; ++i)
        dump_shader |= radv_can_dump_shader(compiler_info, shaders[i]);
 diff --git a/src/amd/vulkan/radv_shader.h b/src/amd/vulkan/radv_shader.h
-index 7f7611a..69b4ba6 100644
+index 7f7611a..ee0bf6f 100644
 --- a/src/amd/vulkan/radv_shader.h
 +++ b/src/amd/vulkan/radv_shader.h
 @@ -144,7 +144,11 @@ struct radv_graphics_state_key {
@@ -16375,7 +16703,7 @@ index 7f7611a..69b4ba6 100644
  
     struct ac_shader_config config;
     uint32_t code_size;
-@@ -527,7 +585,42 @@ struct radv_compiler_info {
+@@ -527,7 +585,56 @@ struct radv_compiler_info {
        uint32_t instr_prefetch_distance : 8;
        uint32_t rbplus_allowed : 1;
        uint32_t address_prt_wa_control_bit : 8;
@@ -16415,11 +16743,25 @@ index 7f7611a..69b4ba6 100644
 +       * one barrier early; the extra wave then runs one barrier ahead, reads the output counts before
 +       * wave 0 wrote them and skips a barrier the API waves wait at (FF7 Rebirth hang, live dump). */
 +      uint32_t bc250_mesh_wave_sync : 1;
-+      uint32_t padding : 5;
++      /* RADV_BC250_MESH_SAFE_COMPACT (with RADV_BC250_MESH_SAFE_ADAPTIVE): a workgroup whose surviving
++       * triangles, after deleting the vertices they do not reference, keep backjump <= 31 exports only
++       * those vertices, renumbered in order, and its survivors in order (ac_nir_lower_ngg_mesh). */
++      uint32_t bc250_mesh_safe_compact : 1;
++      /* RADV_BC250_MESH_DEAD_PAYLOAD: a Mesh shader that declares a task payload but never accesses
++       * it drops the declaration, so it is not treated as a payload consumer (radv_shader.c). */
++      uint32_t bc250_mesh_dead_payload : 1;
++      /* RADV_BC250_MESH_PIECE_PRIMID: the safe direct pieces accept a fragment shader reading
++       * PrimitiveId when the Mesh shader writes it per primitive (each piece keeps the written value). */
++      uint32_t bc250_mesh_piece_primid : 1;
++      /* RADV_BC250_MESH_FAIL_CLOSED: a Mesh pipeline that ends up on no protected route (not safe direct,
++       * ordered, split or expanded) is refused instead of drawing the raw API connectivity; the
++       * refused-pipeline retry may still split it (radv_pipeline_graphics.c). */
++      uint32_t bc250_mesh_fail_closed : 1;
++      uint32_t padding : 1;
     } hw;
  
     /* Misc values included as part of the cache key */
-@@ -539,6 +632,11 @@ struct radv_compiler_info {
+@@ -539,6 +646,11 @@ struct radv_compiler_info {
        uint32_t nggc_max_ps_params : 4;
        uint32_t no_ngg_gs : 1;
        uint32_t load_grid_size_from_user_sgpr : 1;
@@ -16431,7 +16773,7 @@ index 7f7611a..69b4ba6 100644
        uint32_t emulate_ngg_gs_query_pipeline_stat : 1;
        uint32_t primitives_generated_query : 1;
        uint32_t mesh_shader_queries : 1;
-@@ -566,7 +664,29 @@ struct radv_compiler_info {
+@@ -566,7 +678,29 @@ struct radv_compiler_info {
        uint32_t no_implicit_varying_subgroup_size : 1;
        uint32_t force_nan_preserve_min_max : 1;
        uint32_t nir_debug_info : 1;
@@ -16462,7 +16804,7 @@ index 7f7611a..69b4ba6 100644
  
        int32_t force_aniso;
  
-@@ -577,6 +697,36 @@ struct radv_compiler_info {
+@@ -577,8 +711,51 @@ struct radv_compiler_info {
        uint8_t ps_wave_size;
        uint8_t cs_wave_size;
        uint8_t rt_wave_size;
@@ -16498,7 +16840,22 @@ index 7f7611a..69b4ba6 100644
 +      uint8_t bc250_mesh_safe_pieces : 1;
     } key;
  
++   /* BC-250 Mesh route switches added after the key and hw words filled up. Included in the cache hash
++    * only when non-zero, so the hash with all of them off is unchanged (radv_device_init_cache_key). */
++   struct {
++      /* RADV_BC250_TASK_GRID_FOLD: a Task launch count without a compile-time bound folds the split
++       * pieces into their own grid dimension instead of refusing the pipeline. */
++      uint32_t task_grid_fold : 1;
++      /* RADV_BC250_MESH_SAFE_PIECES_EXT: more split shapes on the safe pieces: private corners for every
++       * split piece (Task pieces included), wave64 for subgroup-free wave32 Mesh shaders, and
++       * CullPrimitive (consumed by the split) no longer blocks the shared-vertex piece check. */
++      uint32_t safe_pieces_ext : 1;
++      uint32_t padding : 30;
++   } bc250x;
++
     /* Debug/tracing */
+    struct {
+       bool dump_spirv;
 diff --git a/src/amd/vulkan/radv_shader_args.c b/src/amd/vulkan/radv_shader_args.c
 index 8c36d19..cbc55fc 100644
 --- a/src/amd/vulkan/radv_shader_args.c
