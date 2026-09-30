@@ -2578,7 +2578,18 @@ ms_safe_fast_check_wave(nir_builder *b, lower_ngg_ms_state *s, nir_def *vc, nir_
       nir_def *use_all = nir_imm_false(b), *shared = nir_imm_false(b);
       if (s->options->bc250_safe_adaptive) {
          nir_def *post = ms_adaptive_shared_clean(b, s, idx, live, vc);
-         nir_def *pre = ms_adaptive_shared_clean(b, s, idx, live_all, vc);
+         nir_def *pre;
+         if (s->options->bc250_lean_check) {
+            /* RADV_BC250_MESH_LEAN_CHECK: the pre-cull check only matters when the survivors are not clean
+             * and culling removed a triangle (otherwise it equals the survivor check). Same result. */
+            nir_def *unneeded = nir_imm_false(b);
+            nir_if *need = nir_push_if(b, nir_iand(b, nir_inot(b, post), nir_vote_any(b, 1, culled)));
+            nir_def *checked = ms_adaptive_shared_clean(b, s, idx, live_all, vc);
+            nir_pop_if(b, need);
+            pre = nir_if_phi(b, checked, unneeded);
+         } else {
+            pre = ms_adaptive_shared_clean(b, s, idx, live_all, vc);
+         }
          nir_def *kept = nir_u2u32(b, nir_bit_count(b, nir_ballot(b, 1, 64, live)));
          nir_def *few = nir_uge(b, pc, nir_imul_imm(b, nir_isub(b, pc, kept), 4));
          use_all = nir_iand(b, nir_inot(b, post), nir_iand(b, pre, few));

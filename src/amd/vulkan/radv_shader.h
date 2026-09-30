@@ -756,7 +756,9 @@ struct radv_compiler_info {
       /* RADV_BC250_MESH_PP_SHARE: the owned private-corner route shares vertices inside 10-triangle
        * windows; each triangle's provoking corner keeps its own copy (it carries the per-primitive data). */
       uint32_t pp_share : 1;
-      uint32_t padding : 29;
+      /* RADV_BC250_MESH_LEAN_CHECK: skip per-workgroup checks whose result is already known. */
+      uint32_t lean_check : 1;
+      uint32_t padding : 28;
    } bc250x;
 
    /* Debug/tracing */

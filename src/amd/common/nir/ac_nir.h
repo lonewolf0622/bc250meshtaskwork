@@ -302,6 +302,8 @@ typedef struct {
     * application's logical index (bc250_compact_index_staging); the provoking corner
     * (bc250_compact_owned_corners 0x1 or 0x4) always gets its own copy. */
    bool bc250_pp_share;
+   /* RADV_BC250_MESH_LEAN_CHECK: skip adaptive checks whose result is already known. */
+   bool bc250_lean_check;
    bool bc250_safe_bary;
    bool bc250_safe_stats;
    bool bc250_safe_parallel;
