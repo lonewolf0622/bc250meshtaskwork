@@ -792,6 +792,39 @@ bc250_merge_is_subgroup_op(const nir_intrinsic_instr *in)
    return false;
 }
 
+/* RADV_BC250_MESH_SAFE_PIECES_EXT: a wave32 Mesh shader can run in wave64 unchanged when no subgroup size
+ * was required and nothing observes the subgroup: no subgroup operation, subgroup id, subgroup count,
+ * subgroup size or invocation. */
+bool
+radv_bc250_mesh_wave64_promotable(const struct radv_shader_stage *stage)
+{
+   const nir_shader *nir = stage->nir;
+   if (!nir || nir->info.stage != MESA_SHADER_MESH || nir->info.min_subgroup_size != 32 ||
+       nir->info.max_subgroup_size != 32 || stage->key.subgroup_required_size)
+      return false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            const nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+            if (in->intrinsic == nir_intrinsic_load_subgroup_id || in->intrinsic == nir_intrinsic_load_num_subgroups ||
+                bc250_merge_is_subgroup_op(in))
+               return false;
+         }
+      }
+   }
+   return true;
+}
+
+void
+radv_bc250_mesh_set_wave(nir_shader *nir, unsigned wave)
+{
+   nir->info.min_subgroup_size = wave;
+   nir->info.max_subgroup_size = wave;
+   nir->info.api_subgroup_size = wave;
+}
+
 /* The outermost array deref of an output store, or NULL when the path is not
  * var -> array (vertex/primitive index) -> ... */
 static nir_deref_instr *
@@ -4556,8 +4589,24 @@ bc250_prepare_safe_pieces(struct radv_device *device, struct radv_graphics_pipel
       nir_shader_gather_info(mesh, nir_shader_get_entrypoint(mesh));
    }
    mesh->info.mesh.max_primitives_out = 64;
-   const bool plain = original->info.min_subgroup_size == 64 &&
+   /* RADV_BC250_MESH_SAFE_PIECES_EXT: a subgroup-free wave32 shader takes the wave64 pieces, and
+    * CullPrimitive, which the split consumes (surviving triangles are compacted), does not block the
+    * shared-vertex check of the unsplit clone; the check after the split still applies. */
+   const bool pieces_ext = device->compiler_info.bc250x.safe_pieces_ext && !owned_corners;
+   const bool wave64_promote = pieces_ext && radv_bc250_mesh_wave64_promotable(ms);
+   if (wave64_promote)
+      radv_bc250_mesh_set_wave(mesh, 64);
+   const uint64_t cull_bit = pieces_ext ? (mesh->info.per_primitive_outputs & VARYING_BIT_CULL_PRIMITIVE) : 0;
+   const uint64_t saved_pp = mesh->info.per_primitive_outputs, saved_written = mesh->info.outputs_written;
+   mesh->info.per_primitive_outputs &= ~cull_bit;
+   mesh->info.outputs_written &= ~cull_bit;
+   const bool plain = (original->info.min_subgroup_size == 64 || wave64_promote) &&
                       bc250_safe_direct_candidate(mesh, true, 16, false);
+   mesh->info.per_primitive_outputs = saved_pp;
+   mesh->info.outputs_written = saved_written;
+   if (getenv("BC250_TRACE_COMPILE") && (wave64_promote || cull_bit))
+      fprintf(stderr, "BC250 MESH SAFE PIECES EXT: wave64=%u cull_primitive=%u plain=%u\n",
+              wave64_promote, cull_bit != 0, plain);
    const bool ordinary_piece = device->compiler_info.key.bc250_mesh_safe_bary_last &&
                                original->info.min_subgroup_size == 32 && owned_corners;
    mesh->info.mesh.max_primitives_out = original_p;

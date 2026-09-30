@@ -910,6 +910,11 @@ radv_device_init_cache_key(struct radv_device *device)
    _mesa_blake3_update(&ctx, device->compiler_info.ac, sizeof(struct ac_compiler_info));
    _mesa_blake3_update(&ctx, &device->compiler_info.hw, sizeof(device->compiler_info.hw));
    _mesa_blake3_update(&ctx, &device->compiler_info.key, sizeof(device->compiler_info.key));
+   STATIC_ASSERT(sizeof(device->compiler_info.bc250x) == 4);
+   uint32_t bc250x;
+   memcpy(&bc250x, &device->compiler_info.bc250x, sizeof(bc250x));
+   if (bc250x)
+      _mesa_blake3_update(&ctx, &bc250x, sizeof(bc250x));
    _mesa_blake3_final(&ctx, device->cache_hash);
    if (debug_get_bool_option("BC250_CAPTURE_POLICY_SHADERS", false)) {
       fprintf(stderr, "BC250POLICYCACHE cu=%u hash=", device->compiler_info.key.bc250_compute_cu_mode);
@@ -1537,6 +1542,10 @@ radv_device_init_compiler_info(struct radv_device *device)
    };
 
    radv_get_nir_options(&info);
+
+   const bool bc250_mesh = pdev->bc250_native_mesh && pdev->info.family == CHIP_GFX1013;
+   info.bc250x.task_grid_fold = bc250_mesh && debug_get_bool_option("RADV_BC250_TASK_GRID_FOLD", false);
+   info.bc250x.safe_pieces_ext = bc250_mesh && debug_get_bool_option("RADV_BC250_MESH_SAFE_PIECES_EXT", false);
 
    device->compiler_info = info;
 }

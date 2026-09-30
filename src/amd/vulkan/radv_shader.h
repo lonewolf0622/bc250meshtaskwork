@@ -743,6 +743,19 @@ struct radv_compiler_info {
       uint8_t bc250_mesh_safe_pieces : 1;
    } key;
 
+   /* BC-250 Mesh route switches added after the key and hw words filled up. Included in the cache hash
+    * only when non-zero, so the hash with all of them off is unchanged (radv_device_init_cache_key). */
+   struct {
+      /* RADV_BC250_TASK_GRID_FOLD: a Task launch count without a compile-time bound folds the split
+       * pieces into their own grid dimension instead of refusing the pipeline. */
+      uint32_t task_grid_fold : 1;
+      /* RADV_BC250_MESH_SAFE_PIECES_EXT: more split shapes on the safe pieces: private corners for every
+       * split piece (Task pieces included), wave64 for subgroup-free wave32 Mesh shaders, and
+       * CullPrimitive (consumed by the split) no longer blocks the shared-vertex piece check. */
+      uint32_t safe_pieces_ext : 1;
+      uint32_t padding : 30;
+   } bc250x;
+
    /* Debug/tracing */
    struct {
       bool dump_spirv;

@@ -2707,7 +2707,11 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
        (radv_bc250_mesh_has_per_primitive_data(owned_ms->nir) ||
         (owned_ms->nir->info.outputs_written & (RADV_BC250_CLIPCULL_OUTPUTS | VARYING_BIT_CULL_PRIMITIVE)))) ||
        owned_ms->nir->info.mesh.primitive_type != MESA_PRIM_TRIANGLES ||
-       owned_ms->nir->info.mesh.max_primitives_out > 85) &&
+       owned_ms->nir->info.mesh.max_primitives_out > 85 ||
+       /* RADV_BC250_MESH_SAFE_PIECES_EXT: every split piece (Task pieces included) takes the
+        * private-corner export, not only pieces with barycentrics or per-primitive data. */
+       (compiler_info->bc250x.safe_pieces_ext && compiler_info->key.bc250_mesh_safe_bary_last &&
+        owned_ms->bc250_split_mesh && debug_get_bool_option("RADV_BC250_MESH_SAFE_SPLIT_PIECES", false))) &&
       owned_ms->nir->info.mesh.max_vertices_out <= 256;
    /* RADV_BC250_MESH_SAFE_SPLIT_PIECES (default 0): every split piece (Task replay or the direct
     * Mesh-only split) is its own workgroup exporting its own slice, like the one-piece case, so it
@@ -2715,6 +2719,17 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
    const bool safe_split_pieces = debug_get_bool_option("RADV_BC250_MESH_SAFE_SPLIT_PIECES", false) &&
       compiler_info->key.bc250_mesh_safe_bary_last && tiny_bary && owned_ms->bc250_split_mesh;
    const bool no_fs_ok = safe_split_pieces && !stages[MESA_SHADER_FRAGMENT].nir;
+   /* RADV_BC250_MESH_SAFE_PIECES_EXT: an unsplit subgroup-free wave32 Mesh shader with 33..64 primitives
+    * (above the wave32 owned capacity) tries the owned route in wave64; if it is not admitted it keeps
+    * wave32 and its route. */
+   bool owned_wave64 = false;
+   if (compiler_info->bc250x.safe_pieces_ext && owned_ms->nir && !owned_ms->bc250_split_mesh &&
+       !owned_ms->bc250_safe_fast && !owned_ms->bc250_safe_owned &&
+       owned_ms->nir->info.mesh.max_primitives_out > 32 && owned_ms->nir->info.mesh.max_primitives_out <= 64 &&
+       radv_bc250_mesh_wave64_promotable(owned_ms)) {
+      radv_bc250_mesh_set_wave(owned_ms->nir, 64);
+      owned_wave64 = true;
+   }
    if (compiler_info->key.bc250_mesh_safe_owned && !retained_shaders &&
        (private_bary || no_fs_ok || !radv_bc250_mesh_fs_refused(compiler_info, stages[MESA_SHADER_FRAGMENT].nir)) &&
        (!owned_ms->bc250_split_mesh || safe_split_pieces ||
@@ -2754,6 +2769,12 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
                     3 * owned_ms->nir->info.mesh.max_primitives_out, owned_ms->bc250_task_replay);
          break;
       }
+   }
+   if (owned_wave64) {
+      if (!owned_ms->bc250_safe_owned)
+         radv_bc250_mesh_set_wave(owned_ms->nir, 32);
+      else if (getenv("BC250_TRACE_COMPILE"))
+         fprintf(stderr, "BC250 MESH SAFE PIECES EXT: owned route in wave64\n");
    }
 
    const bool bc250_merge_clipcull = stages[MESA_SHADER_MESH].nir && !compiler_info->hw.bc250_mesh_allow_pos1 &&
