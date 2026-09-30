@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Dry-run inside the noop sandbox; hardware requires one explicit named gate."""
-import hashlib, json, os, re, selectors, subprocess, sys, time
+import hashlib, json, os, re, selectors, struct, subprocess, sys, time
 from pathlib import Path
 
 g = Path(__file__).resolve().parent
@@ -61,6 +61,43 @@ out = Path(os.environ.get('GATE_RESULTS', g / ('dry-run' if offline else 'hardwa
 out.mkdir(exist_ok=True)
 rows = []
 bad = re.compile(r'API_VALIDATION_ERROR|Validation Error|VUID-|validation failed|NIR_VALIDATE|Assertion .*failed|raw_unproven|Segmentation fault')
+def route_check(text, side, case):
+    assert not bad.search(text) and 'BC250 MESH AMD:' in text
+    if side == 'feature' and name == 'gpl':
+        assert 'BINARY_ROUNDTRIP count=3 result=0' in text and 'GPL_BINARY_FAST_LINK result=0' in text
+    if side == 'feature' and name == 'objects':
+        assert 'OBJECT_BINARY_ROUNDTRIP' in text and 'OBJECTS_BOUND' in text
+    if side != 'feature' or name in ('gpl', 'objects'): return
+    count = int(name == 'many-task')
+    data = (case / ('capture-' + str(count) + '.bin')).read_bytes()
+    p = struct.unpack_from('<QQQQIIII', data)
+    assert p[4] == 1
+    task = name != 'D1'
+    template = p[6] - 1048576 if count else 0
+    code = 1048576 if task else p[6]
+    words = struct.unpack_from('<' + 'I' * (code // 4), data, 48 + template)
+    i = dispatch = mesh = 0
+    producer = flushed = acquired = False
+    while i < len(words):
+        h = words[i]
+        assert h >> 30 in (2, 3)
+        n = 1 if h == 0xffff1000 or h >> 30 == 2 else ((h >> 16) & 0x3fff) + 2
+        assert i + n <= len(words)
+        op = (h >> 8) & 255
+        assert op not in (0x4d, 0xaa, 0xad)
+        if op in (0x15, 0x16):
+            dispatch += 1; producer = True; flushed = acquired = False
+        if op == 0x46 and n > 1 and words[i + 1] & 63 == 7 and producer: flushed = True
+        if op == 0x58 and flushed: acquired = True
+        if op == 0x4c:
+            mesh += 1
+            if task: assert producer and flushed and acquired
+            producer = flushed = acquired = False
+        i += n
+    assert mesh > 0
+    if task: assert dispatch >= 1025 and mesh == 1024
+    (case / 'route-proof.json').write_text(json.dumps({'dispatches': dispatch, 'mesh_consumers': mesh,
+        'native_task_packets': 0, 'producer_visibility_order': task, 'many_draw_records': p[7]}, indent=2) + '\n')
 for side in ('mono', 'feature'):
     case = out / (name + '-' + side)
     case.mkdir(exist_ok=True)
@@ -92,7 +129,7 @@ for side in ('mono', 'feature'):
             text = captured.decode(errors='replace')
             (case / 'run.log').write_text(text)
             if not released and '_READY mode=hardware' in text:
-                assert not bad.search(text) and 'BC250 MESH AMD:' in text
+                route_check(text, side, case)
                 if name not in ('D1', 'gpl', 'objects'):
                     assert 'BC250 original NIR: stage=7' in text and 'BC250 original NIR: stage=0' in text
                 if side == 'feature' and name not in ('gpl', 'objects'):
@@ -106,6 +143,7 @@ for side in ('mono', 'feature'):
         assert released
     (case / 'run.log').write_text(text)
     assert code == 0 and not bad.search(text), text[-4000:]
+    route_check(text, side, case)
     assert 'VALIDATION_ERRORS=0' in text and 'BC250 MESH AMD:' in text
     if name not in ('D1', 'gpl', 'objects'): assert 'BC250 original NIR: stage=7' in text and 'BC250 original NIR: stage=0' in text
     captured = (case / 'capture-0.bin').exists() or (case / 'capture-1.bin').exists()
