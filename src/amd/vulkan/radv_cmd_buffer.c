@@ -8738,7 +8738,8 @@ VKAPI_ATTR void VKAPI_CALL
 radv_CmdPushConstants2(VkCommandBuffer commandBuffer, const VkPushConstantsInfo *pPushConstantsInfo)
 {
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
-   if (radv_device_physical(radv_cmd_buffer_device(cmd_buffer))->bc250_expose_dgc &&
+   if (pPushConstantsInfo->layout &&
+       radv_device_physical(radv_cmd_buffer_device(cmd_buffer))->bc250_expose_dgc &&
        !cmd_buffer->state.meta.inside_meta_op && !cmd_buffer->bc250_inside_mesh_draw) {
       VK_FROM_HANDLE(radv_pipeline_layout, layout, pPushConstantsInfo->layout);
       const VkShaderStageFlags graphics = VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_TASK_BIT_EXT |
