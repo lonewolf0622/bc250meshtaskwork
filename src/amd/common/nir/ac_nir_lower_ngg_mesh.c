@@ -2342,7 +2342,47 @@ ms_pps_vertices(nir_builder *b, lower_ngg_ms_state *s, nir_def **L, nir_def **va
    nir_def *start = nir_imul_imm(b, nir_udiv_imm(b, lane, 10), 10);
    nir_def *interval = nir_ishl(b, nir_imm_int64(b, 1023), start);
    nir_def *owner[3] = {nir_imm_int(b, 192), nir_imm_int(b, 192), nir_imm_int(b, 192)};
-   for (unsigned d = 0; d < 3; ++d) {
+   if (table > 32) {
+      /* Large tables: compare with the (at most 30) keys of the window directly. The bit-plane match below
+       * would keep 3 * 8 wave masks live and exceed the scalar register budget. Same result: the smallest
+       * key in the window with the same valid logical vertex (never above the key itself). */
+      nir_def *self_lane = lane;
+      nir_variable *owner_var[3];
+      for (unsigned c = 0; c < 3; ++c) {
+         owner_var[c] = nir_local_variable_create(b->impl, glsl_uint_type(), "pps_owner");
+         nir_store_var(b, owner_var[c], nir_iadd_imm(b, nir_imul_imm(b, self_lane, 3), c), 1);
+      }
+      /* A real loop over the window, so only one window lane's values are live at a time. */
+      nir_variable *i_var = nir_local_variable_create(b->impl, glsl_uint_type(), "pps_i");
+      nir_store_var(b, i_var, nir_imm_int(b, 0), 1);
+      nir_loop *loop = nir_push_loop(b);
+      {
+         nir_def *i = nir_load_var(b, i_var);
+         nir_break_if(b, nir_uge_imm(b, i, 10));
+         nir_def *src = nir_umin_imm(b, nir_iadd(b, start, i), s->wave_size - 1);
+         nir_def *before = nir_uge(b, self_lane, src);
+         nir_def *own[3];
+         for (unsigned c = 0; c < 3; ++c)
+            own[c] = nir_load_var(b, owner_var[c]);
+         for (unsigned d = 0; d < 3; ++d) {
+            nir_def *other_l = nir_shuffle(b, L[d], src);
+            nir_def *other_ok = nir_ine_imm(b, nir_shuffle(b, nir_b2i32(b, valid[d]), src), 0);
+            nir_def *key = nir_iadd_imm(b, nir_imul_imm(b, src, 3), d);
+            for (unsigned c = 0; c < 3; ++c) {
+               nir_def *same = nir_iand(b, nir_iand(b, before, other_ok),
+                                        nir_iand(b, valid[c], nir_ieq(b, other_l, L[c])));
+               own[c] = nir_bcsel(b, same, nir_umin(b, own[c], key), own[c]);
+            }
+         }
+         for (unsigned c = 0; c < 3; ++c)
+            nir_store_var(b, owner_var[c], own[c], 1);
+         nir_store_var(b, i_var, nir_iadd_imm(b, i, 1), 1);
+      }
+      nir_pop_loop(b, loop);
+      for (unsigned c = 0; c < 3; ++c)
+         owner[c] = nir_load_var(b, owner_var[c]);
+   }
+   for (unsigned d = 0; d < 3 && table <= 32; ++d) {
       nir_def *candidates = nir_iand(b, nir_ballot(b, 1, 64, nir_iand(b, live, valid[d])), interval);
       nir_def *matches[3];
       for (unsigned c = 0; c < 3; ++c)
@@ -4009,9 +4049,7 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
        * one-slot barycentric corner number needs private corners (slot 3p + c). */
       const uint32_t *pix = options->bc250_compact_index_staging;
       if (options->bc250_pp_share && !options->bc250_safe_adaptive && util_bitcount64(bary_ref_mask) != 1 &&
-          /* Up to 32 logical vertices: the plane match stays within the existing register budget (larger
-           * tables, e.g. 256-vertex pieces, nearly doubled the VGPRs in wave64). */
-          pix[1] && (pix[2] == 2 || pix[2] == 4) && pix[3] && pix[3] <= 32 &&
+          pix[1] && (pix[2] == 2 || pix[2] == 4) && pix[3] && pix[3] <= 256 &&
           pix[0] + max_primitives * pix[1] <= shader->info.shared_size && max_primitives <= options->wave_size &&
           layout.lds.total_size + 3 * max_primitives <= 32 * 1024) {
          pp_share = true;
