@@ -68,7 +68,8 @@ partial|dr|-DPARTIAL=1|-|1||0|DIRECT READ: applied|DIRECT READ: applied;index16=
 arrayed|dr|-DARRAYED=1|-|1||0|DIRECT READ: applied;~\(([0-9]+) of \1 per-vertex\)|DIRECT READ: applied|0
 perprim|dr|-DPERPRIM=1|-|1||0|DIRECT READ: applied|DIRECT READ: applied;index16=1|0
 primid|dr|-DPERPRIM=1 -DPRIMID=1 -DNOCULL=1|-|1||0|DIRECT READ: applied|DIRECT READ: applied|0
-primid_cull|dr|-DPERPRIM=1 -DPRIMID=1|-|1||-8|||0
+primid_cull|dr|-DPERPRIM=1 -DPRIMID=1|-|1|RADV_BC250_MESH_PIECE_PRIMID=0|-8|||0
+primid_cull_allowed|dr|-DPERPRIM=1 -DPRIMID=1|-|1|RADV_BC250_MESH_PIECE_PRIMID=1|0|DIRECT READ: applied|DIRECT READ: applied|0
 clip|dr|-DCLIP=1|-|1|RADV_BC250_MESH_ALLOW_POS1=1|0|DIRECT READ: applied;~\(([0-9]+) of \1 per-vertex\)|DIRECT READ: applied|0
 multistore|dr|-DMULTISTORE=1|-|1||0|DIRECT READ: applied|DIRECT READ: applied|0
 idxcomp|dr|-DIDXCOMP=1|-|1||0|DIRECT READ: applied|index16=1|0
