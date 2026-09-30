@@ -3607,6 +3607,12 @@ radv_bc250_async_execute(void *data, void *gdata, int thread_index)
    struct radv_shader *opt[MESA_VULKAN_SHADER_STAGES] = {NULL};
    bool ok = true;
 
+   /* RADV_BC250_ASYNC_NEVER_SWAP=1 (testing): keep the quick binaries bound for the pipeline's lifetime. */
+   if (debug_get_bool_option("RADV_BC250_ASYNC_NEVER_SWAP", false)) {
+      radv_bc250_async_free_nir(job);
+      return;
+   }
+
    u_foreach_bit (s, job->stage_mask) {
       nir_shader *nir = job->nir[s];
       struct radv_shader_binary *binary = radv_shader_nir_to_asm(&device->compiler_info, &job->stage[s], &nir, 1,
