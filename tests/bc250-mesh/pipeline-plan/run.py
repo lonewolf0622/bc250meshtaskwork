@@ -26,6 +26,14 @@ SAFE_AUTOCULL SAFE_PARALLEL SAFE_BARY SAFE_BARY_TINY SAFE_BARY_AFFINE SAFE_BARY_
 ALLOW_POS1 SPLIT_ANY NESTED_SLICE SAFE_SPLIT_PIECES'''.split():
     env['RADV_BC250_MESH_' + flag] = '1'
 env.update(RADV_BC250_BARY_IO16='1', RADV_BC250_BARY_CORNER_ID='1')
+variant = os.environ.get('PLAN_VARIANT', 'default')
+assert variant in ('default', 'adaptive', 'corner-id')
+if variant == 'adaptive':
+    env['RADV_BC250_MESH_SAFE_ADAPTIVE'] = '1'
+if variant == 'corner-id':
+    env.update(RADV_BC250_MESH_SAFE_FAST='0', RADV_BC250_MESH_SAFE_PIECES='0',
+               RADV_BC250_MESH_SAFE_BARY_AFFINE='0', RADV_BC250_BARY_CORNER_ID_FORCE='1')
+
 
 
 def run(args, name):
@@ -42,6 +50,9 @@ env['TEST_ICD_LIBRARY'] = json.loads(Path(os.environ['ICD']).read_text())['ICD']
 run(['cc', '-Wall', '-Werror', '-I' + str(src / 'src/amd/vulkan'), '-o', 'validate-plan',
      src / 'tests/bc250-mesh/pipeline-plan/validate.c'], 'validate-build')
 run([out / 'validate-plan'], 'validate')
+run(['glslangValidator', '--target-env', 'vulkan1.3', '-S', 'mesh', '-DVERTS=3', '-DPRIMS=1', '-DLANES=32',
+     '-o', out / 'swap.mesh.spv', src / 'tests/bc250-mesh/compact/cmp.mesh'], 'swap-mesh')
+env['PLAN_SWAP_MESH'] = str(out / 'swap.mesh.spv')
 rows = []
 for name, defs in [('plain', []), ('pieces', ['-DVERTS=128', '-DPRIMS=128', '-DLANES=128']),
                    ('task', ['-DTASK=1']), ('task-pieces', ['-DTASK=1', '-DVERTS=128', '-DPRIMS=128', '-DLANES=128']),
@@ -54,11 +65,13 @@ for name, defs in [('plain', []), ('pieces', ['-DVERTS=128', '-DPRIMS=128', '-DL
              src / ('tests/bc250-mesh/compact/cmp.' + stage)], name + '-' + stage)
     text = run([out / 'cache-pipe', case / 'mesh.spv', case / 'frag.spv',
                 case / 'task.spv' if name.startswith('task') else '-', '1'], name)
+    if variant == 'corner-id' and name == 'bary':
+        assert 'rotation from corner id' in text, text[-4000:]
     assert 'CACHE_ROUNDTRIP' in text and 'hit=1' in text and 'SUBMIT_OK' in text, (name, text[-4000:])
     assert not re.search(r'validation failed|NIR_VALIDATE|Assertion .*failed', text)
     binary = run([out / 'binary-pipe', case / 'mesh.spv', case / 'frag.spv',
                   case / 'task.spv' if name.startswith('task') else '-', '1'], name + '-binary')
-    assert 'BINARY_ROUNDTRIP count=3 result=0' in binary and 'SUBMIT_OK' in binary, (name, binary[-4000:])
+    assert 'BINARY_FOREIGN_PLAN_REFUSED' in binary and 'BINARY_ROUNDTRIP count=3 result=0' in binary and 'SUBMIT_OK' in binary, (name, binary[-4000:])
     rows.append(dict(case=name, serialized_cache_hit=True, binary_roundtrip=True, submit_ok=True))
     print(name, 'PASS', flush=True)
 (out / 'summary.json').write_text(json.dumps(rows, indent=2) + '\n')

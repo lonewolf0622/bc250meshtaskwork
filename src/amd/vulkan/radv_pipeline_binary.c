@@ -254,7 +254,9 @@ radv_bc250_pipeline_binary_restore(struct radv_device *device, struct radv_graph
          goto done;
       }
    }
-   result = radv_bc250_restore_cached_plan(device, pipeline, layout, &plan, shaders[0], shaders[1]);
+   result = radv_bc250_restore_cached_plan(device, pipeline, layout, &plan,
+      pipeline->base.shaders[MESA_SHADER_MESH], pipeline->base.shaders[MESA_SHADER_FRAGMENT],
+      shaders[0], shaders[1]);
 done:
    for (unsigned i = 0; i < 2; i++) {
       if (shaders[i])

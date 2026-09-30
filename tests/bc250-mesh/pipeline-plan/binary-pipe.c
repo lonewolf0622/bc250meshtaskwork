@@ -8,6 +8,7 @@
 #include "icd-fixture.h"
 
 static VkInstance binary_instance;
+static VkShaderModule load(const char *path);
 static VkResult
 binary_create_instance(const VkInstanceCreateInfo *info, const VkAllocationCallbacks *alloc, VkInstance *instance)
 {
@@ -94,6 +95,48 @@ binary_roundtrip(VkDevice device, VkPipelineCache cache, uint32_t count,
       return VK_ERROR_UNKNOWN;
    bi.binaryCount = n;
    printf("BINARY_MISSING_PLAN_REFUSED\n");
+   const char *swap_mesh = getenv("PLAN_SWAP_MESH");
+   if (swap_mesh) {
+      /* Both plans are individually valid. Mixing one pipeline's graphics
+       * binaries with another pipeline's plan must still fail closed. */
+      VkPipelineShaderStageCreateInfo other_stages[3];
+      memcpy(other_stages, infos->pStages, infos->stageCount * sizeof(other_stages[0]));
+      VkShaderModule module = load(swap_mesh);
+      for (unsigned i = 0; i < infos->stageCount; i++)
+         if (other_stages[i].stage == VK_SHADER_STAGE_MESH_BIT_EXT)
+            other_stages[i].module = module;
+      VkGraphicsPipelineCreateInfo other_info = *infos;
+      other_info.pStages = other_stages;
+      other_info.pNext = &flags;
+      VkPipeline other = VK_NULL_HANDLE;
+      VkResult swap_result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &other_info, alloc, &other);
+      if (swap_result != VK_SUCCESS)
+         return swap_result;
+      VkPipelineBinaryCreateInfoKHR other_ci = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR, .pipeline = other};
+      VkPipelineBinaryHandlesInfoKHR other_handles = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR};
+      swap_result = create(device, &other_ci, NULL, &other_handles);
+      if (swap_result != VK_SUCCESS || !other_handles.pipelineBinaryCount || other_handles.pipelineBinaryCount > 8)
+         return VK_ERROR_UNKNOWN;
+      VkPipelineBinaryKHR other_binaries[8];
+      other_handles.pPipelineBinaries = other_binaries;
+      swap_result = create(device, &other_ci, NULL, &other_handles);
+      if (swap_result != VK_SUCCESS)
+         return swap_result;
+      VkPipelineBinaryKHR saved = binaries[n - 1];
+      binaries[n - 1] = other_binaries[other_handles.pipelineBinaryCount - 1];
+      refused = VK_NULL_HANDLE;
+      swap_result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &info, alloc, &refused);
+      binaries[n - 1] = saved;
+      for (unsigned i = 0; i < other_handles.pipelineBinaryCount; i++)
+         destroy(device, other_binaries[i], NULL);
+      vkDestroyPipeline(device, other, alloc);
+      vkDestroyShaderModule(device, module, NULL);
+      if (swap_result != VK_ERROR_FEATURE_NOT_PRESENT || refused != VK_NULL_HANDLE)
+         return VK_ERROR_UNKNOWN;
+      printf("BINARY_FOREIGN_PLAN_REFUSED\n");
+   }
    result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &info, alloc, pipelines);
    for (unsigned i = 0; i < n; i++) {
       destroy(device, binaries[i], NULL);

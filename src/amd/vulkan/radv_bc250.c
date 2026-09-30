@@ -5447,9 +5447,15 @@ VkResult
 radv_bc250_restore_cached_plan(struct radv_device *device, struct radv_graphics_pipeline *pipeline,
                                const struct radv_pipeline_layout *layout,
                                const struct radv_bc250_pipeline_plan *plan,
+                               const struct radv_shader *mesh, const struct radv_shader *fragment,
                                struct radv_shader *producer, struct radv_shader *setup)
 {
-   if (!radv_bc250_pipeline_plan_valid(plan) ||
+   const uint8_t absent_hash[32] = {0};
+   if (!radv_bc250_pipeline_plan_valid(plan) || !mesh || mesh->info.stage != MESA_SHADER_MESH ||
+       (fragment && fragment->info.stage != MESA_SHADER_FRAGMENT) ||
+       memcmp(plan->mesh_hash, mesh->hash, sizeof(plan->mesh_hash)) ||
+       memcmp(plan->fragment_hash, fragment ? fragment->hash : absent_hash, sizeof(plan->fragment_hash)) ||
+       memcmp(plan->hardware_key, &device->compiler_info.hw, sizeof(plan->hardware_key)) ||
        memcmp(plan->route_key, &device->compiler_info.key, sizeof(plan->route_key)) ||
        pipeline->bc250_task_pipeline ||
        pipeline->bc250_setup_pipeline || pipeline->bc250_task_layout)

@@ -56,3 +56,5 @@ fixture_create_instance(const VkInstanceCreateInfo *info, const VkAllocationCall
 #define vkQueueSubmit ((PFN_vkQueueSubmit)fixture_get_proc(fixture_instance, "vkQueueSubmit"))
 #define vkQueueWaitIdle ((PFN_vkQueueWaitIdle)fixture_get_proc(fixture_instance, "vkQueueWaitIdle"))
 #define vkUpdateDescriptorSets ((PFN_vkUpdateDescriptorSets)fixture_get_proc(fixture_instance, "vkUpdateDescriptorSets"))
+
+#define vkDestroyShaderModule ((PFN_vkDestroyShaderModule)fixture_get_proc(fixture_instance, "vkDestroyShaderModule"))

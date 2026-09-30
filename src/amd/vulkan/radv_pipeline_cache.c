@@ -483,7 +483,7 @@ radv_graphics_pipeline_cache_search(struct radv_device *device, struct vk_pipeli
          goto invalid_plan;
       graphics_shaders -= private_shaders;
       /* Validate before reconstructing helpers or publishing shader references. */
-      bool mesh = false;
+      const struct radv_shader *mesh = NULL, *fragment = NULL;
       uint32_t stages = 0;
       for (unsigned i = 0; i < graphics_shaders; i++) {
          const struct radv_shader *shader = pipeline_obj->shaders[i];
@@ -494,13 +494,16 @@ radv_graphics_pipeline_cache_search(struct radv_device *device, struct vk_pipeli
          if (stages & stage)
             goto invalid_plan;
          stages |= stage;
-         mesh |= shader->info.stage == MESA_SHADER_MESH;
+         if (shader->info.stage == MESA_SHADER_MESH)
+            mesh = shader;
+         if (shader->info.stage == MESA_SHADER_FRAGMENT)
+            fragment = shader;
       }
       if (!mesh)
          goto invalid_plan;
       struct radv_shader *producer = private_shaders ? pipeline_obj->shaders[graphics_shaders] : NULL;
       struct radv_shader *setup = private_shaders ? pipeline_obj->shaders[graphics_shaders + 1] : NULL;
-      if (radv_bc250_restore_cached_plan(device, pipeline, layout, plan, producer, setup) != VK_SUCCESS)
+      if (radv_bc250_restore_cached_plan(device, pipeline, layout, plan, mesh, fragment, producer, setup) != VK_SUCCESS)
          goto invalid_plan;
    } else if (device->compiler_info.key.bc250_cache_plan &&
        pipeline->base.type == RADV_PIPELINE_GRAPHICS &&

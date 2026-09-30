@@ -150,6 +150,7 @@ VkResult radv_bc250_restore_cached_plan(struct radv_device *device,
                                        struct radv_graphics_pipeline *pipeline,
                                        const struct radv_pipeline_layout *layout,
                                        const struct radv_bc250_pipeline_plan *plan,
+                                       const struct radv_shader *mesh, const struct radv_shader *fragment,
                                        struct radv_shader *producer, struct radv_shader *setup);
 /* Reads the BC250 hot-path switches into device->bc250_env (radv_device.h). */
 void radv_bc250_device_env_init(struct radv_device *device, const struct radv_physical_device *pdev);

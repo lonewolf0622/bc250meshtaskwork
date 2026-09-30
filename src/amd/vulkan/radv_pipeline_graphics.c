@@ -3708,6 +3708,14 @@ radv_graphics_pipeline_compile(struct radv_graphics_pipeline *pipeline, const Vk
       static_assert(sizeof(compiler_info->key) == sizeof(pipeline->bc250_plan.route_key),
                     "BC250 route policy must retain the complete 24-byte compiler key");
       memcpy(pipeline->bc250_plan.route_key, &compiler_info->key, sizeof(compiler_info->key));
+      static_assert(sizeof(compiler_info->hw) == sizeof(pipeline->bc250_plan.hardware_key),
+                    "BC250 hardware policy must retain all compiler hardware bytes");
+      memcpy(pipeline->bc250_plan.hardware_key, &compiler_info->hw, sizeof(compiler_info->hw));
+      memcpy(pipeline->bc250_plan.mesh_hash, pipeline->base.shaders[MESA_SHADER_MESH]->hash,
+             sizeof(pipeline->bc250_plan.mesh_hash));
+      if (pipeline->base.shaders[MESA_SHADER_FRAGMENT])
+         memcpy(pipeline->bc250_plan.fragment_hash, pipeline->base.shaders[MESA_SHADER_FRAGMENT]->hash,
+                sizeof(pipeline->bc250_plan.fragment_hash));
    }
 
    if (!skip_shaders_cache) {
