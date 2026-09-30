@@ -1205,7 +1205,10 @@ radv_device_init_compiler_info(struct radv_device *device)
       /* Shader based culling efficiency can depend on PS throughput.
        * Estimate an upper limit for PS input param count based on GPU info.
        */
-      nggc_max_ps_params = pdev->info.has_dedicated_vram ? 12 : 8;
+      /* RADV_BC250_NGGC_WIDE: the BC-250 reports as an APU but has GDDR6 and 24 CUs; use the discrete-GPU
+       * limit so more vertex shaders get NGG culling. Off by default. */
+      nggc_max_ps_params = pdev->info.has_dedicated_vram ||
+         (pdev->info.family == CHIP_GFX1013 && debug_get_bool_option("RADV_BC250_NGGC_WIDE", false)) ? 12 : 8;
    }
 
    bool image_2d_view_of_3d = device->vk.enabled_features.image2DViewOf3D && pdev->info.gfx_level == GFX9;

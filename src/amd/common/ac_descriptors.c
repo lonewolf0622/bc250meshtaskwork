@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "util/u_debug.h"
 #include "ac_descriptors.h"
 #include "ac_gpu_info.h"
 #include "ac_formats.h"
@@ -1238,6 +1239,9 @@ ac_set_mutable_ds_surface_fields(const struct radeon_info *info, const struct ac
    }
 }
 
+/* RADV_BC250_DCC_32B: the BC-250 reports as an APU but its memory is GDDR6 (32B minimum request). */
+DEBUG_GET_ONCE_BOOL_OPTION(bc250_dcc_32b, "RADV_BC250_DCC_32B", false)
+
 static uint32_t
 ac_get_dcc_min_compressed_block_size(const struct radeon_info *info)
 {
@@ -1246,7 +1250,8 @@ ac_get_dcc_min_compressed_block_size(const struct radeon_info *info)
     * 32B minimum request size. Sometimes a different size is used depending on the data fabric,
     * etc.
     */
-   return info->has_dedicated_vram || info->family == CHIP_STRIX_HALO ?
+   return info->has_dedicated_vram || info->family == CHIP_STRIX_HALO ||
+          (info->family == CHIP_GFX1013 && debug_get_option_bc250_dcc_32b()) ?
             V_028C78_MIN_BLOCK_SIZE_32B : V_028C78_MIN_BLOCK_SIZE_64B;
 }
 

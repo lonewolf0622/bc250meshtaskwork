@@ -6522,7 +6522,9 @@ radv_bc250_directmesh_env(void)
       {"BC250_EXPERIMENTAL_COMPUTE_CU_MODE", "false"},
       {"BC250_BALANCED_SLICES", "true"}, {"BC250_SINGLE_PIECE", "true"}, {"BC250_CACHE_PLAN", "true"},
       {"BC250_TRANSIENT_ARENA", "true"}, {"BC250_PARALLEL_CULL", "true"}, {"BC250_COMPACT_VERTICES", "false"},
-      {"BC250_OUTPUT_REGIONS", "true"}, {"BC250_EXPERIMENTAL_PRIVATE_GTT", "true"},
+      /* BC250_EXPERIMENTAL_PRIVATE_GTT is not set: it moved every private allocation out of the VRAM
+       * carveout into snooped GTT (a hang experiment, never shown to help). */
+      {"BC250_OUTPUT_REGIONS", "true"},
       {"BC250_EXPERIMENTAL_ZEROED_PRIVATE_GTT", "false"}, {"RADV_BC250_MESH_ONCE", "false"},
       {"BC250_EXPERIMENTAL_DIRECT_SPLIT", "true"}, {"BC250_EXPERIMENTAL_SKIP_INACTIVE_CHUNKS", "true"},
       {"RADV_BC250_SPLIT_MESH", "true"}, {"RADV_BC250_EXPAND_PRIMITIVES", "true"},
