@@ -308,6 +308,7 @@ struct radv_shader_stage {
    bool bc250_lds_refused; /* Refused because the expanded outputs do not fit in LDS. */
    bool bc250_dead_shared; /* The expansion found dead shared-variable copies to drop. */
    bool bc250_expanded; /* Mesh outputs were staged by radv_bc250_expand_primitive_attributes. */
+   bool bc250_empty_output; /* Mesh shader proven to output nothing (both counts literally zero). */
    /* The expansion gave every primitive its own consecutive vertices (no compact vertex map),
     * RADV_BC250_MESH_IMPLICIT_TRIS. */
    bool bc250_private_tris;

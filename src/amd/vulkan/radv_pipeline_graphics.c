@@ -2944,7 +2944,7 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
    if (compiler_info->hw.bc250_mesh_fail_closed && stages[MESA_SHADER_MESH].nir &&
        !stages[MESA_SHADER_MESH].bc250_safe_direct && !stages[MESA_SHADER_MESH].bc250_ordered_export &&
        !stages[MESA_SHADER_MESH].bc250_split_mesh && !stages[MESA_SHADER_MESH].bc250_expanded &&
-       stages[MESA_SHADER_MESH].bc250_merge_k <= 1) {
+       !stages[MESA_SHADER_MESH].bc250_empty_output && stages[MESA_SHADER_MESH].bc250_merge_k <= 1) {
       if (getenv("BC250_TRACE_COMPILE"))
          fprintf(stderr, "BC250 MESH FAIL CLOSED: no protected route (V=%u P=%u prim=%u), refused\n",
                  stages[MESA_SHADER_MESH].nir->info.mesh.max_vertices_out,

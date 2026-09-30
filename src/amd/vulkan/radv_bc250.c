@@ -4779,8 +4779,9 @@ radv_bc250_prepare_bary_affine(const struct radv_compiler_info *ci, struct radv_
    /* A shader with no output stores and only explicit empty count writes uses
     * the ordinary GFX10 fully-culled dummy. Do not shrink a declaration when
     * application output stores/loads could still need its original storage. */
-   if (ci->key.bc250_mesh_safe_bary_last && ci->key.bc250_mesh_safe_bary &&
-       ci->key.bc250_mesh_safe_bary_affine && original && !original->info.mesh.nv &&
+   /* The shrink also serves the fallback routes (without SAFE_BARY/AFFINE): an empty shader then
+    * fits the ordinary expansion instead of being refused for its declared size. */
+   if (ci->key.bc250_mesh_safe_bary_last && original && !original->info.mesh.nv &&
        !original->info.outputs_read && !original->info.outputs_written &&
        !original->info.workgroup_size_variable &&
        original->info.workgroup_size[0] * original->info.workgroup_size[1] *
@@ -4802,6 +4803,26 @@ radv_bc250_prepare_bary_affine(const struct radv_compiler_info *ci, struct radv_
        * (VK_EXT_mesh_shader: the counts are then zero). */
       if (empty && (count_written || debug_get_bool_option("RADV_BC250_MESH_SAFE_SPLIT_PIECES", false))) {
          original->info.mesh.max_vertices_out = original->info.mesh.max_primitives_out = 1;
+         if (!ci->key.bc250_mesh_safe_bary || !ci->key.bc250_mesh_safe_bary_affine) {
+            /* Make both counts literally zero: the output is then nothing at all (no vertex, no
+             * primitive), which needs no protected route. */
+            nir_foreach_block(block, nir_shader_get_entrypoint(original)) {
+               nir_foreach_instr(instr, block) {
+                  if (instr->type != nir_instr_type_intrinsic)
+                     continue;
+                  nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+                  if (in->intrinsic != nir_intrinsic_set_vertex_and_primitive_count)
+                     continue;
+                  nir_builder cb = nir_builder_at(nir_before_instr(instr));
+                  nir_src_rewrite(&in->src[0], nir_imm_int(&cb, 0));
+                  nir_src_rewrite(&in->src[1], nir_imm_int(&cb, 0));
+               }
+            }
+            ms->bc250_empty_output = true;
+            if (getenv("BC250_TRACE_COMPILE"))
+               fprintf(stderr, "BC250 MESH EMPTY: no output stores; declaration shrunk for the fallback\n");
+            return false;
+         }
          ms->bc250_safe_fast = ms->bc250_safe_bary_affine = true;
          if (getenv("BC250_TRACE_COMPILE"))
             fprintf(stderr, "BC250 MESH SAFE EMPTY: no output stores; every count is empty\n");
