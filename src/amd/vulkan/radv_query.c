@@ -975,7 +975,7 @@ radv_alloc_shader_query_buf(struct radv_cmd_buffer *cmd_buffer)
 
    memset(ptr, 0, RADV_SHADER_QUERY_BUF_SIZE);
 
-   cmd_buffer->state.shader_query_buf_va = radv_buffer_get_va(cmd_buffer->upload.upload_bo);
+   cmd_buffer->state.shader_query_buf_va = radv_cmd_buffer_upload_va(cmd_buffer);
    cmd_buffer->state.shader_query_buf_va += offset;
 }
 

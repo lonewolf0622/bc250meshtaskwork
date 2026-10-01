@@ -5,6 +5,7 @@
  */
 
 #include "radv_pipeline_binary.h"
+#include "radv_bc250.h"
 #include "tools/radv_debug.h"
 #include "util/blob.h"
 #include "util/macros.h"
@@ -122,6 +123,146 @@ radv_create_pipeline_binary(struct radv_device *device, const VkAllocationCallba
 
    *pipeline_binary_out = pipeline_binary;
    return VK_SUCCESS;
+}
+
+/* A separate binary carries private draw state; ordinary shader binaries
+ * and all switch-off formats remain untouched. */
+#define RADV_BC250_PLAN_BINARY_MAGIC UINT64_C(0x32304e414c503242)
+
+bool
+radv_bc250_pipeline_binary_is_plan(const struct radv_pipeline_binary *binary)
+{
+   uint64_t magic = 0;
+   if (binary->size >= sizeof(magic))
+      memcpy(&magic, binary->data, sizeof(magic));
+   return magic == RADV_BC250_PLAN_BINARY_MAGIC;
+}
+
+VkResult
+radv_create_pipeline_binary_from_bc250_plan(struct radv_device *device,
+                                           const VkAllocationCallbacks *allocator,
+                                           const struct radv_bc250_pipeline_plan *plan,
+                                           struct radv_shader *producer, struct radv_shader *setup,
+                                           struct util_dynarray *binaries, uint32_t *num_binaries)
+{
+   if (!radv_bc250_pipeline_plan_valid(plan) ||
+       (!!producer != !!(plan->flags & RADV_BC250_PLAN_TASK)) || (!!producer != !!setup))
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   if (!binaries) {
+      (*num_binaries)++;
+      return VK_SUCCESS;
+   }
+   struct blob blob;
+   blob_init(&blob);
+   blob_write_uint64(&blob, RADV_BC250_PLAN_BINARY_MAGIC);
+   blob_write_bytes(&blob, plan, sizeof(*plan));
+   struct radv_shader *shaders[2] = {producer, setup};
+   for (unsigned i = 0; producer && i < 2; i++) {
+      struct blob shader_blob;
+      blob_init(&shader_blob);
+      radv_shader_serialize(shaders[i], &shader_blob);
+      blob_write_uint64(&blob, shader_blob.size);
+      blob_write_bytes(&blob, shaders[i]->hash, sizeof(shaders[i]->hash));
+      blob_write_bytes(&blob, shader_blob.data, shader_blob.size);
+      if (shader_blob.out_of_memory)
+         blob.out_of_memory = true;
+      blob_finish(&shader_blob);
+   }
+   if (blob.out_of_memory) {
+      blob_finish(&blob);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   blake3_hash key;
+   _mesa_blake3_compute(blob.data, blob.size, key);
+   void *data;
+   size_t size;
+   blob_finish_get_buffer(&blob, &data, &size);
+   struct radv_pipeline_binary *binary;
+   VkResult result = radv_create_pipeline_binary(device, allocator, key, data, size, &binary);
+   if (result != VK_SUCCESS) {
+      free(data);
+      return result;
+   }
+   util_dynarray_append(binaries, binary);
+   return VK_SUCCESS;
+}
+
+bool
+radv_bc250_shader_binary_valid(const void *data, size_t size, unsigned stage)
+{
+   if (size < sizeof(struct radv_shader_binary_legacy))
+      return false;
+   struct radv_shader_binary_legacy legacy;
+   memcpy(&legacy, data, sizeof(legacy));
+   const uint64_t total = (uint64_t)sizeof(legacy) + legacy.code_size + legacy.ir_size +
+                          legacy.disasm_size + legacy.stats_size + legacy.debug_info_size;
+   if (legacy.base.type != RADV_BINARY_TYPE_LEGACY || legacy.base.info.stage != stage ||
+       total != legacy.base.total_size || total > size || legacy.exec_size > legacy.code_size)
+      return false;
+   struct blob_reader debug;
+   blob_reader_init(&debug, data, size);
+   blob_skip_bytes(&debug, total);
+   if (debug.current != debug.end) {
+      uint32_t spirv_size = blob_read_uint32(&debug);
+      blob_skip_bytes(&debug, spirv_size);
+      blob_read_string(&debug);
+      blob_read_string(&debug);
+   }
+   return !debug.overrun && debug.current == debug.end;
+}
+
+VkResult
+radv_bc250_pipeline_binary_restore(struct radv_device *device, struct radv_graphics_pipeline *pipeline,
+                                   const struct radv_pipeline_layout *layout,
+                                   const struct radv_pipeline_binary *binary)
+{
+   blake3_hash key;
+   _mesa_blake3_compute(binary->data, binary->size, key);
+   if (!device->bc250_env.pipeline_plan || memcmp(key, binary->key, sizeof(key)))
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   struct blob_reader blob;
+   blob_reader_init(&blob, binary->data, binary->size);
+   if (blob_read_uint64(&blob) != RADV_BC250_PLAN_BINARY_MAGIC)
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   struct radv_bc250_pipeline_plan plan;
+   blob_copy_bytes(&blob, &plan, sizeof(plan));
+   if (blob.overrun || !radv_bc250_pipeline_plan_valid(&plan))
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   const void *shader_data[2] = {NULL, NULL};
+   size_t shader_size[2] = {0, 0};
+   blake3_hash hashes[2];
+   for (unsigned i = 0; (plan.flags & RADV_BC250_PLAN_TASK) && i < 2; i++) {
+      uint64_t size = blob_read_uint64(&blob);
+      if (blob.overrun || size > SIZE_MAX)
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+      shader_size[i] = size;
+      blob_copy_bytes(&blob, hashes[i], sizeof(hashes[i]));
+      shader_data[i] = blob_read_bytes(&blob, size);
+      if (blob.overrun || !radv_bc250_shader_binary_valid(shader_data[i], size, MESA_SHADER_COMPUTE))
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
+   if (blob.overrun || blob.current != blob.end)
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   struct radv_shader *shaders[2] = {NULL, NULL};
+   VkResult result = VK_SUCCESS;
+   for (unsigned i = 0; (plan.flags & RADV_BC250_PLAN_TASK) && i < 2; i++) {
+      struct blob_reader shader_blob;
+      blob_reader_init(&shader_blob, shader_data[i], shader_size[i]);
+      shaders[i] = radv_shader_deserialize(device, hashes[i], sizeof(hashes[i]), &shader_blob);
+      if (!shaders[i]) {
+         result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+         goto done;
+      }
+   }
+   result = radv_bc250_restore_cached_plan(device, pipeline, layout, &plan,
+      pipeline->base.shaders[MESA_SHADER_MESH], pipeline->base.shaders[MESA_SHADER_FRAGMENT],
+      shaders[0], shaders[1]);
+done:
+   for (unsigned i = 0; i < 2; i++) {
+      if (shaders[i])
+         radv_shader_unref(device, shaders[i]);
+   }
+   return result;
 }
 
 static VkResult
@@ -269,6 +410,9 @@ radv_create_pipeline_binary_from_pipeline(struct radv_device *device, const VkAl
             return result;
       }
    } else {
+      if (pipeline->type == RADV_PIPELINE_GRAPHICS_LIB &&
+          radv_pipeline_to_graphics_lib(pipeline)->bc250_source_only)
+         return VK_ERROR_FEATURE_NOT_PRESENT;
       for (uint32_t i = 0; i < MESA_VULKAN_SHADER_STAGES; i++) {
          if (!pipeline->shaders[i])
             continue;
@@ -284,6 +428,23 @@ radv_create_pipeline_binary_from_pipeline(struct radv_device *device, const VkAl
                                                           pipeline_binaries, num_binaries);
          if (result != VK_SUCCESS)
             return result;
+      }
+      const bool complete_lib = pipeline->type == RADV_PIPELINE_GRAPHICS_LIB &&
+         device->bc250_env.gpl_binary_link &&
+         radv_pipeline_to_graphics_lib(pipeline)->lib_flags ==
+            (VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT |
+             VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT |
+             VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT |
+             VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT);
+      if (device->bc250_env.pipeline_plan &&
+          (pipeline->type == RADV_PIPELINE_GRAPHICS || complete_lib) && pipeline->shaders[MESA_SHADER_MESH]) {
+         struct radv_graphics_pipeline *graphics = complete_lib ?
+            &radv_pipeline_to_graphics_lib(pipeline)->base : radv_pipeline_to_graphics(pipeline);
+         VK_FROM_HANDLE(radv_pipeline, producer, graphics->bc250_task_pipeline);
+         VK_FROM_HANDLE(radv_pipeline, setup, graphics->bc250_setup_pipeline);
+         result = radv_create_pipeline_binary_from_bc250_plan(device, pAllocator, &graphics->bc250_plan,
+                     producer ? producer->shaders[MESA_SHADER_COMPUTE] : NULL,
+                     producer && setup ? setup->shaders[MESA_SHADER_COMPUTE] : NULL, pipeline_binaries, num_binaries);
       }
    }
 

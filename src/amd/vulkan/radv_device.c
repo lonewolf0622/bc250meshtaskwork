@@ -915,6 +915,10 @@ radv_device_init_cache_key(struct radv_device *device)
    memcpy(&bc250x, &device->compiler_info.bc250x, sizeof(bc250x));
    if (bc250x)
       _mesa_blake3_update(&ctx, &bc250x, sizeof(bc250x));
+   if (device->bc250_env.pipeline_plan) {
+      static const char tag[] = "bc250-pipeline-plan-v8";
+      _mesa_blake3_update(&ctx, tag, sizeof(tag));
+   }
    _mesa_blake3_final(&ctx, device->cache_hash);
    if (debug_get_bool_option("BC250_CAPTURE_POLICY_SHADERS", false)) {
       fprintf(stderr, "BC250POLICYCACHE cu=%u hash=", device->compiler_info.key.bc250_compute_cu_mode);
@@ -1224,7 +1228,7 @@ radv_device_init_compiler_info(struct radv_device *device)
     * That means the driver should compile shaders for the "worst" case of all features being
     * enabled, regardless of what features are actually enabled on the logical device.
     */
-   if (device->vk.enabled_features.shaderObject) {
+   if (device->vk.enabled_features.shaderObject || device->bc250_env.shader_object_plan) {
       image_2d_view_of_3d = pdev->info.gfx_level == GFX9;
       primitives_generated_query = true;
    }
@@ -1644,6 +1648,11 @@ radv_destroy_device(struct radv_device *device, const VkAllocationCallbacks *pAl
 
    _mesa_hash_table_destroy(device->rt_handles, NULL);
 
+   if (device->bc250_dgc_query_states) {
+      hash_table_u64_foreach(device->bc250_dgc_query_states, entry)
+         free(entry.data);
+      _mesa_hash_table_u64_destroy(device->bc250_dgc_query_states);
+   }
    radv_device_finish_meta(device);
    radv_device_finish_tools(device);
    radv_device_finish_memory_cache(device);
@@ -1990,13 +1999,14 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
    radv_device_init_cache_key(device);
 
    if (device->vk.enabled_features.vertexInputDynamicState || device->vk.enabled_features.graphicsPipelineLibrary ||
-       device->vk.enabled_features.shaderObject) {
+       device->vk.enabled_features.shaderObject || device->bc250_env.shader_object_plan) {
       result = radv_device_init_vs_prologs(device);
       if (result != VK_SUCCESS)
          goto fail;
    }
 
    if (device->vk.enabled_features.graphicsPipelineLibrary || device->vk.enabled_features.shaderObject ||
+       device->bc250_env.shader_object_plan ||
        device->vk.enabled_features.extendedDynamicState3ColorBlendEnable ||
        device->vk.enabled_features.extendedDynamicState3ColorWriteMask ||
        device->vk.enabled_features.extendedDynamicState3AlphaToCoverageEnable ||

@@ -347,6 +347,8 @@ struct radv_shader_stage {
    /* BC250 barycentrics: the two generic slots this last pre-rasterization stage
     * exports its position to (radv_nir_bc250_export_bary_ref), 0 if none. */
    uint64_t bc250_bary_ref_mask;
+   int8_t bc250_bary_raw_slot;
+   int8_t bc250_bary_flat_slot;
    nir_shader *gs_copy_shader;
    nir_shader *internal_nir; /* meta shaders */
 

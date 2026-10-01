@@ -88,6 +88,13 @@ radv_CreatePipelineLayout(VkDevice _device, const VkPipelineLayoutCreateInfo *pC
    radv_pipeline_layout_init(device, layout, pCreateInfo->flags & VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT);
 
    layout->num_sets = pCreateInfo->setLayoutCount;
+   if (radv_device_physical(device)->bc250_expose_dgc) {
+      for (unsigned i = 0; i < pCreateInfo->pushConstantRangeCount; i++) {
+         const VkPushConstantRange *range = &pCreateInfo->pPushConstantRanges[i];
+         for (unsigned word = range->offset / 4; word < (range->offset + range->size) / 4; word++)
+            layout->bc250_pc_stages[word] |= range->stageFlags;
+      }
+   }
 
    for (uint32_t set = 0; set < pCreateInfo->setLayoutCount; set++) {
       VK_FROM_HANDLE(radv_descriptor_set_layout, set_layout, pCreateInfo->pSetLayouts[set]);

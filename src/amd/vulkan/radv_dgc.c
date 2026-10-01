@@ -5,6 +5,7 @@
  */
 
 #include "radv_dgc.h"
+#include "radv_bc250_dgc.h"
 #include "meta/radv_meta.h"
 #include "nir/radv_meta_nir.h"
 #include "tools/radv_debug.h"
@@ -3024,7 +3025,8 @@ radv_create_dgc_pipeline(struct radv_device *device, struct radv_indirect_comman
    if (result != VK_SUCCESS)
       return result;
 
-   nir_shader *cs = build_dgc_prepare_shader(device, layout);
+   nir_shader *cs = radv_bc250_dgc_layout(device, layout) ? radv_bc250_dgc_shader(device, layout) :
+      build_dgc_prepare_shader(device, layout);
 
    const VkPipelineShaderStageCreateInfo stage_info = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -3062,6 +3064,10 @@ radv_GetGeneratedCommandsMemoryRequirementsEXT(VkDevice _device,
    VK_FROM_HANDLE(radv_indirect_execution_set, ies, pInfo->indirectExecutionSet);
    struct dgc_cmdbuf_layout cmdbuf_layout;
 
+   if (radv_bc250_dgc_layout(device, layout)) {
+      radv_bc250_dgc_requirements(device, pInfo, pMemoryRequirements);
+      return;
+   }
    get_dgc_cmdbuf_layout(device, layout, ies, pInfo->pNext, pInfo->maxSequenceCount, true, &cmdbuf_layout);
 
    pMemoryRequirements->memoryRequirements.memoryTypeBits = pdev->memory_types_32bit;
@@ -3096,6 +3102,10 @@ radv_CmdPreprocessGeneratedCommandsEXT(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(radv_cmd_buffer, state_cmd_buffer, stateCommandBuffer);
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
    VK_FROM_HANDLE(radv_indirect_command_layout, layout, pGeneratedCommandsInfo->indirectCommandsLayout);
+   if (radv_bc250_dgc_layout(radv_cmd_buffer_device(cmd_buffer), layout)) {
+      radv_bc250_dgc_prepare(cmd_buffer, pGeneratedCommandsInfo, state_cmd_buffer);
+      return;
+   }
    const bool execution_is_predicating = state_cmd_buffer->state.cond_render.enabled;
 
    assert(layout->vk.usage & VK_INDIRECT_COMMANDS_LAYOUT_USAGE_EXPLICIT_PREPROCESS_BIT_EXT);
@@ -3344,7 +3354,7 @@ radv_prepare_dgc(struct radv_cmd_buffer *cmd_buffer, const VkGeneratedCommandsIn
                                 &upload_data, &params);
    }
 
-   params.params_addr = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + upload_offset;
+   params.params_addr = radv_cmd_buffer_upload_va(cmd_buffer) + upload_offset;
 
    if (layout->push_constant_mask) {
       params.const_copy = dgc_pc_info.need_upload;
@@ -3402,6 +3412,20 @@ radv_CreateIndirectCommandsLayoutEXT(VkDevice _device, const VkIndirectCommandsL
    layout = vk_indirect_command_layout_create(&device->vk, pCreateInfo, pAllocator, sizeof(*layout));
    if (!layout)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   layout->bc250_pc_stages_valid = true;
+   if (radv_device_physical(device)->bc250_expose_dgc) {
+      VK_FROM_HANDLE(radv_pipeline_layout, pl, pCreateInfo->pipelineLayout);
+      const VkShaderStageFlags graphics = VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_TASK_BIT_EXT |
+         VK_SHADER_STAGE_FRAGMENT_BIT;
+      for (unsigned i = 0; i < layout->vk.n_pc_layouts + !!(layout->vk.dgc_info & BITFIELD_BIT(MESA_VK_DGC_SI)); i++) {
+         const struct vk_indirect_command_push_constant_layout *pc = i < layout->vk.n_pc_layouts ?
+            &layout->vk.pc_layouts[i] : &layout->vk.si_layout;
+         for (unsigned word = pc->dst_offset_B / 4; word < (pc->dst_offset_B + pc->size_B) / 4; word++)
+            if (!pl || (pc->stages & pl->bc250_pc_stages[word] & graphics) != (pl->bc250_pc_stages[word] & graphics))
+               layout->bc250_pc_stages_valid = false;
+      }
+   }
 
    for (uint32_t i = 0; i < layout->vk.n_pc_layouts; i++) {
       for (uint32_t j = layout->vk.pc_layouts[i].dst_offset_B / 4, k = 0; k < layout->vk.pc_layouts[i].size_B / 4;

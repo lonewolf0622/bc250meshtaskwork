@@ -890,7 +890,8 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device 
       .EXT_descriptor_indexing = true,
       .EXT_device_address_binding_report = true,
       .EXT_device_fault = true,
-      .EXT_device_generated_commands = !(pdev->bc250_hybrid_task || pdev->bc250_native_task) && pdev->info.gfx_level >= GFX8,
+      .EXT_device_generated_commands = pdev->bc250_native_mesh ? pdev->bc250_expose_dgc :
+         (!(pdev->bc250_hybrid_task || pdev->bc250_native_task) && pdev->info.gfx_level >= GFX8),
       .EXT_device_memory_report = true,
       .EXT_discard_rectangles = true,
 #ifdef VK_USE_PLATFORM_DISPLAY_KHR
@@ -1584,7 +1585,8 @@ radv_physical_device_get_features(const struct radv_physical_device *pdev, struc
       .depthClampControl = true,
 
       /* VK_EXT_device_generated_commands */
-      .deviceGeneratedCommands = !(pdev->bc250_hybrid_task || pdev->bc250_native_task),
+      .deviceGeneratedCommands = pdev->bc250_native_mesh ? pdev->bc250_expose_dgc :
+         !(pdev->bc250_hybrid_task || pdev->bc250_native_task),
       .dynamicGeneratedPipelineLayout = true,
 
       /* VK_KHR_maintenance8 */
@@ -2391,7 +2393,8 @@ radv_get_physical_device_properties(struct radv_physical_device *pdev)
       .supportedIndirectCommandsInputModes = VK_INDIRECT_COMMANDS_INPUT_MODE_VULKAN_INDEX_BUFFER_EXT |
                                              VK_INDIRECT_COMMANDS_INPUT_MODE_DXGI_INDEX_BUFFER_EXT,
       .supportedIndirectCommandsShaderStages =
-         VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT | taskmesh_stages | rt_stages,
+         VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT | taskmesh_stages | rt_stages |
+         (pdev->bc250_expose_dgc && pdev->bc250_hybrid_task ? VK_SHADER_STAGE_TASK_BIT_EXT : 0),
       .supportedIndirectCommandsShaderStagesPipelineBinding = VK_SHADER_STAGE_COMPUTE_BIT,
       .supportedIndirectCommandsShaderStagesShaderBinding = VK_SHADER_STAGE_COMPUTE_BIT,
       .deviceGeneratedCommandsTransformFeedback = true,
@@ -2775,6 +2778,8 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
       debug_get_bool_option("RADV_BC250_HYBRID_TASK", false) && !(bc250_dxvk && radv_bc250_directmesh_hybrid);
    if (pdev->bc250_native_mesh && bc250_dxvk && radv_bc250_directmesh_hybrid && getenv("BC250_TRACE_COMPILE"))
       fprintf(stderr, "radv/bc250: DXVK: hybrid Task off, GPL/shader objects/pipeline binaries kept\n");
+   pdev->bc250_expose_dgc = pdev->bc250_native_mesh && !pdev->bc250_native_task &&
+      debug_get_bool_option("RADV_BC250_EXPOSE_DGC", false);
    pdev->bc250_fast_binding = pdev->bc250_native_mesh &&
       debug_get_bool_option("RADV_BC250_EXPOSE_FAST_BINDING", false);
    /* GFX1013 has no ROTATE_PC_PTR or LOAD_PROVOKING_VTX; the fragment shader

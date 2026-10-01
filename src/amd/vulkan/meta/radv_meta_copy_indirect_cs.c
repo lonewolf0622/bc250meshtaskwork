@@ -153,7 +153,7 @@ radv_compute_copy_memory_indirect(struct radv_cmd_buffer *cmd_buffer,
       return;
    }
 
-   const uint64_t upload_addr = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + alloc_offset;
+   const uint64_t upload_addr = radv_cmd_buffer_upload_va(cmd_buffer) + alloc_offset;
 
    result = radv_compute_copy_memory_indirect_preprocess(cmd_buffer, pCopyMemoryIndirectInfo, upload_addr);
    if (result != VK_SUCCESS) {
@@ -390,7 +390,7 @@ radv_compute_copy_memory_to_image_indirect(struct radv_cmd_buffer *cmd_buffer,
       return;
    }
 
-   const uint64_t upload_addr = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + alloc_offset;
+   const uint64_t upload_addr = radv_cmd_buffer_upload_va(cmd_buffer) + alloc_offset;
 
    result =
       radv_compute_copy_memory_to_image_indirect_preprocess(cmd_buffer, pCopyMemoryToImageIndirectInfo, upload_addr);

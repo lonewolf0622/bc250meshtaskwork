@@ -147,6 +147,10 @@ struct radv_shader_abort_data {
  * ~150 variables). Same values as the per-call reads as long as the process
  * environment does not change after device creation. */
 struct radv_bc250_device_env {
+   bool gpl_source_link; /* RADV_BC250_GPL_SOURCE_LINK: conservative final-source linking. */
+   bool gpl_binary_link; /* RADV_BC250_GPL_BINARY_LINK: complete executable libraries. */
+   bool shader_object_plan; /* RADV_BC250_SHADER_OBJECT_PLAN: linked executable ownership. */
+   bool pipeline_plan; /* RADV_BC250_PIPELINE_PLAN: opt-in portable cache plan. */
    bool chain_trace;          /* BC250_CHAIN_TRACE on GFX1013 (radv_bc250_chain_enabled) */
    bool chain_shader_only;    /* BC250_CHAIN_SHADER_ONLY */
    bool chain_arguments_only; /* BC250_CHAIN_ARGUMENTS_ONLY */
@@ -194,6 +198,8 @@ struct radv_device {
     * created with an unoptimized ACO build first (radv_pipeline_graphics.c). */
    bool bc250_async;
    struct util_queue bc250_async_queue;
+   /* DGC query-state certificates, protected by meta_state.mtx. */
+   struct hash_table_u64 *bc250_dgc_query_states;
    uint64_t bc250_trace_device_id; /* Process-local diagnostic generation. */
    struct radv_bc250_mesh_timer bc250_timer; /* BC250_MESH_TIMER (radv_bc250_timer.h) */
    /* RADV_BC250_COMPUTE_QUEUE_PRIORITY (radv_queue.c): the kernel context priority of compute-family

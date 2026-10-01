@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: MIT
+#version 460
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x = 32) in;
+struct P { uint base; };
+taskPayloadSharedEXT P payload;
+void main()
+{
+   if (gl_LocalInvocationIndex == 0)
+      payload.base = gl_WorkGroupID.x + 1;
+   EmitMeshTasksEXT(1, 1, 1);
+}

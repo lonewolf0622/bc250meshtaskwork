@@ -564,6 +564,19 @@ struct radv_cmd_buffer {
    uint64_t descriptor_buffers[MAX_SETS];
    uint64_t descriptor_heaps[RADV_MAX_HEAPS];
 
+   /* DGC capture writes uploads into its preprocess-owned arena. */
+   uint64_t bc250_dgc_upload_va;
+   uint64_t bc250_dgc_application_va;
+   bool bc250_dgc_merged_constants;
+   bool bc250_dgc_inherit_graphics_state;
+   uint64_t bc250_dgc_nonuniform_pc;
+   VkShaderStageFlags bc250_dgc_pc_stages[MAX_PUSH_CONSTANTS_SIZE / 4];
+   /* Capture-only typed Task constant uploads for a reusable count IB. */
+   struct {
+      uint32_t offsets[2050];
+      unsigned count;
+      bool overflow;
+   } *bc250_dgc_task_uploads;
    struct radv_cmd_buffer_upload upload;
    struct radv_cmd_buffer_upload *bc250_small_arena;
    uint64_t bc250_ordered_arena;
@@ -707,6 +720,13 @@ radv_get_num_pipeline_stat_queries(struct radv_cmd_buffer *cmd_buffer)
 }
 
 bool radv_cmd_buffer_uses_mec(struct radv_cmd_buffer *cmd_buffer);
+
+static inline uint64_t
+radv_cmd_buffer_upload_va(const struct radv_cmd_buffer *cmd_buffer)
+{
+   return cmd_buffer->bc250_dgc_upload_va ? cmd_buffer->bc250_dgc_upload_va :
+      radv_buffer_get_va(cmd_buffer->upload.upload_bo);
+}
 
 bool radv_cmd_buffer_upload_alloc_aligned(struct radv_cmd_buffer *cmd_buffer, unsigned size, unsigned alignment,
                                           unsigned *out_offset, void **ptr);

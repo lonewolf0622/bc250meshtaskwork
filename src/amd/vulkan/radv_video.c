@@ -1182,7 +1182,7 @@ radv_CmdControlVideoCodingKHR(VkCommandBuffer commandBuffer, const VkVideoCoding
    if (vid->dec->embedded_size) {
       uint32_t offset;
       radv_vid_buffer_upload_alloc(cmd_buffer, vid->dec->embedded_size, &offset, &cmd.embedded_ptr);
-      cmd.embedded_va = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + offset;
+      cmd.embedded_va = radv_cmd_buffer_upload_va(cmd_buffer) + offset;
    }
 
    int ret = vid->dec->build_create_cmd(vid->dec, &cmd);
@@ -1917,7 +1917,7 @@ radv_CmdDecodeVideoKHR(VkCommandBuffer commandBuffer, const VkVideoDecodeInfoKHR
    if (vid->dec->embedded_size) {
       uint32_t offset;
       radv_vid_buffer_upload_alloc(cmd_buffer, vid->dec->embedded_size, &offset, &cmd.embedded_ptr);
-      cmd.embedded_va = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + offset;
+      cmd.embedded_va = radv_cmd_buffer_upload_va(cmd_buffer) + offset;
    }
 
    switch (vid->vk.op) {

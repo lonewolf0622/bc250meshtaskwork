@@ -3,6 +3,7 @@
 #define RADV_BC250_H
 #include "vulkan/vulkan_core.h"
 #include <stdbool.h>
+#include "radv_bc250_route.h"
 struct radv_device;
 struct radv_graphics_pipeline;
 struct radv_graphics_pipeline_state;
@@ -10,6 +11,8 @@ struct radv_cmd_buffer;
 VkResult radv_bc250_prepare_task(struct radv_device *device,
                                 struct radv_graphics_pipeline *pipeline,
                                 const struct radv_graphics_pipeline_state *gfx_state);
+void radv_bc250_draw_task_dgc(struct radv_cmd_buffer *cmd_buffer, uint64_t input,
+                              uint64_t count, uint32_t draw_id, uint64_t *scratch);
 void radv_bc250_draw_task(struct radv_cmd_buffer *cmd_buffer,
                          uint32_t x, uint32_t y, uint32_t z);
 void radv_bc250_draw_task_indirect(struct radv_cmd_buffer *cmd_buffer, uint64_t address,
@@ -146,6 +149,23 @@ bool radv_bc250_split_mesh(struct nir_shader *mesh, struct nir_shader *task, str
                            bool compact_lds, unsigned piece_ceiling, unsigned min_pieces, unsigned *pieces_out);
 struct radv_shader;
 struct radv_physical_device;
+struct radv_pipeline_layout;
+struct radv_bc250_pipeline_plan;
+struct radv_shader_stage;
+bool radv_bc250_pipeline_plan_admitted(const struct radv_bc250_pipeline_plan *plan,
+                                       const struct radv_shader *mesh);
+void radv_bc250_capture_pipeline_plan(const struct radv_device *device,
+                                      struct radv_graphics_pipeline *pipeline,
+                                      const struct radv_shader_stage *mesh_stage);
+VkResult radv_bc250_restore_cached_plan(struct radv_device *device,
+                                       struct radv_graphics_pipeline *pipeline,
+                                       const struct radv_pipeline_layout *layout,
+                                       const struct radv_bc250_pipeline_plan *plan,
+                                       const struct radv_shader *mesh, const struct radv_shader *fragment,
+                                       struct radv_shader *producer, struct radv_shader *setup);
+/* Select the immutable helper owner without binding a pipeline for shader objects. */
+struct radv_graphics_pipeline *radv_bc250_mesh_pipeline(const struct radv_cmd_buffer *cmd_buffer);
+
 /* Reads the BC250 hot-path switches into device->bc250_env (radv_device.h). */
 void radv_bc250_device_env_init(struct radv_device *device, const struct radv_physical_device *pdev);
 bool radv_bc250_chain_enabled(const struct radv_device *device);
@@ -160,6 +180,6 @@ void radv_bc250_draw_merge_indirect(struct radv_cmd_buffer *cmd_buffer, unsigned
 
 struct radv_shader;
 void radv_bc250_report_mesh_route(const struct radv_device *device, const struct radv_shader *shader,
-                                  const char *object, unsigned pieces, bool task, bool ordered);
+                                  const char *object, unsigned pieces, bool task, bool ordered, bool empty);
 
 #endif

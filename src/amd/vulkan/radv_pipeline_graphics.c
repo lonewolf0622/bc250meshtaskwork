@@ -2328,7 +2328,7 @@ radv_pipeline_load_retained_shaders(const struct radv_device *device, const VkGr
       return;
 
    /* Nothing to load if fast-linking is enabled and if there is no retained shaders. */
-   if (radv_should_import_lib_binaries(create_flags))
+   if (radv_should_import_lib_binaries(create_flags) && !device->bc250_env.gpl_source_link)
       return;
 
    for (uint32_t i = 0; i < libs_info->libraryCount; i++) {
@@ -2563,6 +2563,10 @@ radv_bc250_link_bary_rotation(const struct radv_compiler_info *compiler_info, st
 
    NIR_PASS(_, fs, radv_nir_bc250_lower_bary_rotation, raw_slot, flat_slot, num_raster_vertices_per_prim,
             gfx_state->bc250_ps_dynamic_provoking, gfx_state->rs.provoking_vtx_last);
+   if (producer) {
+      producer->bc250_bary_raw_slot = raw_slot;
+      producer->bc250_bary_flat_slot = flat_slot;
+   }
    nir_shader_gather_info(fs, nir_shader_get_entrypoint(fs));
    return VK_SUCCESS;
 }
@@ -2970,9 +2974,12 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
     * none of them would draw the API connectivity unchecked (the route the hang rules forbid):
     * refuse it. The refused-pipeline retry may still split it; otherwise pipeline creation fails. */
    if (compiler_info->hw.bc250_mesh_fail_closed && stages[MESA_SHADER_MESH].nir &&
-       !stages[MESA_SHADER_MESH].bc250_safe_direct && !stages[MESA_SHADER_MESH].bc250_ordered_export &&
-       !stages[MESA_SHADER_MESH].bc250_split_mesh && !stages[MESA_SHADER_MESH].bc250_expanded &&
-       !stages[MESA_SHADER_MESH].bc250_empty_output && stages[MESA_SHADER_MESH].bc250_merge_k <= 1) {
+       !radv_bc250_mesh_protected_route(stages[MESA_SHADER_MESH].bc250_safe_direct,
+                                       stages[MESA_SHADER_MESH].bc250_ordered_export,
+                                       stages[MESA_SHADER_MESH].bc250_split_mesh,
+                                       stages[MESA_SHADER_MESH].bc250_expanded,
+                                       stages[MESA_SHADER_MESH].bc250_merge_k,
+                                       stages[MESA_SHADER_MESH].bc250_empty_output)) {
       if (getenv("BC250_TRACE_COMPILE"))
          fprintf(stderr, "BC250 MESH FAIL CLOSED: no protected route (V=%u P=%u prim=%u), refused\n",
                  stages[MESA_SHADER_MESH].nir->info.mesh.max_vertices_out,
@@ -3561,6 +3568,24 @@ fail:
    return result;
 }
 
+/* Normalize the library subsets: a complete library and its final link must
+ * describe the same compiler state even when the link contributes no subset. */
+static void
+radv_bc250_graphics_state_hash(const struct radv_device *device,
+                               const VkGraphicsPipelineCreateInfo *info,
+                               const struct radv_graphics_pipeline_state *gfx_state, uint8_t hash[32])
+{
+   struct radv_pipeline_layout layout = gfx_state->layout;
+   radv_pipeline_layout_hash(&layout);
+   const struct radv_graphics_pipeline_key key =
+      radv_generate_graphics_pipeline_key(device, info, &gfx_state->vk, ALL_GRAPHICS_LIB_FLAGS);
+   struct mesa_blake3 ctx;
+   _mesa_blake3_init(&ctx);
+   radv_pipeline_hash(device, &layout, &ctx);
+   _mesa_blake3_update(&ctx, &key.gfx_state, sizeof(key.gfx_state));
+   _mesa_blake3_final(&ctx, hash);
+}
+
 void
 radv_graphics_pipeline_hash(const struct radv_device *device, const struct radv_graphics_pipeline_state *gfx_state,
                             unsigned char *hash)
@@ -3736,20 +3761,21 @@ radv_graphics_pipeline_compile(struct radv_graphics_pipeline *pipeline, const Vk
     * argument helper. Reconstruct those before lookup; task-backed pipelines
     * retain their existing cache exclusion until their metadata is covered. */
    bool found_in_application_cache = true;
-   const bool restored_bc250 = bc250_prepare_before_cache && compiler_info->key.bc250_cache_plan &&
+   const bool restored_bc250 = bc250_prepare_before_cache &&
+      (compiler_info->key.bc250_cache_plan || device->bc250_env.pipeline_plan) &&
       pipeline->base.type == RADV_PIPELINE_GRAPHICS && !skip_shaders_cache &&
-      radv_graphics_pipeline_cache_search(device, cache, pipeline, &found_in_application_cache);
+      radv_graphics_pipeline_cache_search(device, cache, pipeline, &gfx_state->layout, &found_in_application_cache);
    if (bc250_prepare_before_cache && !restored_bc250) {
       if (pipeline->base.create_flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT)
          return VK_PIPELINE_COMPILE_REQUIRED;
       result = radv_bc250_prepare_task(device, pipeline, gfx_state);
       if (result != VK_SUCCESS)
          return result;
-      skip_shaders_cache |= pipeline->bc250_task_pipeline != VK_NULL_HANDLE;
+      skip_shaders_cache |= pipeline->bc250_task_pipeline != VK_NULL_HANDLE && !device->bc250_env.pipeline_plan;
    }
 
    if (restored_bc250 || (!skip_shaders_cache &&
-       radv_graphics_pipeline_cache_search(device, cache, pipeline, &found_in_application_cache))) {
+       radv_graphics_pipeline_cache_search(device, cache, pipeline, &gfx_state->layout, &found_in_application_cache))) {
       if (bc250_prepare_before_cache && getenv("BC250_TRACE_COMPILE"))
          fprintf(stderr, "BC250 graphics cache hit: split_pieces=%u\n", pipeline->bc250_direct_split_pieces);
       if (found_in_application_cache)
@@ -3797,7 +3823,9 @@ radv_graphics_pipeline_compile(struct radv_graphics_pipeline *pipeline, const Vk
    struct radv_shader_debug_info debug[MESA_VULKAN_SHADER_STAGES] = {0};
    struct radv_shader_debug_info gs_copy_debug = {0};
    struct radv_bc250_async_job *async_job = NULL;
-   if (!retained_shaders && radv_bc250_async_allowed(device, pipeline, stages, fast_linking_enabled))
+   /* The pipeline plan is captured from the final binaries: no quick/optimized swap with it. */
+   if (!retained_shaders && !device->bc250_env.pipeline_plan &&
+       radv_bc250_async_allowed(device, pipeline, stages, fast_linking_enabled))
       async_job = calloc(1, sizeof(*async_job));
    bc250_async_capture = async_job;
    VkResult compile_result = radv_graphics_shaders_compile(compiler_info, cache, stages, &gfx_state->key.gfx_state, pipeline->base.is_internal,
@@ -3813,6 +3841,13 @@ radv_graphics_pipeline_compile(struct radv_graphics_pipeline *pipeline, const Vk
    /* RADV_BC250_ASYNC_COMPILE: the quick binaries are never cached. */
    radv_graphics_shaders_create(device, cache, skip_shaders_cache || async_job, pipeline->base.shaders, binaries, debug,
                                 &pipeline->base.gs_copy_shader, gs_copy_binary, &gs_copy_debug);
+
+   if (device->bc250_env.pipeline_plan && pipeline->base.shaders[MESA_SHADER_MESH]) {
+      radv_bc250_capture_pipeline_plan(device, pipeline, &stages[MESA_SHADER_MESH]);
+      radv_bc250_graphics_state_hash(device, pCreateInfo, gfx_state, pipeline->bc250_plan.state_hash);
+      if (!radv_bc250_pipeline_plan_admitted(&pipeline->bc250_plan, pipeline->base.shaders[MESA_SHADER_MESH]))
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
 
    if (async_job) {
       async_job->device = device;
@@ -3986,23 +4021,44 @@ radv_needs_null_export_workaround(const struct radv_device *device, const struct
 
 static VkResult
 radv_graphics_pipeline_import_binaries(struct radv_device *device, struct radv_graphics_pipeline *pipeline,
+                                       const struct radv_pipeline_layout *layout,
                                        const VkPipelineBinaryInfoKHR *binary_info)
 {
    blake3_hash pipeline_hash;
    struct mesa_blake3 ctx;
 
    _mesa_blake3_init(&ctx);
+   const struct radv_pipeline_binary *plan_binary = NULL;
 
    for (uint32_t i = 0; i < binary_info->binaryCount; i++) {
       VK_FROM_HANDLE(radv_pipeline_binary, pipeline_binary, binary_info->pPipelineBinaries[i]);
       struct radv_shader *shader;
       struct blob_reader blob;
 
+      if (radv_bc250_pipeline_binary_is_plan(pipeline_binary)) {
+         const bool complete_lib = pipeline->base.type == RADV_PIPELINE_GRAPHICS_LIB &&
+            device->bc250_env.gpl_binary_link &&
+            radv_pipeline_to_graphics_lib(&pipeline->base)->lib_flags == ALL_GRAPHICS_LIB_FLAGS;
+         if (!device->bc250_env.pipeline_plan || plan_binary ||
+             (pipeline->base.type != RADV_PIPELINE_GRAPHICS && !complete_lib))
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+         plan_binary = pipeline_binary;
+         _mesa_blake3_update(&ctx, pipeline_binary->key, sizeof(pipeline_binary->key));
+         continue;
+      }
+
       blob_reader_init(&blob, pipeline_binary->data, pipeline_binary->size);
 
       shader = radv_shader_deserialize(device, pipeline_binary->key, sizeof(pipeline_binary->key), &blob);
       if (!shader)
          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      if (device->bc250_env.pipeline_plan &&
+          (blob.overrun || shader->info.stage >= MESA_VULKAN_SHADER_STAGES ||
+           shader->info.stage == MESA_SHADER_TASK || shader->info.stage == MESA_SHADER_COMPUTE ||
+           pipeline->base.shaders[shader->info.stage])) {
+         radv_shader_unref(device, shader);
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+      }
 
       if (shader->info.stage == MESA_SHADER_VERTEX && i > 0) {
          /* The GS copy-shader is a VS placed after all other stages. */
@@ -4015,6 +4071,16 @@ radv_graphics_pipeline_import_binaries(struct radv_device *device, struct radv_g
    }
 
    _mesa_blake3_final(&ctx, pipeline_hash);
+
+   if (device->bc250_env.pipeline_plan && pipeline->base.shaders[MESA_SHADER_MESH]) {
+      if (!plan_binary)
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+      VkResult result = radv_bc250_pipeline_binary_restore(device, pipeline, layout, plan_binary);
+      if (result != VK_SUCCESS)
+         return result;
+   } else if (plan_binary) {
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
 
    pipeline->base.pipeline_hash = *(uint64_t *)pipeline_hash;
 
@@ -4132,6 +4198,12 @@ radv_graphics_pipeline_init(struct radv_graphics_pipeline *pipeline, struct radv
    struct radv_graphics_pipeline_state gfx_state;
    VkResult result = VK_SUCCESS;
 
+   /* A partial BC250 interface cannot prove barycentric slot ownership or
+    * the Task consumer route. Recompile the merged source at the final link,
+    * including when the application requests a link without LTO. */
+   if (device->bc250_env.gpl_source_link)
+      fast_linking_enabled = false;
+
    pipeline->last_vgt_api_stage = MESA_SHADER_NONE;
 
    const VkPipelineLibraryCreateInfoKHR *libs_info =
@@ -4158,8 +4230,48 @@ radv_graphics_pipeline_init(struct radv_graphics_pipeline *pipeline, struct radv
    if (result != VK_SUCCESS)
       return result;
 
+   /* A fast link owns its private handles, even after library destruction.
+    * Partial compiled interfaces are refused until their route compatibility
+    * has been proven independently. */
+   if (!import_pipeline_binaries && libs_info && device->bc250_env.gpl_binary_link) {
+      struct radv_graphics_lib_pipeline *compiled = NULL;
+      for (unsigned i = 0; i < libs_info->libraryCount; i++) {
+         VK_FROM_HANDLE(radv_pipeline, imported, libs_info->pLibraries[i]);
+         struct radv_graphics_lib_pipeline *lib = radv_pipeline_to_graphics_lib(imported);
+         if (lib->base.bc250_plan.version)
+            compiled = lib;
+      }
+      if (compiled) {
+         uint8_t hash[32];
+         radv_bc250_graphics_state_hash(device, pCreateInfo, &gfx_state, hash);
+         if (libs_info->libraryCount != 1 || pCreateInfo->stageCount ||
+             compiled->lib_flags != ALL_GRAPHICS_LIB_FLAGS || !radv_is_fast_linking_enabled(pCreateInfo) ||
+             memcmp(hash, compiled->base.bc250_plan.state_hash, sizeof(hash))) {
+            result = VK_ERROR_FEATURE_NOT_PRESENT;
+         } else {
+            VK_FROM_HANDLE(radv_pipeline, producer, compiled->base.bc250_task_pipeline);
+            VK_FROM_HANDLE(radv_pipeline, setup, compiled->base.bc250_setup_pipeline);
+            result = radv_bc250_restore_cached_plan(device, pipeline, &gfx_state.layout,
+               &compiled->base.bc250_plan, pipeline->base.shaders[MESA_SHADER_MESH],
+               pipeline->base.shaders[MESA_SHADER_FRAGMENT],
+               producer ? producer->shaders[MESA_SHADER_COMPUTE] : NULL,
+               producer && setup ? setup->shaders[MESA_SHADER_COMPUTE] : NULL);
+         }
+         if (result != VK_SUCCESS) {
+            radv_graphics_pipeline_state_finish(device, &gfx_state);
+            return result;
+         }
+      }
+   }
+
    if (import_pipeline_binaries) {
-      result = radv_graphics_pipeline_import_binaries(device, pipeline, binary_info);
+      result = radv_graphics_pipeline_import_binaries(device, pipeline, &gfx_state.layout, binary_info);
+      if (result == VK_SUCCESS && pipeline->bc250_plan.version) {
+         uint8_t hash[32];
+         radv_bc250_graphics_state_hash(device, pCreateInfo, &gfx_state, hash);
+         if (memcmp(hash, pipeline->bc250_plan.state_hash, sizeof(hash)))
+            result = VK_ERROR_FEATURE_NOT_PRESENT;
+      }
    } else {
       if (gfx_state.compilation_required) {
          const VkShaderStageFlags active_stages = pipeline->active_stages;
@@ -4266,7 +4378,7 @@ radv_graphics_pipeline_create(VkDevice _device, VkPipelineCache _cache, const Vk
 
    radv_bc250_report_mesh_route(device, pipeline->base.shaders[MESA_SHADER_MESH],
       "pipeline", pipeline->bc250_direct_split_pieces, pipeline->bc250_task_pipeline != VK_NULL_HANDLE,
-      pipeline->bc250_ordered);
+      pipeline->bc250_ordered, pipeline->bc250_plan.flags & RADV_BC250_PLAN_EMPTY);
 
    radv_pipeline_report_pso_history(device, &pipeline->base);
 
@@ -4358,7 +4470,18 @@ radv_graphics_lib_pipeline_init(struct radv_graphics_lib_pipeline *pipeline, str
       radv_graphics_pipeline_import_layout(&pipeline->layout, pipeline_layout);
 
    if (import_pipeline_binaries) {
-      result = radv_graphics_pipeline_import_binaries(device, &pipeline->base, binary_info);
+      result = radv_graphics_pipeline_import_binaries(device, &pipeline->base, &pipeline->layout, binary_info);
+      if (result == VK_SUCCESS && pipeline->base.bc250_plan.version) {
+         struct radv_graphics_pipeline_state gfx_state;
+         result = radv_generate_graphics_pipeline_state(device, pCreateInfo, &gfx_state);
+         if (result == VK_SUCCESS) {
+            uint8_t hash[32];
+            radv_bc250_graphics_state_hash(device, pCreateInfo, &gfx_state, hash);
+            if (memcmp(hash, pipeline->base.bc250_plan.state_hash, sizeof(hash)))
+               result = VK_ERROR_FEATURE_NOT_PRESENT;
+            radv_graphics_pipeline_state_finish(device, &gfx_state);
+         }
+      }
    } else {
       struct radv_graphics_pipeline_state gfx_state;
 
@@ -4366,9 +4489,63 @@ radv_graphics_lib_pipeline_init(struct radv_graphics_lib_pipeline *pipeline, str
       if (result != VK_SUCCESS)
          return result;
 
-      result =
-         radv_graphics_pipeline_compile(&pipeline->base, pCreateInfo, &gfx_state, device, cache, fast_linking_enabled);
+      if (device->bc250_env.gpl_binary_link && pipeline->lib_flags == ALL_GRAPHICS_LIB_FLAGS &&
+          (pipeline->base.active_stages & VK_SHADER_STAGE_MESH_BIT_EXT) && !libs_info) {
+         /* The entire interface is present. Use the monolithic admission and
+          * preparation path, then retain only the executables and their plan.
+          * Partial libraries keep the conservative source fallback below. */
+         VkPipelineCreateFlags2 flags = pipeline->base.base.create_flags;
+         pipeline->base.base.type = RADV_PIPELINE_GRAPHICS;
+         pipeline->base.base.create_flags &= ~(VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR |
+            VK_PIPELINE_CREATE_2_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT);
+         result = radv_graphics_pipeline_compile(&pipeline->base, pCreateInfo, &gfx_state, device, cache, false);
+         pipeline->base.base.type = RADV_PIPELINE_GRAPHICS_LIB;
+         pipeline->base.base.create_flags = flags;
+      } else if (device->bc250_env.gpl_source_link) {
+         VkPipelineShaderStageCreateInfo source[MESA_VULKAN_SHADER_STAGES];
+         unsigned count = 0;
+         if (libs_info) {
+            for (unsigned i = 0; i < libs_info->libraryCount; i++) {
+               VK_FROM_HANDLE(radv_pipeline, imported, libs_info->pLibraries[i]);
+               struct radv_graphics_lib_pipeline *lib = radv_pipeline_to_graphics_lib(imported);
+               if (!lib->bc250_source_only || count + lib->stage_count > ARRAY_SIZE(source)) {
+                  result = VK_ERROR_FEATURE_NOT_PRESENT;
+                  goto source_done;
+               }
+               if (lib->stage_count)
+                  memcpy(source + count, lib->stages, lib->stage_count * sizeof(source[0]));
+               count += lib->stage_count;
+            }
+         }
+         if (count + pCreateInfo->stageCount > ARRAY_SIZE(source)) {
+            result = VK_ERROR_FEATURE_NOT_PRESENT;
+            goto source_done;
+         }
+         if (pCreateInfo->stageCount)
+            memcpy(source + count, pCreateInfo->pStages, pCreateInfo->stageCount * sizeof(source[0]));
+         count += pCreateInfo->stageCount;
+         for (unsigned i = 0; i < count; i++) {
+            mesa_shader_stage stage = vk_to_mesa_shader_stage(source[i].stage);
+            if (!gfx_state.stages[stage].spirv.size || gfx_state.stages[stage].layout.mapping) {
+               result = VK_ERROR_FEATURE_NOT_PRESENT;
+               goto source_done;
+            }
+            pipeline->stage_keys[stage] = gfx_state.stages[stage].key;
+         }
+         pipeline->stages = radv_copy_shader_stage_create_info(device, count, source, pipeline->mem_ctx);
+         if (!pipeline->stages) {
+            result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto source_done;
+         }
+         pipeline->stage_count = count;
+         pipeline->bc250_source_only = true;
+         result = VK_SUCCESS;
+      } else {
+         result =
+            radv_graphics_pipeline_compile(&pipeline->base, pCreateInfo, &gfx_state, device, cache, fast_linking_enabled);
+      }
 
+source_done:
       radv_graphics_pipeline_state_finish(device, &gfx_state);
    }
 
@@ -4401,7 +4578,7 @@ radv_graphics_lib_pipeline_create(VkDevice _device, VkPipelineCache _cache,
    }
 
    radv_bc250_report_mesh_route(device, pipeline->base.base.shaders[MESA_SHADER_MESH],
-      "library", 0, false, false);
+      "library", 0, false, false, pipeline->base.bc250_plan.flags & RADV_BC250_PLAN_EMPTY);
 
    radv_pipeline_report_pso_history(device, &pipeline->base.base);
 
@@ -4443,7 +4620,7 @@ radv_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache, ui
        */
       const VkPipelineBinaryInfoKHR *bc250_binaries =
          vk_find_struct_const(pCreateInfos[i].pNext, PIPELINE_BINARY_INFO_KHR);
-      if (radv_device_physical(device)->bc250_hybrid_task &&
+      if (radv_device_physical(device)->bc250_hybrid_task && !device->bc250_env.pipeline_plan &&
           bc250_binaries && bc250_binaries->binaryCount) {
          pPipelines[i] = VK_NULL_HANDLE;
          result = VK_ERROR_FEATURE_NOT_PRESENT;

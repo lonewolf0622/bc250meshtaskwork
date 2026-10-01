@@ -17,6 +17,9 @@ struct radv_ray_tracing_stage_info;
 struct radv_shader;
 struct util_dynarray;
 struct vk_pipeline_cache_object;
+struct radv_bc250_pipeline_plan;
+struct radv_graphics_pipeline;
+struct radv_pipeline_layout;
 
 struct radv_pipeline_binary {
    struct vk_object_base base;
@@ -27,6 +30,18 @@ struct radv_pipeline_binary {
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(radv_pipeline_binary, base, VkPipelineBinaryKHR, VK_OBJECT_TYPE_PIPELINE_BINARY_KHR)
+
+bool radv_bc250_pipeline_binary_is_plan(const struct radv_pipeline_binary *binary);
+bool radv_bc250_shader_binary_valid(const void *data, size_t size, unsigned stage);
+VkResult radv_bc250_pipeline_binary_restore(struct radv_device *device,
+                                           struct radv_graphics_pipeline *pipeline,
+                                           const struct radv_pipeline_layout *layout,
+                                           const struct radv_pipeline_binary *binary);
+VkResult radv_create_pipeline_binary_from_bc250_plan(struct radv_device *device,
+                                                    const VkAllocationCallbacks *allocator,
+                                                    const struct radv_bc250_pipeline_plan *plan,
+                                                    struct radv_shader *producer, struct radv_shader *setup,
+                                                    struct util_dynarray *binaries, uint32_t *num_binaries);
 
 VkResult radv_create_pipeline_binary_from_shader(struct radv_device *device, const VkAllocationCallbacks *pAllocator,
                                                  struct radv_shader *shader, struct util_dynarray *pipeline_binaries,
