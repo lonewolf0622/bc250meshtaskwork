@@ -2003,6 +2003,9 @@ radv_descriptor_get_va(const struct radv_descriptor_state *descriptors_state, un
    return va;
 }
 
+/* BC250_CAPTURE_POINTERS (debug dump): read once, not per state flush on every GPU. */
+DEBUG_GET_ONCE_BOOL_OPTION(bc250_capture_pointers, "BC250_CAPTURE_POINTERS", false)
+
 static void
 radv_emit_descriptors_per_stage(const struct radv_device *device, struct radv_cmd_stream *cs,
                                 const struct radv_shader *shader, const struct radv_descriptor_state *descriptors_state)
@@ -2010,7 +2013,7 @@ radv_emit_descriptors_per_stage(const struct radv_device *device, struct radv_cm
    const struct radv_physical_device *pdev = radv_device_physical(device);
    const uint32_t indirect_descriptors_offset = radv_get_user_sgpr_loc(shader, AC_UD_INDIRECT_DESCRIPTORS);
 
-   if (debug_get_bool_option("BC250_CAPTURE_POINTERS", false)) {
+   if (debug_get_option_bc250_capture_pointers()) {
       flockfile(stderr);
       fprintf(stderr, "BC250DESC stage=%u shader=%llx table=%llx indirect_reg=%u enabled=%x valid=%x",
               shader->info.stage, (unsigned long long)radv_shader_get_va(shader),
@@ -6797,7 +6800,7 @@ radv_emit_push_constants_per_stage(const struct radv_device *device, struct radv
    const uint32_t push_constants_offset = radv_get_user_sgpr_loc(shader, AC_UD_PUSH_CONSTANTS);
    const uint64_t inline_push_const_mask = shader->info.inline_push_constant_mask;
 
-   if (debug_get_bool_option("BC250_CAPTURE_POINTERS", false)) {
+   if (debug_get_option_bc250_capture_pointers()) {
       flockfile(stderr);
       fprintf(stderr, "BC250PTR stage=%u shader=%llx pc=%llx inline_source=%llx mask=%llx pc_reg=%u inline_reg=%u compat=%u words=",
               shader->info.stage, (unsigned long long)radv_shader_get_va(shader),
@@ -8818,7 +8821,7 @@ radv_EndCommandBuffer(VkCommandBuffer commandBuffer)
    struct radv_cmd_stream *cs = cmd_buffer->cs;
    struct radv_cmd_stream *ace_cs = cmd_buffer->gang.cs;
 
-   if (debug_get_bool_option("BC250_CAPTURE_POINTERS", false)) {
+   if (debug_get_option_bc250_capture_pointers()) {
       flockfile(stderr);
       bc250_capture_upload(&cmd_buffer->upload);
       list_for_each_entry(struct radv_cmd_buffer_upload, upload, &cmd_buffer->upload.list, list)
@@ -8902,7 +8905,7 @@ radv_EndCommandBuffer(VkCommandBuffer commandBuffer)
    if (result != VK_SUCCESS)
       return vk_error(cmd_buffer, result);
 
-   if (debug_get_bool_option("BC250_CAPTURE_POINTERS", false)) {
+   if (debug_get_option_bc250_capture_pointers()) {
       flockfile(stderr);
       fprintf(stderr, "BC250PREIB_BEGIN words=%u\n", cs->b->cdw);
       for (unsigned i = 0; i < cs->b->cdw; i++)

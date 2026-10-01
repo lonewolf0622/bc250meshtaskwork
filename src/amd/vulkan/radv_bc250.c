@@ -6897,8 +6897,14 @@ radv_bc250_directmesh_env(void)
    if (!on || strcmp(on, "1"))
       return;
    /* Hybrid Task hides GPL, shader objects and pipeline binaries. Remember whether the preset (and not
-    * the user) turned it on, so DXVK (no Mesh shaders in D3D9-11) keeps GPL (radv_physical_device.c). */
-   radv_bc250_directmesh_hybrid = getenv("RADV_BC250_HYBRID_TASK") == NULL;
+    * the user) turned it on, so DXVK (no Mesh shaders in D3D9-11) keeps GPL (radv_physical_device.c).
+    * Decided on the first instance only: the preset's setenv below makes the variable visible to every
+    * later vkCreateInstance, and DXVK creates one instance per DXGI factory. */
+   static bool hybrid_decided;
+   if (!hybrid_decided) {
+      radv_bc250_directmesh_hybrid = getenv("RADV_BC250_HYBRID_TASK") == NULL;
+      hybrid_decided = true;
+   }
    static const char *const settings[][2] = {
       /* BC-250 base: Mesh through hybrid Task; split/expansion stays the automatic fallback. */
       {"RADV_BC250_NATIVE_TASK", "0"}, {"RADV_BC250_HYBRID_TASK", "1"},
