@@ -4,8 +4,8 @@ Mesh shader support for the AMD BC-250 (GFX1013, RDNA1-based) in Mesa's RADV Vul
 a **safe direct path**: no split/replay, one launch per Mesh workgroup, and built-in protection against the index
 patterns that hang this chip.
 
-**Download:** [patch against stock Mesa 26.2.1](https://github.com/lonewolf0622/bc250meshtaskwork/releases/download/directmesh-v1.1/bc250-directmesh-mesa-26.2.1.patch)
-(also in [`patches/`](patches/) and on the [release page](https://github.com/lonewolf0622/bc250meshtaskwork/releases/tag/directmesh-v1.1)),
+**Download:** [patch against stock Mesa 26.2.1](https://github.com/lonewolf0622/bc250meshtaskwork/releases/download/directmesh-v1.2/bc250-directmesh-mesa-26.2.1.patch)
+(also in [`patches/`](patches/) and on the [release page](https://github.com/lonewolf0622/bc250meshtaskwork/releases/tag/directmesh-v1.2)),
 or build this repository directly (see Build).
 
 Turn it on with one switch:
@@ -18,6 +18,11 @@ RADV_DIRECTMESH=1 %command%
 
 - `VK_EXT_mesh_shader` (Mesh + Task) on the BC-250, usable by D3D12 games through normal Proton / vkd3d-proton.
 - `VK_KHR_fragment_shader_barycentric`, so vkd3d-proton keeps Mesh shaders enabled in UE5 games.
+- `VK_EXT_device_generated_commands` with Mesh and Task draws, so D3D12 `ExecuteIndirect` works through vkd3d-proton
+  (Crimson Desert needs it).
+- Multiview with Mesh shaders, so vkd3d-proton keeps D3D12 view instancing when Mesh shaders are on.
+- Indirect Task draws that scale: the rarely used extra Task chunks are recorded once per call and skipped with one
+  check per draw, instead of being recorded for every draw.
 - **Direct Mesh path:** each Mesh workgroup is drawn in a single launch. Per workgroup, after culling, the driver
   picks the cheapest export that it can prove safe:
   - shared vertices, when the surviving triangles use every vertex with small index backjumps;
@@ -30,7 +35,8 @@ RADV_DIRECTMESH=1 %command%
   declarations a Mesh shader never reads, and folds Task launch counts that have no compile-time bound into their own
   grid dimension.
 - **Fail closed:** a shape nothing can prove safe takes the older split/expansion path (also private corners) or, as a
-  last resort, is refused at pipeline creation. It is never drawn on the unprotected raw route.
+  last resort, is refused at pipeline creation. It is never drawn on the unprotected raw route. Split Mesh shaders
+  that write images run those writes once, in the first piece.
 
 ## Tested
 
@@ -40,6 +46,11 @@ Vulkan CTS on real hardware (with `RADV_DIRECTMESH=1`):
 |---|---|
 | `dEQP-VK.mesh_shader.ext.*` + fragment-barycentric Mesh cases that run on this device | 3,558 / 3,558 pass, 0 hangs, every pipeline direct (v1.1) |
 | Mesh/Task stages in other groups (binding model, subgroups, SPIR-V, atomics, dynamic state, ...) | 10,036 pass, 0 fail, 0 hangs |
+
+v1.2 hardware image checks (each byte-identical against the proven route): device-generated Mesh and Task draws,
+descriptor buffers with device-generated commands, graphics pipeline libraries and shader objects with Mesh, and many
+indirect Task draws including one large enough to need the extra chunks (old path, new path and device-generated
+commands all identical).
 
 Each converter step also passed a one-shot hardware image check: the same scene drawn by the proven route and by the
 new route must be byte-identical.
@@ -68,6 +79,7 @@ Games (Steam / Proton, D3D12):
 | Control | runs, Mesh direct; about 8% less Mesh GPU time per draw than private corners alone |
 | Hellblade 2 | runs, all Mesh pipelines direct, including barycentric shaders (unchanged by the adaptive export) |
 | Alan Wake 2 | runs, Mesh direct; about 10% less Mesh GPU time per draw than private corners alone |
+| Crimson Desert | runs with Mesh shaders on (v1.2), including Medium settings |
 
 The game figures were measured with v1.0. With v1.1, Final Fantasy VII Rebirth and Hellblade 2 compile to the same
 shaders, and Control was played again with the renumbered export.
@@ -115,6 +127,9 @@ Useful extras:
 
 ## Changes
 
+- **v1.2:** `VK_EXT_device_generated_commands` for Mesh/Task, multiview with Mesh shaders, split Mesh shaders that write
+  images, indirect Task draws recorded once per call (many indirect Task draws were very slow), vertex sharing for
+  per-primitive data, leaner per-workgroup checks, wider NGG culling, graphics pipeline libraries kept for DXVK games.
 - **v1.1:** automatic Mesh shader converter (renumbered-vertex export, Task pieces on the direct path, `gl_PrimitiveID`
   with pieces, wave64 promotion, unread task payloads, unbounded Task launch counts); fail-closed refusal of any Mesh
   pipeline without a protected route (in v1.0 two rare shapes could reach the raw route: Mesh-only lines above the
@@ -123,10 +138,8 @@ Useful extras:
 
 ## Not included
 
-- `VK_EXT_device_generated_commands`, graphics pipeline libraries and shader objects are hidden while Mesh uses the
-  hybrid Task path. vkd3d-proton still handles `ExecuteIndirect` for Mesh draws. A small number of games that need
-  state-changing `ExecuteIndirect` may not render fully.
-- Mesh pipeline statistics queries, and multiview with Mesh shaders.
+- Mesh pipeline statistics queries.
+- Per-primitive shading rate from Mesh shaders.
 
 ## If a game hangs
 
