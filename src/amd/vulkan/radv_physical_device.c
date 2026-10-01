@@ -1387,7 +1387,11 @@ radv_physical_device_get_features(const struct radv_physical_device *pdev, struc
       /* VK_EXT_mesh_shader */
       .meshShader = radv_mesh_enabled(pdev),
       .taskShader = taskmesh_en || pdev->bc250_hybrid_task || pdev->bc250_native_task,
-      .multiviewMeshShader = taskmesh_en,
+      /* RADV_BC250_EXPOSE_MULTIVIEW_MESH: the Mesh lowering writes the layer per view and multiview
+       * Mesh shaders take the expanded route. vkd3d-proton turns D3D12 view instancing off when Mesh
+       * is exposed without multiview Mesh. */
+      .multiviewMeshShader = taskmesh_en ||
+         (pdev->bc250_native_mesh && debug_get_bool_option("RADV_BC250_EXPOSE_MULTIVIEW_MESH", false)),
       .primitiveFragmentShadingRateMeshShader = taskmesh_en,
       /* BC250 counts MESH/TASK invocations through GDS snapshots (v8). */
       /* Replay splitting does not yet preserve mesh-invocation queries. */
