@@ -761,7 +761,10 @@ struct radv_compiler_info {
       uint32_t pp_share : 1;
       /* RADV_BC250_MESH_LEAN_CHECK: skip per-workgroup checks whose result is already known. */
       uint32_t lean_check : 1;
-      uint32_t padding : 28;
+      /* RADV_BC250_MESH_SPLIT_STORES: a split Mesh shader may store to images; the stores run in the
+       * first piece only (exactly once per original workgroup). */
+      uint32_t split_stores : 1;
+      uint32_t padding : 27;
    } bc250x;
 
    /* Debug/tracing */

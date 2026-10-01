@@ -2914,6 +2914,27 @@ bc250_reads_external_memory(const nir_intrinsic_instr *in)
           (strstr(name, "image") && strstr(name, "load"));
 }
 
+/* External memory a shader can also write: image loads, and SSBO or global
+ * loads not marked non-writeable. UBO loads and tex instructions are not. */
+static bool
+bc250_reads_storage_memory(const nir_intrinsic_instr *in)
+{
+   if (!bc250_reads_external_memory(in))
+      return false;
+   const bool ubo = in->intrinsic == nir_intrinsic_load_deref ?
+      !nir_deref_mode_may_be(nir_src_as_deref(in->src[0]), nir_var_mem_ssbo | nir_var_mem_global | nir_var_image) :
+      !strncmp(nir_intrinsic_infos[in->intrinsic].name, "load_ubo", 8);
+   const bool readonly = nir_intrinsic_has_access(in) && (nir_intrinsic_access(in) & ACCESS_NON_WRITEABLE);
+   return !ubo && !readonly;
+}
+
+static bool
+bc250_split_image_store(const nir_intrinsic_instr *in)
+{
+   return in->intrinsic == nir_intrinsic_image_deref_store || in->intrinsic == nir_intrinsic_image_store ||
+          in->intrinsic == nir_intrinsic_bindless_image_store;
+}
+
 static bool
 bc250_split_primitive_output(nir_variable *var)
 {
@@ -3141,8 +3162,16 @@ radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool d
     * body. That holds only while no piece can observe it: refuse any body
     * that also reads external memory (another piece may or may not see the
     * first piece's write; bindings may alias).
+    *
+    * RADV_BC250_MESH_SPLIT_STORES: a non-atomic image store is guarded the
+    * same way, so it also runs exactly once per original workgroup, with the
+    * values the original body computes. Another piece must not observe it:
+    * refuse a body that reads storage memory (an image load, an SSBO or global
+    * load that is not non-writeable). Sampled texture reads and UBO loads are
+    * read-only bindings.
     */
-   bool external_atomics = false, reads_external = false;
+   const bool split_stores = debug_get_bool_option("RADV_BC250_MESH_SPLIT_STORES", false);
+   bool external_atomics = false, reads_external = false, external_stores = false, reads_storage = false;
    nir_foreach_function_impl(impl, mesh) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
@@ -3155,6 +3184,13 @@ radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool d
             nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
             const char *name = nir_intrinsic_infos[in->intrinsic].name;
             reads_external |= bc250_reads_external_memory(in);
+            reads_storage |= bc250_reads_storage_memory(in);
+            if (split_stores && bc250_split_image_store(in)) {
+               if (nir_intrinsic_access(in) & ACCESS_VOLATILE)
+                  return bc250_split_reject("volatile access");
+               external_stores = true;
+               continue;
+            }
             if (nir_intrinsic_has_atomic_op(in) && nir_intrinsic_writes_external_memory(in)) {
                if (nir_intrinsic_has_access(in) && (nir_intrinsic_access(in) & ACCESS_VOLATILE))
                   return bc250_split_reject("volatile access");
@@ -3196,6 +3232,8 @@ radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool d
    }
    if (external_atomics && reads_external)
       return bc250_split_reject("external atomic with external memory reads");
+   if (external_stores && reads_storage)
+      return bc250_split_reject("image store with storage memory reads");
 
    /* Restrict task launches to proven bounded one-dimensional grids. Never
     * clamp a valid application's launch to make it fit this experiment.
@@ -3373,8 +3411,8 @@ radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool d
       nir_store_var(&b, vertex_count, nir_imm_int(&b, 0), 1);
    nir_pop_if(&b, NULL);
 
-   if (external_atomics) {
-      /* Write-only external atomics run in the first piece (base 0) only. */
+   if (external_atomics || external_stores) {
+      /* Write-only external atomics and image stores run in the first piece (base 0) only. */
       nir_def *first_piece = nir_ieq_imm(&b, base, 0);
       struct util_dynarray atomics;
       util_dynarray_init(&atomics, NULL);
@@ -3383,13 +3421,14 @@ radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool d
             if (instr->type != nir_instr_type_intrinsic)
                continue;
             nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
-            if (nir_intrinsic_has_atomic_op(in) && nir_intrinsic_writes_external_memory(in))
+            if ((nir_intrinsic_has_atomic_op(in) && nir_intrinsic_writes_external_memory(in)) ||
+                (external_stores && bc250_split_image_store(in)))
                util_dynarray_append(&atomics, in);
          }
       }
       util_dynarray_foreach(&atomics, nir_intrinsic_instr *, it) {
          nir_instr *instr = &(*it)->instr;
-         assert(nir_def_is_unused(&(*it)->def));
+         assert(!nir_intrinsic_infos[(*it)->intrinsic].has_dest || nir_def_is_unused(&(*it)->def));
          b.cursor = nir_before_instr(instr);
          nir_instr_remove(instr);
          nir_push_if(&b, first_piece);
@@ -3397,7 +3436,7 @@ radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool d
          nir_pop_if(&b, NULL);
       }
       if (debug_get_bool_option("BC250_TRACE_COMPILE", false))
-         fprintf(stderr, "BC250 split external atomics: %u guarded to the first piece\n",
+         fprintf(stderr, "BC250 split external atomics/stores: %u guarded to the first piece\n",
                  (unsigned)util_dynarray_num_elements(&atomics, nir_intrinsic_instr *));
       util_dynarray_fini(&atomics);
    }

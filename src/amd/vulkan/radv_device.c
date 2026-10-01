@@ -1555,6 +1555,7 @@ radv_device_init_compiler_info(struct radv_device *device)
    info.bc250x.safe_pieces_ext = bc250_mesh && debug_get_bool_option("RADV_BC250_MESH_SAFE_PIECES_EXT", false);
    info.bc250x.pp_share = bc250_mesh && debug_get_bool_option("RADV_BC250_MESH_PP_SHARE", false);
    info.bc250x.lean_check = bc250_mesh && debug_get_bool_option("RADV_BC250_MESH_LEAN_CHECK", false);
+   info.bc250x.split_stores = bc250_mesh && debug_get_bool_option("RADV_BC250_MESH_SPLIT_STORES", false);
 
    device->compiler_info = info;
 }
