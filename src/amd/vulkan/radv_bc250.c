@@ -3886,6 +3886,7 @@ static bool
 bc250_lower_application_constants(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
 {
    if (intrin->intrinsic == nir_intrinsic_load_draw_id && !data) {
+      b->shader->info.bc250_compat_constants = true;
       b->cursor = nir_before_instr(&intrin->instr);
       nir_def_rewrite_uses(&intrin->def,
          nir_load_push_constant(b, 1, 32, nir_imm_int(b, 20), .base = 0,
@@ -3895,6 +3896,7 @@ bc250_lower_application_constants(nir_builder *b, nir_intrinsic_instr *intrin, v
    }
    if (intrin->intrinsic != nir_intrinsic_load_push_constant)
       return false;
+   b->shader->info.bc250_compat_constants = true;
    b->cursor = nir_before_instr(&intrin->instr);
    nir_def *offset = nir_iadd_imm(b, intrin->src[0].ssa, nir_intrinsic_base(intrin));
    nir_def *addr = nir_iadd(b, bc250_pointer(b, 24), nir_u2u64(b, offset));

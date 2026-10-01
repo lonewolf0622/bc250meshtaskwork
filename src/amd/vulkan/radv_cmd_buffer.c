@@ -2008,6 +2008,22 @@ radv_emit_descriptors_per_stage(const struct radv_device *device, struct radv_cm
    const struct radv_physical_device *pdev = radv_device_physical(device);
    const uint32_t indirect_descriptors_offset = radv_get_user_sgpr_loc(shader, AC_UD_INDIRECT_DESCRIPTORS);
 
+   if (debug_get_bool_option("BC250_CAPTURE_POINTERS", false)) {
+      flockfile(stderr);
+      fprintf(stderr, "BC250DESC stage=%u shader=%llx table=%llx indirect_reg=%u enabled=%x valid=%x",
+              shader->info.stage, (unsigned long long)radv_shader_get_va(shader),
+              (unsigned long long)descriptors_state->indirect_descriptor_sets_va,
+              indirect_descriptors_offset, shader->info.user_sgprs_locs.descriptor_sets_enabled,
+              descriptors_state->valid);
+      u_foreach_bit(i, descriptors_state->valid) {
+         fprintf(stderr, " set%u=%llx set%u_reg=%u", i,
+                 (unsigned long long)radv_descriptor_get_va(descriptors_state, i), i,
+                 shader->info.user_data_0 + shader->info.user_sgprs_locs.descriptor_sets[i].sgpr_idx * 4);
+      }
+      fprintf(stderr, "\n");
+      funlockfile(stderr);
+   }
+
    if (indirect_descriptors_offset) {
       radeon_begin(cs);
       if (pdev->info.gfx_level >= GFX12) {
@@ -6779,6 +6795,19 @@ radv_emit_push_constants_per_stage(const struct radv_device *device, struct radv
    const uint32_t push_constants_offset = radv_get_user_sgpr_loc(shader, AC_UD_PUSH_CONSTANTS);
    const uint64_t inline_push_const_mask = shader->info.inline_push_constant_mask;
 
+   if (debug_get_bool_option("BC250_CAPTURE_POINTERS", false)) {
+      flockfile(stderr);
+      fprintf(stderr, "BC250PTR stage=%u shader=%llx pc=%llx inline_source=%llx mask=%llx pc_reg=%u inline_reg=%u compat=%u words=",
+              shader->info.stage, (unsigned long long)radv_shader_get_va(shader),
+              (unsigned long long)push_constants_va, (unsigned long long)dgc_application_va,
+              (unsigned long long)inline_push_const_mask, push_constants_offset,
+              radv_get_user_sgpr_loc(shader, AC_UD_INLINE_PUSH_CONSTANTS), shader->info.bc250_compat_constants);
+      for (unsigned i = 0; i < MAX_PUSH_CONSTANTS_SIZE / 4; i++)
+         fprintf(stderr, "%08x", values[i]);
+      fprintf(stderr, "\n");
+      funlockfile(stderr);
+   }
+
    /* Emit inlined push constants. */
    if (inline_push_const_mask && dgc_application_va) {
       unsigned reg = radv_get_user_sgpr_loc(shader, AC_UD_INLINE_PUSH_CONSTANTS);
@@ -6850,7 +6879,6 @@ static void
 radv_flush_constants(struct radv_cmd_buffer *cmd_buffer, VkShaderStageFlags stages, VkPipelineBindPoint bind_point)
 {
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
-   const struct radv_physical_device *pdev = radv_device_physical(device);
    struct radv_cmd_stream *cs = radv_get_pm4_cs(cmd_buffer);
    const struct radv_push_constant_state *push_constants = radv_get_push_constants_state(cmd_buffer, bind_point);
    uint64_t va = 0;
@@ -6870,6 +6898,24 @@ radv_flush_constants(struct radv_cmd_buffer *cmd_buffer, VkShaderStageFlags stag
    default:
       UNREACHABLE("Unhandled bind point");
    }
+
+   /* A lowered shader reads the application VA from compatibility words 6/7.
+    * Its inline SGPRs and pointer upload must therefore use the private block,
+    * even when an application DGC block also exists. The shader flag survives
+    * NIR cloning and binary serialization; pipeline shape cannot identify ABI. */
+   bool compat_constants = false;
+   if (internal_stages & VK_SHADER_STAGE_COMPUTE_BIT) {
+      const struct radv_shader *shader = bind_point == VK_PIPELINE_BIND_POINT_COMPUTE
+         ? cmd_buffer->state.shaders[MESA_SHADER_COMPUTE] : cmd_buffer->state.rt_prolog;
+      compat_constants = shader && shader->info.bc250_compat_constants;
+   } else {
+      radv_foreach_stage(stage, internal_stages & ~VK_SHADER_STAGE_TASK_BIT_EXT) {
+         const struct radv_shader *shader = radv_get_shader(cmd_buffer->state.shaders, stage);
+         compat_constants |= shader && shader->info.bc250_compat_constants;
+      }
+   }
+   if (compat_constants)
+      dgc_va = 0;
 
    if (cmd_buffer->bc250_dgc_task_uploads) {
       /* A count stream reuses the ordinary Task constants. Load inlined
@@ -6895,20 +6941,9 @@ radv_flush_constants(struct radv_cmd_buffer *cmd_buffer, VkShaderStageFlags stag
 
          /* Avoid redundantly emitting the same values for merged stages. */
          if (shader && shader != prev_shader) {
-            /* Fragment shaders keep the application ABI while private Mesh
-             * consumers use the compatibility block. DGC root constants must
-             * reach both, including inlined Fragment constants. */
-            uint64_t fragment_va = stage == MESA_SHADER_FRAGMENT && !cmd_buffer->state.meta.inside_meta_op
+            const uint64_t fragment_va = stage == MESA_SHADER_FRAGMENT &&
+               !shader->info.bc250_compat_constants && !cmd_buffer->state.meta.inside_meta_op
                ? cmd_buffer->bc250_dgc_application_va : 0;
-            if (!fragment_va && stage == MESA_SHADER_FRAGMENT && pdev->bc250_expose_dgc &&
-                cmd_buffer->bc250_inside_mesh_draw && !cmd_buffer->state.meta.inside_meta_op) {
-               const struct radv_graphics_pipeline *p = radv_bc250_mesh_pipeline(cmd_buffer);
-               if (p && (p->bc250_task_pipeline || p->bc250_ordered || p->bc250_direct_split_pieces ||
-                          (p->bc250_plan.flags & RADV_BC250_PLAN_SPLIT)) &&
-                   (!p->base.shaders[MESA_SHADER_MESH] ||
-                    p->base.shaders[MESA_SHADER_MESH]->info.ms.bc250_merge_k <= 1))
-                  memcpy(&fragment_va, cmd_buffer->push_constants + 24, sizeof(fragment_va));
-            }
             radv_emit_push_constants_per_stage(device, cs, shader, (uint32_t *)cmd_buffer->push_constants,
                fragment_va ? fragment_va : va, fragment_va ? fragment_va : dgc_va);
 
@@ -8760,6 +8795,19 @@ radv_CmdPushConstants2(VkCommandBuffer commandBuffer, const VkPushConstantsInfo 
    cmd_buffer->push_constant_stages |= pPushConstantsInfo->stageFlags;
 }
 
+/* CPU mappings only: an offline gate can resolve emitted pointers without GPU reads. */
+static void
+bc250_capture_upload(const struct radv_cmd_buffer_upload *upload)
+{
+   if (!upload->upload_bo || !upload->map)
+      return;
+   fprintf(stderr, "BC250MEM va=%llx bytes=%u data=",
+           (unsigned long long)radv_buffer_get_va(upload->upload_bo), upload->offset);
+   for (unsigned i = 0; i < upload->offset; i++)
+      fprintf(stderr, "%02x", upload->map[i]);
+   fprintf(stderr, "\n");
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 radv_EndCommandBuffer(VkCommandBuffer commandBuffer)
 {
@@ -8767,6 +8815,14 @@ radv_EndCommandBuffer(VkCommandBuffer commandBuffer)
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    struct radv_cmd_stream *cs = cmd_buffer->cs;
    struct radv_cmd_stream *ace_cs = cmd_buffer->gang.cs;
+
+   if (debug_get_bool_option("BC250_CAPTURE_POINTERS", false)) {
+      flockfile(stderr);
+      bc250_capture_upload(&cmd_buffer->upload);
+      list_for_each_entry(struct radv_cmd_buffer_upload, upload, &cmd_buffer->upload.list, list)
+         bc250_capture_upload(upload);
+      funlockfile(stderr);
+   }
 
    if (cmd_buffer->qf == RADV_QUEUE_SPARSE)
       return vk_command_buffer_end(&cmd_buffer->vk);
@@ -8843,6 +8899,15 @@ radv_EndCommandBuffer(VkCommandBuffer commandBuffer)
    VkResult result = radv_finalize_cmd_stream(device, cs);
    if (result != VK_SUCCESS)
       return vk_error(cmd_buffer, result);
+
+   if (debug_get_bool_option("BC250_CAPTURE_POINTERS", false)) {
+      flockfile(stderr);
+      fprintf(stderr, "BC250PREIB_BEGIN words=%u\n", cs->b->cdw);
+      for (unsigned i = 0; i < cs->b->cdw; i++)
+         fprintf(stderr, "%08x raw\n", cs->b->buf[i]);
+      fprintf(stderr, "BC250PREIB_END\n");
+      funlockfile(stderr);
+   }
 
    return vk_command_buffer_end(&cmd_buffer->vk);
 }

@@ -1162,6 +1162,8 @@ radv_nir_shader_info_pass(const struct radv_compiler_info *compiler_info, const 
 {
    struct nir_function *func = (struct nir_function *)exec_list_get_head_const(&nir->functions);
 
+   info->bc250_compat_constants = nir->info.bc250_compat_constants;
+
    if (layout->use_dynamic_descriptors) {
       info->loads_dynamic_offsets = true;
 
@@ -1622,6 +1624,7 @@ radv_nir_shader_info_merge(const struct radv_shader_stage *src, struct radv_shad
           (src->stage == MESA_SHADER_VERTEX && dst->stage == MESA_SHADER_GEOMETRY) ||
           (src->stage == MESA_SHADER_TESS_EVAL && dst->stage == MESA_SHADER_GEOMETRY));
 
+   dst_info->bc250_compat_constants |= src_info->bc250_compat_constants;
    dst_info->loads_push_constants |= src_info->loads_push_constants;
    dst_info->loads_dynamic_offsets |= src_info->loads_dynamic_offsets;
    dst_info->loads_dynamic_descriptors_offset_addr |= src_info->loads_dynamic_descriptors_offset_addr;
