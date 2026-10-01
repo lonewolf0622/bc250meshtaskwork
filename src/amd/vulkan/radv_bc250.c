@@ -5346,11 +5346,15 @@ radv_bc250_prepare_task(struct radv_device *device,
          };
          stages[s].nir = radv_shader_spirv_to_nir_cached(&device->compiler_info, NULL, &stages[s], &options, false);
       }
-      if (device->compiler_info.bc250x.task_tail)
+      /* RADV_BC250_TASK_TAIL: DrawID from the per-draw slot. That load reads the private block,
+       * so it is added after the application push constants were redirected (data != NULL
+       * leaves DrawID to it). */
+      const bool draw_id_slot = device->compiler_info.bc250x.task_tail;
+      NIR_PASS(_, stages[s].nir, nir_shader_intrinsics_pass, bc250_lower_application_constants,
+               nir_metadata_control_flow, draw_id_slot ? (void *)1 : NULL);
+      if (draw_id_slot)
          NIR_PASS(_, stages[s].nir, nir_shader_intrinsics_pass, bc250_lower_draw_id_slot,
                   nir_metadata_control_flow, NULL);
-      NIR_PASS(_, stages[s].nir, nir_shader_intrinsics_pass, bc250_lower_application_constants,
-               nir_metadata_control_flow, NULL);
    }
 
    /* RADV_BC250_MESH_CLIPCULL_CONST before the split (a mesh-only shader already had it). */
