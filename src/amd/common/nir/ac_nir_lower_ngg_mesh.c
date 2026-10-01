@@ -2342,7 +2342,7 @@ ms_pps_vertices(nir_builder *b, lower_ngg_ms_state *s, nir_def **L, nir_def **va
    nir_def *start = nir_imul_imm(b, nir_udiv_imm(b, lane, 10), 10);
    nir_def *interval = nir_ishl(b, nir_imm_int64(b, 1023), start);
    nir_def *owner[3] = {nir_imm_int(b, 192), nir_imm_int(b, 192), nir_imm_int(b, 192)};
-   if (table > 32) {
+   if (table > 64) {
       /* Large tables: compare with the (at most 30) keys of the window directly. The bit-plane match below
        * would keep 3 * 8 wave masks live and exceed the scalar register budget. Same result: the smallest
        * key in the window with the same valid logical vertex (never above the key itself). */
@@ -2382,7 +2382,7 @@ ms_pps_vertices(nir_builder *b, lower_ngg_ms_state *s, nir_def **L, nir_def **va
       for (unsigned c = 0; c < 3; ++c)
          owner[c] = nir_load_var(b, owner_var[c]);
    }
-   for (unsigned d = 0; d < 3 && table <= 32; ++d) {
+   for (unsigned d = 0; d < 3 && table <= 64; ++d) {
       nir_def *candidates = nir_iand(b, nir_ballot(b, 1, 64, nir_iand(b, live, valid[d])), interval);
       nir_def *matches[3];
       for (unsigned c = 0; c < 3; ++c)
