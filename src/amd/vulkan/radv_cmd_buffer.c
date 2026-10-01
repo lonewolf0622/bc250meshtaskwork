@@ -1205,6 +1205,7 @@ radv_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
    struct radv_cmd_buffer *cmd_buffer = container_of(vk_cmd_buffer, struct radv_cmd_buffer, vk);
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
 
+   radv_bc250_task_tails_free(cmd_buffer);
    if (cmd_buffer->utrace.trace) {
       u_trace_fini(cmd_buffer->utrace.trace);
       free(cmd_buffer->utrace.trace);
@@ -1351,6 +1352,7 @@ radv_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer, UNUSED VkCommandB
    cmd_buffer->bc250_ordered_arena = 0;
    cmd_buffer->bc250_ordered_arena_size = 0;
    radv_bc250_split_batch_close(cmd_buffer);
+   radv_bc250_task_tails_free(cmd_buffer);
    cmd_buffer->bc250_mesh_amd_reuse_off = false;
    cmd_buffer->bc250_mesh_dealloc_dist_set = false;
 

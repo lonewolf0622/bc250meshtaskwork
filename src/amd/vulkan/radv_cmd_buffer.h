@@ -567,6 +567,10 @@ struct radv_cmd_buffer {
    /* DGC capture writes uploads into its preprocess-owned arena. */
    uint64_t bc250_dgc_upload_va;
    uint64_t bc250_dgc_application_va;
+   /* RADV_BC250_TASK_TAIL in a DGC capture: the program VA where the capture places the chunk
+    * slots 1..1023 (reached by one conditional CHAIN), and the side stream holding them. */
+   uint64_t bc250_dgc_tail_va;
+   struct radv_cmd_stream *bc250_dgc_tail;
    bool bc250_dgc_merged_constants;
    bool bc250_dgc_inherit_graphics_state;
    uint64_t bc250_dgc_nonuniform_pc;
@@ -585,6 +589,8 @@ struct radv_cmd_buffer {
     * batch list of the current render pass instance (NULL when none is open),
     * its GPU address and the number of entries appended so far. */
    uint32_t *bc250_split_batch;
+   /* RADV_BC250_TASK_TAIL: side streams holding the shared chunk slots 1..1023 (struct radv_cmd_stream *). */
+   struct util_dynarray bc250_task_tails;
    uint64_t bc250_split_batch_va;
    uint32_t bc250_split_batch_used;
 

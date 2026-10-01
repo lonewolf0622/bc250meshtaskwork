@@ -358,6 +358,11 @@ bc250_dgc_capture(struct radv_cmd_buffer *owner, const struct radv_cmd_buffer *s
    if (!cmd)
       return false;
    *cmd = *state;
+   /* The shallow copy must not touch the owner's task tails; a capture keeps its own. */
+   util_dynarray_init(&cmd->bc250_task_tails, NULL);
+   cmd->bc250_dgc_tail = NULL;
+   cmd->bc250_dgc_tail_va = shape->task && device->compiler_info.bc250x.task_tail ?
+      info->preprocessAddress + (uint64_t)seq * shape->stride + shape->template_offset + BC250_DGC_TAIL_OFFSET : 0;
    cmd->bc250_dgc_inherit_graphics_state = true;
    /* Capture all native meta query stop/start pairs. Execution patches these
     * typed packets according to its query scope, independently of preprocessing. */
@@ -508,7 +513,8 @@ bc250_dgc_capture(struct radv_cmd_buffer *owner, const struct radv_cmd_buffer *s
           * readers that must finish before this preprocess region is reused. */
          radv_emit_cache_flush(cmd);
          ok = !vk_command_buffer_has_error(&cmd->vk) && cmd->cs->b->buf == capture_buf &&
-              cmd->cs->b->cdw * 4 <= template_code &&
+              cmd->cs->b->cdw * 4 <= (cmd->bc250_dgc_tail ? BC250_DGC_TAIL_OFFSET : template_code) &&
+              (!cmd->bc250_dgc_tail_va || cmd->bc250_dgc_tail) &&
               (!cmd->bc250_dgc_task_uploads || !cmd->bc250_dgc_task_uploads->overflow) &&
               cmd->upload.offset <= shape->data && !cmd->gang.cs;
          if (!ok && dump)
@@ -523,6 +529,11 @@ bc250_dgc_capture(struct radv_cmd_buffer *owner, const struct radv_cmd_buffer *s
             uint32_t *padding = (uint32_t *)program;
             for (uint32_t i = cmd->cs->b->cdw; i < template_code / 4; i++)
                padding[i] = PKT3_NOP_PAD;
+            /* RADV_BC250_TASK_TAIL: the chunk slots after the first, reached by one CHAIN. */
+            if (cmd->bc250_dgc_tail) {
+               memcpy(program + BC250_DGC_TAIL_OFFSET, cmd->bc250_dgc_tail->b->buf, cmd->bc250_dgc_tail->b->cdw * 4);
+               device->ws->cs_execute_secondary(owner->cs->b, cmd->bc250_dgc_tail->b, false);
+            }
             /* Transfer residency only: an unfinalized capture has no IB buffers.
              * The winsys copies its residency list and no executable commands. */
             device->ws->cs_execute_secondary(owner->cs->b, cmd->cs->b, false);
@@ -593,6 +604,8 @@ bc250_dgc_capture(struct radv_cmd_buffer *owner, const struct radv_cmd_buffer *s
       }
       radv_destroy_cmd_stream(device, cmd->cs);
    }
+   if (cmd->bc250_dgc_tail)
+      radv_destroy_cmd_stream(device, cmd->bc250_dgc_tail);
    _mesa_set_fini(&cmd->vs_prologs, NULL);
    _mesa_set_fini(&cmd->ps_epilogs, NULL);
    free(cmd->bc250_dgc_task_uploads);

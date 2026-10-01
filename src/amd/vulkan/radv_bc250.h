@@ -24,6 +24,10 @@ void radv_bc250_draw_split_indirect(struct radv_cmd_buffer *cmd_buffer, uint64_t
  * every rendering begin/end, barrier, conditional rendering begin/end,
  * vkCmdExecuteCommands and command buffer begin/reset. */
 void radv_bc250_split_batch_close(struct radv_cmd_buffer *cmd_buffer);
+void radv_bc250_task_tails_free(struct radv_cmd_buffer *cmd_buffer);
+/* RADV_BC250_TASK_TAIL in DGC: the slots after the first start this far into the 1 MiB program. */
+#define BC250_DGC_TAIL_OFFSET 65536u
+#define BC250_DGC_TAIL_BYTES (1048576u - BC250_DGC_TAIL_OFFSET)
 struct nir_shader;
 struct radv_compiler_info;
 struct radv_shader_stage;

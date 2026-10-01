@@ -764,7 +764,10 @@ struct radv_compiler_info {
       /* RADV_BC250_MESH_SPLIT_STORES: a split Mesh shader may store to images; the stores run in the
        * first piece only (exactly once per original workgroup). */
       uint32_t split_stores : 1;
-      uint32_t padding : 27;
+      /* RADV_BC250_TASK_TAIL: hybrid Task chunk slots 1..1023 are recorded once per indirect
+       * call and called per record; the API DrawID is read from the per-draw slot. */
+      uint32_t task_tail : 1;
+      uint32_t padding : 26;
    } bc250x;
 
    /* Debug/tracing */

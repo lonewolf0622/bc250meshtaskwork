@@ -3921,6 +3921,22 @@ bc250_lower_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
    }
 }
 
+/* RADV_BC250_TASK_TAIL: the API DrawID of a hybrid Task draw comes from the per-draw
+ * slot (struct bc250_task_slot, w), written by the CPU (direct draws) or by the indirect
+ * setup shader, so the chunk slots after the first carry no per-record constant. */
+static bool
+bc250_lower_draw_id_slot(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
+{
+   if (intrin->intrinsic != nir_intrinsic_load_draw_id)
+      return false;
+   b->shader->info.bc250_compat_constants = true;
+   b->cursor = nir_before_instr(&intrin->instr);
+   nir_def_rewrite_uses(&intrin->def,
+      nir_load_global(b, 1, 32, nir_iadd_imm(b, bc250_pointer(b, 8 * 7), 12), .align_mul = 4));
+   nir_instr_remove(&intrin->instr);
+   return true;
+}
+
 static bool
 bc250_lower_application_constants(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
 {
@@ -3992,6 +4008,8 @@ bc250_build_indirect_setup(struct radv_device *device)
     * slot (constants.task_slot). */
    nir_def *full_size = nir_bcsel(&b, valid, nir_vec4(&b, x, y, z, nir_imm_int(&b, 0)),
                                   nir_imm_ivec4(&b, 0, 0, 0, 0));
+   if (device->compiler_info.bc250x.task_tail)
+      full_size = nir_vector_insert_imm(&b, full_size, draw_id, 3);
    nir_def *lane = nir_load_local_invocation_index(&b);
    nir_push_if(&b, nir_ieq_imm(&b, lane, 0));
    nir_store_global(&b, full_size, bc250_pointer(&b, 8 * 7), .align_mul = 16);
@@ -5328,6 +5346,9 @@ radv_bc250_prepare_task(struct radv_device *device,
          };
          stages[s].nir = radv_shader_spirv_to_nir_cached(&device->compiler_info, NULL, &stages[s], &options, false);
       }
+      if (device->compiler_info.bc250x.task_tail)
+         NIR_PASS(_, stages[s].nir, nir_shader_intrinsics_pass, bc250_lower_draw_id_slot,
+                  nir_metadata_control_flow, NULL);
       NIR_PASS(_, stages[s].nir, nir_shader_intrinsics_pass, bc250_lower_application_constants,
                nir_metadata_control_flow, NULL);
    }
@@ -5891,9 +5912,83 @@ bc250_alloc_records(struct radv_cmd_buffer *cmd_buffer, unsigned bytes, uint64_t
    return true;
 }
 
+void
+radv_bc250_task_tails_free(struct radv_cmd_buffer *cmd_buffer)
+{
+   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   util_dynarray_foreach (&cmd_buffer->bc250_task_tails, struct radv_cmd_stream *, tail)
+      radv_destroy_cmd_stream(device, *tail);
+   util_dynarray_fini(&cmd_buffer->bc250_task_tails);
+   util_dynarray_init(&cmd_buffer->bc250_task_tails, NULL);
+}
+
+/* RADV_BC250_TASK_TAIL: record chunk slots 1..BC250_INDIRECT_CHUNKS-1 once into a side
+ * stream. The commands are the ones the inline loop emits; the side stream has its own
+ * register tracking, so it re-emits every tracked register it uses. Every record of one
+ * indirect call shares the scratch, payload and application-constant addresses, and the
+ * producer and consumer read neither the record address nor the API DrawID from the
+ * constants (only the setup shader does, and it stays inline), so the same slots serve
+ * every record of the call. Returns NULL when the slots must stay inline. */
+static struct radv_cmd_stream *
+bc250_record_task_tail(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pipeline *pipeline,
+                       const struct bc250_constants *constants, uint64_t address, bool dgc)
+{
+   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   struct radv_cmd_stream *main_cs = cmd_buffer->cs, *tail = NULL;
+   if (main_cs->buffered_sh_regs.num || cmd_buffer->gang.cs ||
+       radv_create_cmd_stream(device, AMD_IP_GFX, !dgc, &tail) != VK_SUCCESS)
+      return NULL;
+   /* DGC copies the slots into its program: keep them in one unchained buffer. */
+   if (dgc)
+      radeon_check_space(device->ws, tail->b, BC250_DGC_TAIL_BYTES / 4);
+   uint32_t *dgc_buf = tail->b->buf;
+   const enum radv_cmd_flush_bits saved_flush = cmd_buffer->state.flush_bits;
+   cmd_buffer->cs = tail;
+   for (unsigned k = 1; k < BC250_INDIRECT_CHUNKS && !vk_command_buffer_has_error(&cmd_buffer->vk); k++)
+      bc250_emit_indirect_chunk(cmd_buffer, pipeline, constants, address, k, true);
+   /* The tail returns past everything the inline path would still flush. */
+   cmd_buffer->state.flush_bits |= saved_flush | RADV_CMD_FLAG_VS_PARTIAL_FLUSH | RADV_CMD_FLAG_PS_PARTIAL_FLUSH;
+   radv_emit_cache_flush(cmd_buffer);
+   cmd_buffer->cs = main_cs;
+   cmd_buffer->state.flush_bits = saved_flush;
+   if (vk_command_buffer_has_error(&cmd_buffer->vk) ||
+       (dgc ? tail->b->buf != dgc_buf || tail->b->cdw * 4 > BC250_DGC_TAIL_BYTES
+            : device->ws->cs_finalize(tail->b) != VK_SUCCESS)) {
+      radv_destroy_cmd_stream(device, tail);
+      return NULL;
+   }
+   if (!dgc)
+      util_dynarray_append(&cmd_buffer->bc250_task_tails, tail);
+   return tail;
+}
+
+/* After a conditional call into a task tail the GPU state is either the state after
+ * slot 0 or after the tail: re-emit everything (the same reset DGC uses). */
+static void
+bc250_invalidate_after_task_tail(struct radv_cmd_buffer *cmd_buffer)
+{
+   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   radv_init_cmd_stream(device, cmd_buffer->cs, AMD_IP_GFX);
+   cmd_buffer->state.dirty |= RADV_CMD_DIRTY_GRAPHICS_PIPELINE | RADV_CMD_DIRTY_COMPUTE_PIPELINE |
+                              RADV_CMD_DIRTY_PS_STATE | RADV_CMD_DIRTY_NGG_STATE | RADV_CMD_DIRTY_INDEX_BUFFER;
+   cmd_buffer->state.dirty_dynamic |= cmd_buffer->state.graphics_pipeline->needed_dynamic_state;
+   cmd_buffer->state.emitted_ps = NULL;
+   cmd_buffer->state.last_index_type = -1;
+   cmd_buffer->state.last_num_instances = -1;
+   cmd_buffer->state.last_drawid = -1;
+   for (unsigned i = 0; i < MAX_BIND_POINTS; i++) {
+      cmd_buffer->descriptors[i].dirty |= cmd_buffer->descriptors[i].valid;
+      cmd_buffer->descriptors[i].dirty_dynamic = true;
+   }
+   cmd_buffer->push_constant_stages |= VK_SHADER_STAGE_ALL;
+   cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_VS_PARTIAL_FLUSH |
+                                   RADV_CMD_FLAG_PS_PARTIAL_FLUSH | RADV_CMD_FLAG_INV_L2;
+}
+
 static void
 bc250_draw_task(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint32_t z,
-                uint64_t indirect_va, uint64_t count_va, uint32_t draw_id, uint64_t *shared_address)
+                uint64_t indirect_va, uint64_t count_va, uint32_t draw_id, uint64_t *shared_address,
+                struct radv_cmd_stream **task_tail)
 {
    struct radv_graphics_pipeline *pipeline = radv_bc250_mesh_pipeline(cmd_buffer);
    assert(pipeline && pipeline->bc250_task_pipeline);
@@ -6018,11 +6113,65 @@ bc250_draw_task(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint
       radv_meta_end(cmd_buffer);
       cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_INV_VCACHE |
                                       RADV_CMD_FLAG_INV_SCACHE | RADV_CMD_FLAG_INV_L2;
-      const bool skip_suffix = radv_cmd_buffer_device(cmd_buffer)->bc250_env.skip_inactive_chunks;
-      for (unsigned k = 0; k < BC250_INDIRECT_CHUNKS; k++) {
-         bc250_emit_indirect_chunk(cmd_buffer, pipeline, &constants, address, k, skip_suffix);
-         if (vk_command_buffer_has_error(&cmd_buffer->vk))
+      struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+      const bool skip_suffix = device->bc250_env.skip_inactive_chunks;
+      bc250_emit_indirect_chunk(cmd_buffer, pipeline, &constants, address, 0, skip_suffix);
+      if (vk_command_buffer_has_error(&cmd_buffer->vk))
+         return;
+      /* RADV_BC250_TASK_TAIL: one conditional IB2 call per record replaces the inline slots
+       * 1..1023 (primary command buffers only: an IB2 cannot nest). */
+      /* The shared slots need the DrawID from memory (compiler_info.bc250x.task_tail). */
+      const bool dgc_tail = cmd_buffer->bc250_dgc_tail_va != 0;
+      if (task_tail && skip_suffix && device->compiler_info.bc250x.task_tail &&
+          (dgc_tail || cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) && !*task_tail)
+         *task_tail = bc250_record_task_tail(cmd_buffer, pipeline, &constants, address, dgc_tail);
+      if (task_tail && *task_tail && dgc_tail) {
+         /* DGC: the program already runs as an IB2. One conditional CHAIN to the slots the
+          * capture copies to bc250_dgc_tail_va; they end the IB2 like the inline slots did. */
+         const struct radv_physical_device *pdev = radv_device_physical(device);
+         struct ac_cmdbuf *cs = cmd_buffer->cs->b;
+         cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_VS_PARTIAL_FLUSH |
+                                         RADV_CMD_FLAG_PS_PARTIAL_FLUSH | RADV_CMD_FLAG_INV_L2 | RADV_CMD_FLAG_WB_L2;
+         radv_emit_cache_flush(cmd_buffer);
+         ac_emit_cp_pfp_sync_me(cs, false);
+         radeon_check_space(device->ws, cs, 16);
+         ac_emit_cp_cond_exec(cs, pdev->info.gfx_level, constants.compute_args + 16 + 4, 4);
+         ac_emit_cp_indirect_buffer(cs, cmd_buffer->bc250_dgc_tail_va, (*task_tail)->b->cdw,
+                                    AC_CP_INDIRECT_BUFFER_CHAIN, false);
+         cmd_buffer->bc250_dgc_tail = *task_tail;
+         if (device->bc250_env.trace_compile)
+            fprintf(stderr, "BC250 TASK TAIL: dgc chain dwords=%u\n", (*task_tail)->b->cdw);
+         bc250_invalidate_after_task_tail(cmd_buffer);
+      } else if (task_tail && *task_tail) {
+         const struct radv_physical_device *pdev = radv_device_physical(device);
+         struct ac_cmdbuf *cs = cmd_buffer->cs->b;
+         /* As before slot 1 inline: setup wrote the sub-record table; synchronize PFP
+          * before COND_EXEC reads chunk 1's active flag. */
+         cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_VS_PARTIAL_FLUSH |
+                                         RADV_CMD_FLAG_PS_PARTIAL_FLUSH | RADV_CMD_FLAG_INV_L2 | RADV_CMD_FLAG_WB_L2;
+         radv_emit_cache_flush(cmd_buffer);
+         ac_emit_cp_pfp_sync_me(cs, false);
+         radeon_check_space(device->ws, cs, 1024);
+         uint32_t *conditional_buf = cs->buf;
+         const unsigned conditional_start = cs->cdw;
+         ac_emit_cp_cond_exec(cs, pdev->info.gfx_level, constants.compute_args + 16 + 4, 0);
+         device->ws->cs_execute_secondary(cs, (*task_tail)->b, true);
+         if (conditional_buf != cs->buf || cs->cdw - conditional_start - 5 > 1000 ||
+             cs->cdw == conditional_start + 5) {
+            vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_UNKNOWN);
             return;
+         }
+         conditional_buf[conditional_start + 4] = cs->cdw - conditional_start - 5;
+         if (device->bc250_env.trace_compile)
+            fprintf(stderr, "BC250 TASK TAIL: record=%u call_dwords=%u\n", draw_id,
+                    cs->cdw - conditional_start - 5);
+         bc250_invalidate_after_task_tail(cmd_buffer);
+      } else {
+         for (unsigned k = 1; k < BC250_INDIRECT_CHUNKS; k++) {
+            bc250_emit_indirect_chunk(cmd_buffer, pipeline, &constants, address, k, skip_suffix);
+            if (vk_command_buffer_has_error(&cmd_buffer->vk))
+               return;
+         }
       }
       if (skip_suffix) {
          /* Inactive chunks no longer drain the preceding active mesh draw. */
@@ -6032,14 +6181,14 @@ bc250_draw_task(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint
       /* CPU-side chunking: each flat range is dispatched directly and its mesh
        * records are consumed before the next chunk reuses the scratch. */
       assert(mapped);
-      struct bc250_task_slot slot = {.full_x = x, .full_y = y, .full_z = z};
+      struct bc250_task_slot slot = {.full_x = x, .full_y = y, .full_z = z, .pad = draw_id};
       memcpy((char *)mapped + slots_base, &slot, sizeof(slot));
       constants.task_slot = address + slots_base;
       bc250_emit_chunks(cmd_buffer, pipeline, &constants, address, x, y, z, total);
    } else {
       radv_meta_begin(cmd_buffer);
       assert(mapped);
-      struct bc250_task_slot slot = {.full_x = x, .full_y = y, .full_z = z};
+      struct bc250_task_slot slot = {.full_x = x, .full_y = y, .full_z = z, .pad = draw_id};
       memcpy((char *)mapped + slots_base, &slot, sizeof(slot));
       constants.task_slot = address + slots_base;
       radv_meta_bind_compute_pipeline(cmd_buffer, pipeline->bc250_task_pipeline);
@@ -6086,13 +6235,14 @@ void
 radv_bc250_draw_task_dgc(struct radv_cmd_buffer *cmd_buffer, uint64_t input,
                           uint64_t count, uint32_t draw_id, uint64_t *scratch)
 {
-   bc250_draw_task(cmd_buffer, 0, 0, 0, input, count, draw_id, scratch);
+   struct radv_cmd_stream *tail = NULL;
+   bc250_draw_task(cmd_buffer, 0, 0, 0, input, count, draw_id, scratch, cmd_buffer->bc250_dgc_tail_va ? &tail : NULL);
 }
 
 void
 radv_bc250_draw_task(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint32_t z)
 {
-   bc250_draw_task(cmd_buffer, x, y, z, 0, 0, 0, NULL);
+   bc250_draw_task(cmd_buffer, x, y, z, 0, 0, 0, NULL, NULL);
 }
 
 void
@@ -6106,8 +6256,10 @@ radv_bc250_draw_task_indirect(struct radv_cmd_buffer *cmd_buffer, uint64_t addre
       return;
    }
    uint64_t scratch_address = 0;
+   struct radv_cmd_stream *task_tail = NULL;
    for (uint32_t i = 0; i < draw_count; i++) {
-      bc250_draw_task(cmd_buffer, 0, 0, 0, address + (uint64_t)i * stride, count_address, i, &scratch_address);
+      bc250_draw_task(cmd_buffer, 0, 0, 0, address + (uint64_t)i * stride, count_address, i, &scratch_address,
+                      &task_tail);
       if (vk_command_buffer_has_error(&cmd_buffer->vk))
          return;
    }
