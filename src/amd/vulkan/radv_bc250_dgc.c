@@ -258,9 +258,13 @@ struct bc250_dgc_program {
    struct bc250_dgc_query_patch patches[];
 };
 
-static bool
-bc250_dgc_record_program(struct radv_device *device, const VkGeneratedCommandsInfoEXT *info,
-                         const struct bc250_dgc_shape *shape, const uint8_t *snapshot)
+/* The query-event offsets of one captured program. It is never looked up by preprocess address
+ * (two preprocesses into one buffer would otherwise exchange offsets): an inline preprocess hands
+ * it to its execute, and an execute of an explicit preprocess rebuilds it from its own state, which
+ * the API requires to match the preprocessing state. */
+static struct bc250_dgc_program *
+bc250_dgc_build_program(const VkGeneratedCommandsInfoEXT *info, const struct bc250_dgc_shape *shape,
+                        const uint8_t *snapshot)
 {
    unsigned count = 0;
    struct bc250_dgc_program *program = NULL;
@@ -272,12 +276,12 @@ bc250_dgc_record_program(struct radv_device *device, const VkGeneratedCommandsIn
             uint32_t header = words[i];
             unsigned len = header == PKT3_NOP_PAD || header >> 30 == 2 ? 1 : ((header >> 16) & 0x3fff) + 2;
             if ((header >> 30 != 2 && header >> 30 != 3) || i + len > shape->code / 4) {
-               free(program); return false;
+               free(program); return NULL;
             }
             if ((header >> 8 & 255) == PKT3_EVENT_WRITE && len > 1 &&
                 ((words[i + 1] & 63) == V_028A90_PIPELINESTAT_START ||
                  (words[i + 1] & 63) == V_028A90_PIPELINESTAT_STOP)) {
-               if (len != 2) { free(program); return false; }
+               if (len != 2) { free(program); return NULL; }
                if (pass)
                   program->patches[index] = (struct bc250_dgc_query_patch){
                      (uint64_t)seq * shape->stride + i * 4, header, words[i + 1]};
@@ -289,33 +293,20 @@ bc250_dgc_record_program(struct radv_device *device, const VkGeneratedCommandsIn
       if (!pass) {
          count = index;
          program = malloc(sizeof(*program) + (size_t)count * sizeof(program->patches[0]));
-         if (!program) return false;
+         if (!program) return NULL;
       }
    }
    const VkGeneratedCommandsPipelineInfoEXT *pi = vk_find_struct_const(info->pNext, GENERATED_COMMANDS_PIPELINE_INFO_EXT);
    *program = (struct bc250_dgc_program){.layout = info->indirectCommandsLayout, .pipeline = pi->pipeline,
       .size = shape->size, .sequences = info->maxSequenceCount, .draws = info->maxDrawCount, .count = count};
-   mtx_lock(&device->meta_state.mtx);
-   if (!device->bc250_dgc_query_states)
-      device->bc250_dgc_query_states = _mesa_hash_table_u64_create(NULL);
-   bool ok = device->bc250_dgc_query_states != NULL;
-   if (ok) {
-      free(_mesa_hash_table_u64_search(device->bc250_dgc_query_states, info->preprocessAddress));
-      _mesa_hash_table_u64_insert(device->bc250_dgc_query_states, info->preprocessAddress, program);
-   }
-   mtx_unlock(&device->meta_state.mtx);
-   if (!ok) free(program);
-   return ok;
+   return program;
 }
 
 static bool
 bc250_dgc_patch_queries(struct radv_cmd_buffer *cmd, const VkGeneratedCommandsInfoEXT *info,
-                        const struct bc250_dgc_shape *shape)
+                        const struct bc250_dgc_shape *shape, const struct bc250_dgc_program *program)
 {
    struct radv_device *device = radv_cmd_buffer_device(cmd);
-   mtx_lock(&device->meta_state.mtx);
-   const struct bc250_dgc_program *program = device->bc250_dgc_query_states ?
-      _mesa_hash_table_u64_search(device->bc250_dgc_query_states, info->preprocessAddress) : NULL;
    const VkGeneratedCommandsPipelineInfoEXT *pi = vk_find_struct_const(info->pNext, GENERATED_COMMANDS_PIPELINE_INFO_EXT);
    bool ok = program && program->pipeline == pi->pipeline && program->layout == info->indirectCommandsLayout && program->size == shape->size &&
       program->sequences == info->maxSequenceCount && program->draws == info->maxDrawCount;
@@ -343,7 +334,6 @@ bc250_dgc_patch_queries(struct radv_cmd_buffer *cmd, const VkGeneratedCommandsIn
       }
       if (packets) fclose(packets);
    }
-   mtx_unlock(&device->meta_state.mtx);
    return ok;
 }
 
@@ -626,9 +616,9 @@ bc250_dgc_info_valid(const struct radv_cmd_buffer *cmd, const VkGeneratedCommand
       info->indirectAddressSize >= (uint64_t)layout->vk.stride * info->maxSequenceCount;
 }
 
-void
-radv_bc250_dgc_prepare(struct radv_cmd_buffer *cmd, const VkGeneratedCommandsInfoEXT *info,
-                       struct radv_cmd_buffer *state)
+static void
+bc250_dgc_prepare(struct radv_cmd_buffer *cmd, const VkGeneratedCommandsInfoEXT *info,
+                  struct radv_cmd_buffer *state, struct bc250_dgc_program **program_out)
 {
    struct bc250_dgc_shape shape;
    if (!bc250_dgc_info_valid(state, info, &shape) || cmd->qf != RADV_QUEUE_GENERAL ||
@@ -668,12 +658,16 @@ radv_bc250_dgc_prepare(struct radv_cmd_buffer *cmd, const VkGeneratedCommandsInf
       FILE *f = fopen(path, "wb");
       if (f) { fwrite(&params, 1, sizeof(params), f); fwrite(snapshot, 1, shape.size, f); fclose(f); }
    }
-   bool recorded = bc250_dgc_record_program(radv_cmd_buffer_device(cmd), info, &shape, snapshot);
+   struct bc250_dgc_program *program = bc250_dgc_build_program(info, &shape, snapshot);
    free(snapshot);
-   if (!recorded) {
+   if (!program) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
       return;
    }
+   if (program_out)
+      *program_out = program;
+   else
+      free(program);
    cmd->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_VS_PARTIAL_FLUSH |
                             RADV_CMD_FLAG_PS_PARTIAL_FLUSH | RADV_CMD_FLAG_WB_L2;
    radv_meta_begin(cmd);
@@ -687,6 +681,30 @@ radv_bc250_dgc_prepare(struct radv_cmd_buffer *cmd, const VkGeneratedCommandsInf
 }
 
 void
+radv_bc250_dgc_prepare(struct radv_cmd_buffer *cmd, const VkGeneratedCommandsInfoEXT *info,
+                       struct radv_cmd_buffer *state)
+{
+   bc250_dgc_prepare(cmd, info, state, NULL);
+}
+
+/* Query offsets for an execute of an explicit preprocess: capture again with the execution state
+ * (no upload, no dispatch). */
+static struct bc250_dgc_program *
+bc250_dgc_program_from_state(struct radv_cmd_buffer *cmd, const VkGeneratedCommandsInfoEXT *info,
+                             const struct bc250_dgc_shape *shape)
+{
+   uint8_t *snapshot = calloc(1, shape->size);
+   if (!snapshot)
+      return NULL;
+   bool ok = true;
+   for (uint32_t seq = 0; seq < info->maxSequenceCount && ok; seq++)
+      ok = bc250_dgc_capture(cmd, cmd, info, shape, seq, snapshot + (uint64_t)seq * shape->stride);
+   struct bc250_dgc_program *program = ok ? bc250_dgc_build_program(info, shape, snapshot) : NULL;
+   free(snapshot);
+   return program;
+}
+
+void
 radv_bc250_dgc_execute(struct radv_cmd_buffer *cmd, VkBool32 preprocessed, const VkGeneratedCommandsInfoEXT *info)
 {
    struct bc250_dgc_shape shape;
@@ -696,14 +714,21 @@ radv_bc250_dgc_execute(struct radv_cmd_buffer *cmd, VkBool32 preprocessed, const
    }
    if (!info->maxSequenceCount)
       return;
+   struct bc250_dgc_program *program = NULL;
    if (!preprocessed)
-      radv_bc250_dgc_prepare(cmd, info, cmd);
-   if (vk_command_buffer_has_error(&cmd->vk))
+      bc250_dgc_prepare(cmd, info, cmd, &program);
+   else if (!(program = bc250_dgc_program_from_state(cmd, info, &shape)))
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+   if (vk_command_buffer_has_error(&cmd->vk)) {
+      free(program);
       return;
+   }
    struct radv_device *device = radv_cmd_buffer_device(cmd);
    struct radv_graphics_pipeline *p = radv_bc250_mesh_pipeline(cmd);
-   if (!radv_bc250_dgc_before(cmd))
+   if (!radv_bc250_dgc_before(cmd)) {
+      free(program);
       return;
+   }
    /* Explicit preprocess buffers may be reset after completion. Scratch and
     * constants are all in preprocess memory; executable residency belongs to
     * the execution command buffer as well as the preprocessing buffer. */
@@ -731,7 +756,9 @@ radv_bc250_dgc_execute(struct radv_cmd_buffer *cmd, VkBool32 preprocessed, const
    cmd->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_INV_L2 | RADV_CMD_FLAG_INV_VCACHE |
                             RADV_CMD_FLAG_INV_SCACHE | RADV_CMD_FLAG_WB_L2;
    radv_emit_cache_flush(cmd);
-   if (!bc250_dgc_patch_queries(cmd, info, &shape)) {
+   const bool patched = bc250_dgc_patch_queries(cmd, info, &shape, program);
+   free(program);
+   if (!patched) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }

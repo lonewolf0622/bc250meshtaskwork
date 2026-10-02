@@ -198,8 +198,6 @@ struct radv_device {
     * created with an unoptimized ACO build first (radv_pipeline_graphics.c). */
    bool bc250_async;
    struct util_queue bc250_async_queue;
-   /* DGC query-state certificates, protected by meta_state.mtx. */
-   struct hash_table_u64 *bc250_dgc_query_states;
    uint64_t bc250_trace_device_id; /* Process-local diagnostic generation. */
    struct radv_bc250_mesh_timer bc250_timer; /* BC250_MESH_TIMER (radv_bc250_timer.h) */
    /* RADV_BC250_COMPUTE_QUEUE_PRIORITY (radv_queue.c): the kernel context priority of compute-family
