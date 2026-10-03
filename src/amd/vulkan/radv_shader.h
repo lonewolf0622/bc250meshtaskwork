@@ -782,7 +782,9 @@ struct radv_compiler_info {
       uint32_t lds_plan : 1;
       /* RADV_BC250_MESH_LDS_COVER: the local route's coverage words and hole ranks come from LDS. */
       uint32_t lds_cover : 1;
-      uint32_t padding : 20;
+      /* RADV_BC250_MESH_MERGED_CHECK: one ranked check gives the adaptive shared and renumbered results. */
+      uint32_t merged_check : 1;
+      uint32_t padding : 19;
    } bc250x;
 
    /* Debug/tracing */

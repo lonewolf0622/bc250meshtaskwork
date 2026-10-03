@@ -300,6 +300,10 @@ typedef struct {
     * wave reductions, and hole removal ranks vertices from scalar word prefix sums and an LDS rank table
     * instead of per-corner popcounts of every word. Same counts, map and connectivity. */
    bool bc250_lds_cover;
+   /* RADV_BC250_MESH_MERGED_CHECK: with the adaptive and renumbered exports, the survivor check runs once on the
+    * ranks. When the survivors reference every vertex, each rank is the index itself, so the ranked check is the
+    * shared check; otherwise the shared check fails and the ranked check is the renumbered check. */
+   bool bc250_merged_check;
    bool bc250_safe_check;
    bool bc250_safe_corners;
    /* RADV_BC250_MESH_SAFE_ADAPTIVE (with bc250_safe_corners, no owned per-primitive data): a

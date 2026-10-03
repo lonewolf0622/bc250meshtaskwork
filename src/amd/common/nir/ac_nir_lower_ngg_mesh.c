@@ -2728,8 +2728,19 @@ ms_safe_fast_check_wave(nir_builder *b, lower_ngg_ms_state *s, nir_def *vc, nir_
        *  3. otherwise the private corners of the survivors.
        * The map holds the exported triangles' API indices in order (corner sources for 3). */
       nir_def *use_all = nir_imm_false(b), *shared = nir_imm_false(b);
+      const bool merged = s->options->bc250_merged_check && s->options->bc250_safe_adaptive && s->safe_compact;
+      nir_def *merged_words[8], *merged_used = NULL, *merged_compact = NULL;
       if (s->options->bc250_safe_adaptive) {
-         nir_def *post = ms_adaptive_shared_clean(b, s, idx, live, vc);
+         nir_def *post;
+         if (merged) {
+            /* RADV_BC250_MESH_MERGED_CHECK: one coverage and one scan for both survivor checks. */
+            nir_def *ranked = ms_adaptive_compact_ok(b, s, idx, live, vc, merged_words, &merged_used);
+            nir_def *all = nir_ieq(b, merged_used, vc);
+            post = nir_iand(b, ranked, all);
+            merged_compact = nir_iand(b, ranked, nir_inot(b, all));
+         } else {
+            post = ms_adaptive_shared_clean(b, s, idx, live, vc);
+         }
          nir_def *pre;
          if (s->options->bc250_lean_check) {
             /* RADV_BC250_MESH_LEAN_CHECK: the pre-cull check only matters when the survivors are not clean
@@ -2776,7 +2787,15 @@ ms_safe_fast_check_wave(nir_builder *b, lower_ngg_ms_state *s, nir_def *vc, nir_
       nir_def *compact_result = NULL;
       if (s->safe_compact) {
          nir_def *words[8], *used;
-         nir_def *ok = nir_iand(b, nir_inot(b, shared), ms_adaptive_compact_ok(b, s, idx, live, vc, words, &used));
+         nir_def *ok;
+         if (merged) {
+            for (unsigned w = 0; w < 8; ++w)
+               words[w] = merged_words[w];
+            used = merged_used;
+            ok = nir_iand(b, nir_inot(b, shared), merged_compact);
+         } else {
+            ok = nir_iand(b, nir_inot(b, shared), ms_adaptive_compact_ok(b, s, idx, live, vc, words, &used));
+         }
          compact = nir_push_if(b, ok);
          nir_def *holes = ms_safe_local_remove_holes(b, s, idx, live, words, used);
          compact_result = nir_vec3(b, nir_channel(b, holes, 0), nir_channel(b, holes, 1), nir_imm_int(b, 2));
