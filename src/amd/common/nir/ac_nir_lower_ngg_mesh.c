@@ -3897,6 +3897,10 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
    bool compact = !compact_reason;
    if (compact)
       cross_invocation_access |= per_vertex_outputs;
+   /* RADV_BC250_MESH_PP_DIRECT: the lane exporting a provoking slot reads the per-primitive outputs of
+    * the triangle that created it, written by another invocation: keep them in LDS. */
+   if (safe_direct && options->bc250_pp_direct)
+      cross_invocation_access |= per_primitive_outputs & (UINT64_C(0xffffffff) << VARYING_SLOT_VAR0);
    uint64_t original_cross_invocation_access = cross_invocation_access;
 
    /* RADV_BC250_MESH_IMPLICIT_TRIS (see ms_implicit_index). */
