@@ -780,7 +780,9 @@ struct radv_compiler_info {
       uint32_t pieces65 : 1;
       /* RADV_BC250_MESH_LDS_PLAN: the local slot planner finds first occurrences with an LDS table. */
       uint32_t lds_plan : 1;
-      uint32_t padding : 21;
+      /* RADV_BC250_MESH_LDS_COVER: the local route's coverage words and hole ranks come from LDS. */
+      uint32_t lds_cover : 1;
+      uint32_t padding : 20;
    } bc250x;
 
    /* Debug/tracing */

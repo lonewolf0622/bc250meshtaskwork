@@ -190,6 +190,9 @@ typedef struct
    /* RADV_BC250_MESH_LDS_PLAN: first-occurrence table (intervals x max_vertices dwords), when lds_plan. */
    bool lds_plan;
    uint32_t lds_plan_addr;
+   /* RADV_BC250_MESH_LDS_COVER: 8 coverage dwords, then one rank byte per vertex. */
+   bool lds_cover;
+   uint32_t lds_cover_addr;
    nir_variable *fast_prim_arg;
    uint32_t safe_direct_map_addr;
    uint32_t safe_direct_latest_addr;
@@ -2519,6 +2522,44 @@ ms_safe_local_remove_holes(nir_builder *b, lower_ngg_ms_state *s, nir_def *idx,
    nir_def *words[8];
    for (unsigned w = 0; w < 8; ++w)
       words[w] = w < DIV_ROUND_UP(vmax, 32) ? coverage[w] : zero;
+   if (s->lds_cover) {
+      /* RADV_BC250_MESH_LDS_COVER: rank(v) = referenced vertices in earlier words (scalar prefix sums) plus
+       * those below v in its word. Each referenced vertex stores its slot in the map and its rank in a byte
+       * table; corners read the table. Same ranks as ms_safe_parallel_rank. */
+      const unsigned nwords = DIV_ROUND_UP(vmax, 32);
+      nir_def *prefix[9];
+      prefix[0] = zero;
+      for (unsigned w = 0; w < nwords; ++w)
+         prefix[w + 1] = nir_iadd(b, prefix[w], nir_bit_count(b, words[w]));
+      for (unsigned first = 0; first < vmax; first += s->wave_size) {
+         nir_def *v = nir_iadd_imm(b, lane, first);
+         nir_def *mask = words[first / 32], *base = prefix[first / 32];
+         if (s->wave_size == 64 && first + 32 < vmax) {
+            mask = nir_bcsel(b, nir_ult_imm(b, lane, 32), mask, words[first / 32 + 1]);
+            base = nir_bcsel(b, nir_ult_imm(b, lane, 32), base, prefix[first / 32 + 1]);
+         }
+         nir_def *bit = nir_iand_imm(b, v, 31);
+         nir_def *referenced = nir_iand(b, nir_ult_imm(b, v, vmax),
+            nir_ine_imm(b, nir_iand_imm(b, nir_ushr(b, mask, bit), 1), 0));
+         nir_def *rank = nir_iadd(b, base, nir_bit_count(b, nir_iand(b, mask,
+                                  nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), bit), -1))));
+         nir_if *store = nir_push_if(b, referenced);
+         nir_store_shared(b, nir_u2u8(b, v), rank, .base = s->safe_direct_map_addr);
+         nir_store_shared(b, nir_u2u8(b, rank), v, .base = s->lds_cover_addr + 32);
+         nir_pop_if(b, store);
+      }
+      nir_barrier(b, .execution_scope = SCOPE_SUBGROUP, .memory_scope = SCOPE_SUBGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared);
+      nir_def *live_mask = nir_ballot(b, 1, 64, live);
+      nir_if *store = nir_push_if(b, live);
+      nir_def *slots[3];
+      for (unsigned c = 0; c < 3; ++c)
+         slots[c] = nir_load_shared(b, 1, 8, nir_channel(b, idx, c), .base = s->lds_cover_addr + 32);
+      nir_store_shared(b, nir_vec3(b, slots[0], slots[1], slots[2]),
+                       nir_imul_imm(b, nir_mbcnt_amd(b, live_mask, zero), 3), .base = s->safe_direct_indices_addr);
+      nir_pop_if(b, store);
+      return nir_vec2(b, used, nir_u2u32(b, nir_bit_count(b, live_mask)));
+   }
    for (unsigned first = 0; first < vmax; first += s->wave_size) {
       nir_def *v = nir_iadd_imm(b, lane, first);
       nir_def *mask = words[first / 32];
@@ -2745,7 +2786,27 @@ ms_safe_fast_check_wave(nir_builder *b, lower_ngg_ms_state *s, nir_def *vc, nir_
    const unsigned coverage_words = DIV_ROUND_UP(b->shader->info.mesh.max_vertices_out, 32);
    assert(coverage_words <= 8);
    nir_def *data[10];
-   for (unsigned w = 0; w < coverage_words; ++w) {
+   if (s->lds_cover) {
+      /* RADV_BC250_MESH_LDS_COVER: the same words (bits of live corners below 32 * words), OR-ed in LDS.
+       * Only this wave uses them; its LDS operations complete in order. */
+      nir_if *clear = nir_push_if(b, nir_ult_imm(b, lane, coverage_words));
+      nir_store_shared(b, zero, nir_imul_imm(b, lane, 4), .base = s->lds_cover_addr, .align_mul = 4);
+      nir_pop_if(b, clear);
+      nir_barrier(b, .execution_scope = SCOPE_SUBGROUP, .memory_scope = SCOPE_SUBGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared);
+      for (unsigned c = 0; c < 3; ++c) {
+         nir_if *mark = nir_push_if(b, nir_iand(b, live, nir_ult_imm(b, v[c], 32 * coverage_words)));
+         nir_shared_atomic(b, 32, nir_imul_imm(b, nir_ushr_imm(b, v[c], 5), 4), nir_ishl(b, nir_imm_int(b, 1), v[c]),
+                           .base = s->lds_cover_addr, .atomic_op = nir_atomic_op_ior);
+         nir_pop_if(b, mark);
+      }
+      nir_barrier(b, .execution_scope = SCOPE_SUBGROUP, .memory_scope = SCOPE_SUBGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared);
+      for (unsigned w = 0; w < coverage_words; ++w)
+         data[w] = nir_read_first_invocation(b, nir_load_shared(b, 1, 32, nir_imm_int(b, 4 * w),
+                                                                 .base = s->lds_cover_addr, .align_mul = 4));
+   }
+   for (unsigned w = 0; w < coverage_words && !s->lds_cover; ++w) {
       nir_def *bits = zero;
       for (unsigned c = 0; c < 3; ++c) {
          nir_def *in_word = nir_ieq_imm(b, nir_ushr_imm(b, v[c], 5), w);
@@ -4111,8 +4172,8 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
 
    uint32_t safe_direct_map_addr = 0, safe_direct_latest_addr = 0;
    uint32_t pp_direct_creator_addr = 0;
-   uint32_t lds_plan_addr = 0;
-   bool lds_plan = false;
+   uint32_t lds_plan_addr = 0, lds_cover_addr = 0;
+   bool lds_plan = false, lds_cover = false;
    uint32_t safe_direct_indices_addr = 0, safe_direct_counts_addr = 0;
    bool safe_compact = false;
    bool pp_share = false;
@@ -4154,6 +4215,16 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
          lds_plan_addr = align(layout.lds.total_size, 4);
          layout.lds.total_size = lds_plan_addr + plan_size;
       }
+      if (options->bc250_lds_cover && options->bc250_safe_local && !options->bc250_safe_corners &&
+          max_primitives <= options->wave_size &&
+          align(layout.lds.total_size, 4) + 32 + max_vertices + 6 * max_primitives <= 32 * 1024) {
+         lds_cover = true;
+         lds_cover_addr = align(layout.lds.total_size, 4);
+         layout.lds.total_size = lds_cover_addr + 32 + max_vertices;
+      }
+      if (options->bc250_lds_cover && getenv("BC250_TRACE_COMPILE"))
+         fprintf(stderr, "BC250 MESH LDS COVER: %s V=%u P=%u\n", lds_cover ? "applied" : "not applied",
+                 max_vertices, max_primitives);
       if (options->bc250_lds_plan && getenv("BC250_TRACE_COMPILE"))
          fprintf(stderr, "BC250 MESH LDS PLAN: %s V=%u P=%u intervals=%u bytes=%u\n", lds_plan ? "applied" : "not applied",
                  max_vertices, max_primitives, plan_intervals, lds_plan ? plan_size : 0);
@@ -4268,6 +4339,8 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
       .pp_direct_creator_addr = pp_direct_creator_addr,
       .lds_plan = lds_plan,
       .lds_plan_addr = lds_plan_addr,
+      .lds_cover = lds_cover,
+      .lds_cover_addr = lds_cover_addr,
       .safe_direct_latest_addr = safe_direct_latest_addr,
       .safe_direct_indices_addr = safe_direct_indices_addr,
       .safe_direct_counts_addr = safe_direct_counts_addr,

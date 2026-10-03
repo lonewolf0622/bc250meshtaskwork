@@ -296,6 +296,10 @@ typedef struct {
     * occurrence in its interval with an LDS table (atomic min of corner keys) instead of bit-plane ballots.
     * Same plan. */
    bool bc250_lds_plan;
+   /* RADV_BC250_MESH_LDS_COVER: on the local route, the coverage words are OR-ed in LDS instead of
+    * wave reductions, and hole removal ranks vertices from scalar word prefix sums and an LDS rank table
+    * instead of per-corner popcounts of every word. Same counts, map and connectivity. */
+   bool bc250_lds_cover;
    bool bc250_safe_check;
    bool bc250_safe_corners;
    /* RADV_BC250_MESH_SAFE_ADAPTIVE (with bc250_safe_corners, no owned per-primitive data): a
