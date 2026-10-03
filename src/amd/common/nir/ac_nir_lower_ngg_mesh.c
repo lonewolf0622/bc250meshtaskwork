@@ -4237,9 +4237,9 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
          lds_plan_addr = align(layout.lds.total_size, 4);
          layout.lds.total_size = lds_plan_addr + plan_size;
       }
-      /* Hardware-free estimate: with at most 64 vertices (two words) the wave reductions are cheaper than the
-       * LDS round trip (33..64 vertices: -1.7% latency for +16 instructions); above, -4..7%. */
-      if (options->bc250_lds_cover && options->bc250_safe_local && max_vertices > 64 &&
+      /* Hardware: 256-vertex pieces (eight words) are 4.8% faster; 128-vertex pieces (four words) are 5-7%
+       * slower, where the wave reductions beat the LDS round trip. */
+      if (options->bc250_lds_cover && options->bc250_safe_local && max_vertices > 128 &&
           max_primitives <= options->wave_size &&
           align(layout.lds.total_size, 4) + 32 + max_vertices + 6 * max_primitives <= 32 * 1024) {
          lds_cover = true;
