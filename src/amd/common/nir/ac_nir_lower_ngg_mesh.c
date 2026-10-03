@@ -1971,6 +1971,31 @@ ms_compact_primitive_slots(nir_builder *b, nir_def *prim, nir_def *slots[3], low
  * Logical vertices own independent chains; no lane serializes all allocations.
  * The conservative source-key window may duplicate more than exact closure.
  */
+/* RADV_BC250_MESH_LDS_COVER: the coverage words of the given corners of the live lanes (bits below
+ * 32 * words), OR-ed in LDS by the single checker wave; its LDS operations complete in order. Returns the
+ * words as wave-uniform values. */
+static void
+ms_lds_coverage(nir_builder *b, lower_ngg_ms_state *s, nir_def **v, nir_def *live, unsigned nwords, nir_def **words)
+{
+   nir_def *lane = nir_load_subgroup_invocation(b);
+   nir_if *clear = nir_push_if(b, nir_ult_imm(b, lane, nwords));
+   nir_store_shared(b, nir_imm_int(b, 0), nir_imul_imm(b, lane, 4), .base = s->lds_cover_addr, .align_mul = 4);
+   nir_pop_if(b, clear);
+   nir_barrier(b, .execution_scope = SCOPE_SUBGROUP, .memory_scope = SCOPE_SUBGROUP,
+               .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared);
+   for (unsigned c = 0; c < 3; ++c) {
+      nir_if *mark = nir_push_if(b, nir_iand(b, live, nir_ult_imm(b, v[c], 32 * nwords)));
+      nir_shared_atomic(b, 32, nir_imul_imm(b, nir_ushr_imm(b, v[c], 5), 4), nir_ishl(b, nir_imm_int(b, 1), v[c]),
+                        .base = s->lds_cover_addr, .atomic_op = nir_atomic_op_ior);
+      nir_pop_if(b, mark);
+   }
+   nir_barrier(b, .execution_scope = SCOPE_SUBGROUP, .memory_scope = SCOPE_SUBGROUP,
+               .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared);
+   for (unsigned w = 0; w < nwords; ++w)
+      words[w] = nir_read_first_invocation(b, nir_load_shared(b, 1, 32, nir_imm_int(b, 4 * w),
+                                                              .base = s->lds_cover_addr, .align_mul = 4));
+}
+
 static nir_def *
 ms_safe_parallel_rank(nir_builder *b, nir_def *key, nir_def **words)
 {
@@ -2599,7 +2624,13 @@ ms_adaptive_shared_clean(nir_builder *b, lower_ngg_ms_state *s, nir_def *idx, ni
    const unsigned words = DIV_ROUND_UP(b->shader->info.mesh.max_vertices_out, 32);
    assert(words <= 8);
    nir_def *used = zero;
-   for (unsigned w = 0; w < words; ++w) {
+   if (s->lds_cover) {
+      nir_def *cw[8];
+      ms_lds_coverage(b, s, v, live, words, cw);
+      for (unsigned w = 0; w < words; ++w)
+         used = nir_iadd(b, used, nir_bit_count(b, cw[w]));
+   }
+   for (unsigned w = 0; w < words && !s->lds_cover; ++w) {
       nir_def *bits = zero;
       for (unsigned c = 0; c < 3; ++c) {
          nir_def *in_word = nir_ieq_imm(b, nir_ushr_imm(b, v[c], 5), w);
@@ -2629,7 +2660,16 @@ ms_adaptive_compact_ok(nir_builder *b, lower_ngg_ms_state *s, nir_def *idx, nir_
    const unsigned count = DIV_ROUND_UP(b->shader->info.mesh.max_vertices_out, 32);
    assert(count <= 8);
    *used = zero;
-   for (unsigned w = 0; w < 8; ++w) {
+   if (s->lds_cover) {
+      ms_lds_coverage(b, s, v, live, count, words);
+      for (unsigned w = 0; w < 8; ++w) {
+         if (w >= count)
+            words[w] = zero;
+         else
+            *used = nir_iadd(b, *used, nir_bit_count(b, words[w]));
+      }
+   }
+   for (unsigned w = 0; w < 8 && !s->lds_cover; ++w) {
       if (w >= count) {
          words[w] = zero;
          continue;
@@ -2786,26 +2826,8 @@ ms_safe_fast_check_wave(nir_builder *b, lower_ngg_ms_state *s, nir_def *vc, nir_
    const unsigned coverage_words = DIV_ROUND_UP(b->shader->info.mesh.max_vertices_out, 32);
    assert(coverage_words <= 8);
    nir_def *data[10];
-   if (s->lds_cover) {
-      /* RADV_BC250_MESH_LDS_COVER: the same words (bits of live corners below 32 * words), OR-ed in LDS.
-       * Only this wave uses them; its LDS operations complete in order. */
-      nir_if *clear = nir_push_if(b, nir_ult_imm(b, lane, coverage_words));
-      nir_store_shared(b, zero, nir_imul_imm(b, lane, 4), .base = s->lds_cover_addr, .align_mul = 4);
-      nir_pop_if(b, clear);
-      nir_barrier(b, .execution_scope = SCOPE_SUBGROUP, .memory_scope = SCOPE_SUBGROUP,
-                  .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared);
-      for (unsigned c = 0; c < 3; ++c) {
-         nir_if *mark = nir_push_if(b, nir_iand(b, live, nir_ult_imm(b, v[c], 32 * coverage_words)));
-         nir_shared_atomic(b, 32, nir_imul_imm(b, nir_ushr_imm(b, v[c], 5), 4), nir_ishl(b, nir_imm_int(b, 1), v[c]),
-                           .base = s->lds_cover_addr, .atomic_op = nir_atomic_op_ior);
-         nir_pop_if(b, mark);
-      }
-      nir_barrier(b, .execution_scope = SCOPE_SUBGROUP, .memory_scope = SCOPE_SUBGROUP,
-                  .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared);
-      for (unsigned w = 0; w < coverage_words; ++w)
-         data[w] = nir_read_first_invocation(b, nir_load_shared(b, 1, 32, nir_imm_int(b, 4 * w),
-                                                                 .base = s->lds_cover_addr, .align_mul = 4));
-   }
+   if (s->lds_cover)
+      ms_lds_coverage(b, s, v, live, coverage_words, data);
    for (unsigned w = 0; w < coverage_words && !s->lds_cover; ++w) {
       nir_def *bits = zero;
       for (unsigned c = 0; c < 3; ++c) {
@@ -4215,7 +4237,8 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
          lds_plan_addr = align(layout.lds.total_size, 4);
          layout.lds.total_size = lds_plan_addr + plan_size;
       }
-      if (options->bc250_lds_cover && options->bc250_safe_local && !options->bc250_safe_corners &&
+      /* With at most 32 vertices one wave reduction is cheaper than the LDS round trip. */
+      if (options->bc250_lds_cover && options->bc250_safe_local && max_vertices > 32 &&
           max_primitives <= options->wave_size &&
           align(layout.lds.total_size, 4) + 32 + max_vertices + 6 * max_primitives <= 32 * 1024) {
          lds_cover = true;
