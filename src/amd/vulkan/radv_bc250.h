@@ -25,11 +25,11 @@ void radv_bc250_draw_split_indirect(struct radv_cmd_buffer *cmd_buffer, uint64_t
  * vkCmdExecuteCommands and command buffer begin/reset. */
 void radv_bc250_split_batch_close(struct radv_cmd_buffer *cmd_buffer);
 void radv_bc250_task_tails_free(struct radv_cmd_buffer *cmd_buffer);
-void radv_bc250_pp_direct_fs_inputs(struct nir_shader *fs);
 /* RADV_BC250_TASK_TAIL in DGC: the slots after the first start this far into the 1 MiB program. */
 #define BC250_DGC_TAIL_OFFSET 65536u
 #define BC250_DGC_TAIL_BYTES (1048576u - BC250_DGC_TAIL_OFFSET)
 struct nir_shader;
+void radv_bc250_pp_direct_fs_inputs(struct nir_shader *fs);
 struct radv_compiler_info;
 struct radv_shader_stage;
 /* RADV_BC250_MESH_DIRECT_READ parts (compiler key bc250_mesh_direct_read, see
