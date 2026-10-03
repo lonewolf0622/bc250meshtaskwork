@@ -4150,7 +4150,11 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
       .autocull_skip_viewport_state = options->skip_viewport_state_culling,
       .autocull_lds_addr = autocull_lds_addr,
       .dont_export_cull = dont_export_cull,
-      .num_pos_exports = ms_num_pos_exports(per_vertex_outputs, options->export_clipdist_mask &
+      .num_pos_exports = ms_num_pos_exports(per_vertex_outputs |
+                                               (options->multiview && options->multiview_layer_per_vertex &&
+                                                !(shader->info.outputs_written & VARYING_BIT_LAYER) ?
+                                                VARYING_BIT_LAYER : 0),
+                                            options->export_clipdist_mask &
                                             ~(dont_export_cull ? cull_export_mask : 0)),
       .ac = options->compiler_info,
       .vert_multirow_export = fast_launch_2 && max_vertices > hw_workgroup_size,
