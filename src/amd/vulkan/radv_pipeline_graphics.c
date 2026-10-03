@@ -3309,6 +3309,8 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
 
    /* Optimize varyings on lowered shader I/O (more efficient than optimizing I/O derefs). */
    radv_graphics_shaders_link_varyings(stages, compiler_info->ac->gfx_level);
+   if (stages[MESA_SHADER_MESH].nir && stages[MESA_SHADER_MESH].bc250_pp_direct && stages[MESA_SHADER_FRAGMENT].nir)
+      radv_bc250_pp_direct_fs_inputs(stages[MESA_SHADER_FRAGMENT].nir);
 
    VkResult bary_result = radv_bc250_link_bary_rotation(compiler_info, stages, gfx_state);
    if (bary_result != VK_SUCCESS)

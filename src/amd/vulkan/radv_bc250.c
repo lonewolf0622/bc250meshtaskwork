@@ -424,6 +424,31 @@ bc250_safe_direct_candidate(nir_shader *mesh, bool parallel, unsigned max_slots,
    return bc250_safe_direct_candidate_pp(mesh, parallel, max_slots, private_bary, false);
 }
 
+/* RADV_BC250_MESH_PP_DIRECT: after linking, the fragment shader's per-primitive generic inputs are flat
+ * inputs: the Mesh shader exports them per vertex on the provoking corner's slot. */
+static bool
+bc250_pp_direct_fs_input(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
+{
+   if (intrin->intrinsic != nir_intrinsic_load_per_primitive_input ||
+       nir_intrinsic_io_semantics(intrin).location < VARYING_SLOT_VAR0)
+      return false;
+   intrin->intrinsic = nir_intrinsic_load_input;
+   return true;
+}
+
+void
+radv_bc250_pp_direct_fs_inputs(nir_shader *fs)
+{
+   NIR_PASS(_, fs, nir_shader_intrinsics_pass, bc250_pp_direct_fs_input, nir_metadata_all, NULL);
+   nir_foreach_shader_in_variable(var, fs) {
+      if (var->data.per_primitive && var->data.location >= VARYING_SLOT_VAR0) {
+         var->data.per_primitive = false;
+         var->data.interpolation = INTERP_MODE_FLAT;
+      }
+   }
+   nir_shader_gather_info(fs, nir_shader_get_entrypoint(fs));
+}
+
 bool
 radv_bc250_mesh_safe_direct_candidate(nir_shader *mesh, bool parallel)
 {
@@ -5114,16 +5139,9 @@ radv_bc250_prepare_task(struct radv_device *device,
       if (pp_direct) {
          struct radv_shader_stage *ms = &stages[MESA_SHADER_MESH];
          ms->bc250_safe_fast = true;
+         /* The fragment shader's per-primitive inputs become flat loads after linking
+          * (radv_bc250_pp_direct_fs_inputs). */
          ms->bc250_pp_direct = 1 | (gfx_state->key.gfx_state.rs.provoking_vtx_last ? 2 << 1 : 0);
-         /* The fragment shader reads the per-primitive data as flat attributes of the provoking vertex. */
-         nir_shader *fs = stages[MESA_SHADER_FRAGMENT].nir;
-         nir_foreach_shader_in_variable(var, fs) {
-            if (var->data.per_primitive && var->data.location >= VARYING_SLOT_VAR0) {
-               var->data.per_primitive = false;
-               var->data.interpolation = INTERP_MODE_FLAT;
-            }
-         }
-         nir_shader_gather_info(fs, nir_shader_get_entrypoint(fs));
          if (getenv("BC250_TRACE_COMPILE"))
             fprintf(stderr, "BC250 MESH PP DIRECT: V=%u P=%u provoking=%u per_primitive=0x%" PRIx64 "\n",
                     fast_v, fast_p, ms->bc250_pp_direct >> 1,
