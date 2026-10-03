@@ -5328,7 +5328,7 @@ radv_bc250_prepare_task(struct radv_device *device,
        stages[MESA_SHADER_MESH].stage == MESA_SHADER_NONE ||
        pipeline->base.type != RADV_PIPELINE_GRAPHICS ||
        (pipeline->base.create_flags & bc250_refused_create_flags(device)) ||
-       gfx_state->key.gfx_state.has_multiview_view_index)
+       (gfx_state->key.gfx_state.has_multiview_view_index && !device->compiler_info.bc250x.task_multiview))
       return VK_ERROR_FEATURE_NOT_PRESENT;
 
    /* Lower application constants before introducing any private constants. */
@@ -5341,8 +5341,9 @@ radv_bc250_prepare_task(struct radv_device *device,
          return VK_ERROR_FEATURE_NOT_PRESENT;
       }
       if (!stages[s].nir) {
+         /* Multiview keeps ViewIndex: the Mesh consumer needs it, a Task reader is refused below. */
          struct radv_spirv_to_nir_options options = {
-            .lower_view_index_to_zero = true,
+            .lower_view_index_to_zero = !gfx_state->key.gfx_state.has_multiview_view_index,
          };
          stages[s].nir = radv_shader_spirv_to_nir_cached(&device->compiler_info, NULL, &stages[s], &options, false);
       }
@@ -5355,6 +5356,21 @@ radv_bc250_prepare_task(struct radv_device *device,
       if (draw_id_slot)
          NIR_PASS(_, stages[s].nir, nir_shader_intrinsics_pass, bc250_lower_draw_id_slot,
                   nir_metadata_control_flow, NULL);
+   }
+
+   /* RADV_BC250_TASK_MULTIVIEW: the Task producer runs once per draw and the Mesh consumer once per
+    * view (the ordinary multiview Mesh draw loop writes the view index for it). That is exact only
+    * when the Task shader does not depend on the view: a Task shader reading ViewIndex stays refused. */
+   if (gfx_state->key.gfx_state.has_multiview_view_index && stages[MESA_SHADER_TASK].nir) {
+      nir_shader *task = stages[MESA_SHADER_TASK].nir;
+      nir_shader_gather_info(task, nir_shader_get_entrypoint(task));
+      if (BITSET_TEST(task->info.system_values_read, SYSTEM_VALUE_VIEW_INDEX)) {
+         if (getenv("BC250_TRACE_COMPILE"))
+            fprintf(stderr, "BC250 hybrid task refused: multiview Task shader reads ViewIndex\n");
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+      }
+      if (getenv("BC250_TRACE_COMPILE"))
+         fprintf(stderr, "BC250 hybrid task multiview: producer once, consumer per view\n");
    }
 
    /* RADV_BC250_MESH_CLIPCULL_CONST before the split (a mesh-only shader already had it). */

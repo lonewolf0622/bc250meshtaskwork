@@ -767,7 +767,9 @@ struct radv_compiler_info {
       /* RADV_BC250_TASK_TAIL: hybrid Task chunk slots 1..1023 are recorded once per indirect
        * call and called per record; the API DrawID is read from the per-draw slot. */
       uint32_t task_tail : 1;
-      uint32_t padding : 26;
+      /* RADV_BC250_TASK_MULTIVIEW: hybrid Task with a view mask when the Task shader ignores the view. */
+      uint32_t task_multiview : 1;
+      uint32_t padding : 25;
    } bc250x;
 
    /* Debug/tracing */
