@@ -432,14 +432,20 @@ bc250_pp_direct_fs_input(nir_builder *b, nir_intrinsic_instr *intrin, void *data
    if (intrin->intrinsic != nir_intrinsic_load_per_primitive_input ||
        nir_intrinsic_io_semantics(intrin).location < VARYING_SLOT_VAR0)
       return false;
-   intrin->intrinsic = nir_intrinsic_load_input;
+   b->cursor = nir_before_instr(&intrin->instr);
+   nir_def *load = nir_load_input(b, intrin->def.num_components, intrin->def.bit_size, intrin->src[0].ssa,
+                                  .base = nir_intrinsic_base(intrin), .range = 1,
+                                  .component = nir_intrinsic_component(intrin),
+                                  .dest_type = nir_intrinsic_dest_type(intrin),
+                                  .io_semantics = nir_intrinsic_io_semantics(intrin));
+   nir_def_replace(&intrin->def, load);
    return true;
 }
 
 void
 radv_bc250_pp_direct_fs_inputs(nir_shader *fs)
 {
-   NIR_PASS(_, fs, nir_shader_intrinsics_pass, bc250_pp_direct_fs_input, nir_metadata_all, NULL);
+   NIR_PASS(_, fs, nir_shader_intrinsics_pass, bc250_pp_direct_fs_input, nir_metadata_control_flow, NULL);
    nir_foreach_shader_in_variable(var, fs) {
       if (var->data.per_primitive && var->data.location >= VARYING_SLOT_VAR0) {
          var->data.per_primitive = false;
