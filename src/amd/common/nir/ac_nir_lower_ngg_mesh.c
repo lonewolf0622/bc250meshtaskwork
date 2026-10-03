@@ -182,6 +182,11 @@ typedef struct
    nir_def *fast_compact;
    /* RADV_BC250_MESH_PP_SHARE: shared-vertex plan for the owned private-corner route. */
    bool pp_share;
+   /* RADV_BC250_MESH_PP_DIRECT: provoking corner (0 or 2) + 1, 0 when off; the per-primitive generic
+    * outputs exported per vertex; the slot -> creating triangle map (one byte per slot). */
+   unsigned pp_direct;
+   uint64_t pp_direct_mask;
+   uint32_t pp_direct_creator_addr;
    nir_variable *fast_prim_arg;
    uint32_t safe_direct_map_addr;
    uint32_t safe_direct_latest_addr;
@@ -1258,7 +1263,15 @@ emit_ms_vertex(nir_builder *b, nir_def *index, nir_def *row, bool exports, bool 
    }
    const bool layer_vtx = s->insert_layer_output && s->options->multiview_layer_per_vertex;
    /* The inserted layer has no stored value: it is the view index (below). */
-   ms_emit_arrayed_outputs(b, index, per_vertex_outputs & ~(layer_vtx ? VARYING_BIT_LAYER : 0), s);
+   ms_emit_arrayed_outputs(b, index, per_vertex_outputs & ~(layer_vtx ? VARYING_BIT_LAYER : 0) & ~s->pp_direct_mask,
+                           s);
+   /* RADV_BC250_MESH_PP_DIRECT: the slot also carries the per-primitive outputs of the triangle that
+    * created it; the fragment shader reads them flat, from the provoking corner (always that slot). */
+   if (s->pp_direct && s->pp_direct_mask) {
+      nir_def *creator = nir_u2u32(b, nir_load_shared(b, 1, 8, export_index, .base = s->pp_direct_creator_addr));
+      ms_emit_arrayed_outputs(b, creator, s->pp_direct_mask, s);
+      per_vertex_outputs |= s->pp_direct_mask;
+   }
    /* RADV_BC250_MESH_MULTIVIEW_VTX: every vertex of the draw carries the view index as its layer. */
    if (layer_vtx) {
       s->out.outputs[VARYING_SLOT_LAYER][0] = nir_load_view_index(b);
@@ -1309,6 +1322,8 @@ emit_ms_primitive(nir_builder *b, nir_def *index, nir_def *row, bool exports, bo
     * the surviving original primitive. No in-place array overwrite. */
    if (s->compact_cull)
       index = s->compact_source_index;
+   /* RADV_BC250_MESH_PP_DIRECT: the generic per-primitive outputs travel with the provoking slot. */
+   per_primitive_outputs &= ~s->pp_direct_mask;
    ms_emit_arrayed_outputs(b, index, per_primitive_outputs, s);
 
    /* Insert layer output store if the pipeline uses multiview but the API shader doesn't write it. */
@@ -2273,7 +2288,12 @@ ms_safe_local_vertices(nir_builder *b, lower_ngg_ms_state *s, nir_def *idx,
       v[c] = nir_umin(b, nir_channel(b, idx, c), limit);
    }
    nir_def *interval = nir_imm_int64(b, -1);
-   if (b->shader->info.mesh.max_vertices_out > 32) {
+   if (s->pp_direct) {
+      /* RADV_BC250_MESH_PP_DIRECT: fresh provoking corners make up to 3P slots, so every V keeps the
+       * ten-triangle intervals (at most 30 keys, every reference at most 29 slots back). */
+      nir_def *start = nir_imul_imm(b, nir_udiv_imm(b, lane, 10), 10);
+      interval = nir_ishl(b, nir_imm_int64(b, 1023), start);
+   } else if (b->shader->info.mesh.max_vertices_out > 32) {
       nir_def *start = nir_imul_imm(b, nir_udiv_imm(b, lane, 10), 10);
       interval = nir_bcsel(b, nir_ule_imm(b, vc, 32), interval,
                           nir_ishl(b, nir_imm_int64(b, 1023), start));
@@ -2299,6 +2319,10 @@ ms_safe_local_vertices(nir_builder *b, lower_ngg_ms_state *s, nir_def *idx,
          owner[c] = nir_umin(b, owner[c], key);
       }
    }
+   /* RADV_BC250_MESH_PP_DIRECT: the provoking corner always owns its own slot (it carries this
+    * triangle's per-primitive outputs); later corners may still share it (same per-vertex values). */
+   if (s->pp_direct)
+      owner[s->pp_direct - 1] = nir_iadd_imm(b, nir_imul_imm(b, lane, 3), s->pp_direct - 1);
    nir_def *fresh_bits = zero;
    nir_def *fresh_count = zero;
    for (unsigned c = 0; c < 3; ++c) {
@@ -2317,6 +2341,8 @@ ms_safe_local_vertices(nir_builder *b, lower_ngg_ms_state *s, nir_def *idx,
       slots[c] = nir_iadd(b, base, nir_bit_count(b, nir_iand(b, owned, below)));
       nir_if *create = nir_push_if(b, fresh[c]);
       nir_store_shared(b, nir_u2u8(b, v[c]), slots[c], .base = s->safe_direct_map_addr);
+      if (s->pp_direct)
+         nir_store_shared(b, nir_u2u8(b, lane), slots[c], .base = s->pp_direct_creator_addr);
       nir_pop_if(b, create);
    }
    nir_if *accepted = nir_push_if(b, live);
@@ -2713,8 +2739,11 @@ ms_safe_fast_check_wave(nir_builder *b, lower_ngg_ms_state *s, nir_def *vc, nir_
    if (s->options->bc250_safe_local) {
       /* Removing even a fully shared triangle changes the primitive stream. */
       wave_clean = nir_iand(b, wave_clean, nir_inot(b, nir_vote_any(b, 1, culled)));
+      /* RADV_BC250_MESH_PP_DIRECT: every workgroup takes the slot planner (fresh provoking corners). */
+      if (s->pp_direct)
+         wave_clean = nir_imm_false(b);
       nir_if *repair = nir_push_if(b, nir_inot(b, wave_clean));
-      nir_if *ordered = nir_push_if(b, nir_inot(b, r2_fail));
+      nir_if *ordered = nir_push_if(b, s->pp_direct ? nir_imm_false(b) : nir_inot(b, r2_fail));
       nir_def *holes = ms_safe_local_remove_holes(b, s, idx, live, data, used);
       nir_push_else(b, ordered);
       nir_def *copies = ms_safe_local_vertices(b, s, idx, live, vc);
@@ -4039,6 +4068,7 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
               util_bitcount64(layout.var.vtx_attr.mask), util_bitcount64(layout.var.prm_attr.mask));
 
    uint32_t safe_direct_map_addr = 0, safe_direct_latest_addr = 0;
+   uint32_t pp_direct_creator_addr = 0;
    uint32_t safe_direct_indices_addr = 0, safe_direct_counts_addr = 0;
    bool safe_compact = false;
    bool pp_share = false;
@@ -4064,6 +4094,10 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
       }
       layout.lds.total_size = safe_direct_counts_addr + 8 +
          (options->bc250_safe_autocull && !options->bc250_safe_local ? 12 : 0);
+      if (options->bc250_pp_direct) {
+         pp_direct_creator_addr = layout.lds.total_size;
+         layout.lds.total_size += options->bc250_safe_direct_bound;
+      }
       /* RADV_BC250_MESH_SAFE_COMPACT: the renumbered survivor indices follow the counts. Without the
        * room (or with barycentric reference slots, whose corner numbers need private corners) the
        * shader keeps the three adaptive cases. The vertex map needs at most 3 * survivors entries,
@@ -4169,6 +4203,10 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
       .compact_table = compact_ix[3],
       .safe_direct = safe_direct,
       .safe_direct_map_addr = safe_direct_map_addr,
+      .pp_direct = safe_direct && options->bc250_pp_direct ? ((options->bc250_pp_direct >> 1) & 3) + 1 : 0,
+      .pp_direct_mask = safe_direct && options->bc250_pp_direct ?
+         per_primitive_outputs & (UINT64_C(0xffffffff) << VARYING_SLOT_VAR0) : 0,
+      .pp_direct_creator_addr = pp_direct_creator_addr,
       .safe_direct_latest_addr = safe_direct_latest_addr,
       .safe_direct_indices_addr = safe_direct_indices_addr,
       .safe_direct_counts_addr = safe_direct_counts_addr,

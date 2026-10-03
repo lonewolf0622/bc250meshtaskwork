@@ -3108,6 +3108,7 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
    if (stages[MESA_SHADER_MESH].nir) {
       stages[MESA_SHADER_MESH].info.ms.bc250_amd_mesh = stages[MESA_SHADER_MESH].bc250_amd_mesh;
       stages[MESA_SHADER_MESH].info.ms.bc250_safe_fast = stages[MESA_SHADER_MESH].bc250_safe_fast;
+      stages[MESA_SHADER_MESH].info.ms.bc250_pp_direct = stages[MESA_SHADER_MESH].bc250_pp_direct;
       stages[MESA_SHADER_MESH].bc250_safe_stats =
          (compiler_info->key.bc250_mesh_direct_read & RADV_BC250_MESH_SAFE_STATS_KEY) &&
          stages[MESA_SHADER_MESH].bc250_safe_fast;

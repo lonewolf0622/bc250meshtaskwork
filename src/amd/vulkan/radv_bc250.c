@@ -338,7 +338,7 @@ radv_bc250_mesh_needs_expansion(nir_shader *mesh)
  * ring. Task, multiview, split and linked-FS exclusions are checked by the caller.
  */
 static bool
-bc250_safe_direct_candidate(nir_shader *mesh, bool parallel, unsigned max_slots, bool private_bary)
+bc250_safe_direct_candidate_pp(nir_shader *mesh, bool parallel, unsigned max_slots, bool private_bary, bool pp_direct)
 {
    if (!mesh || mesh->info.stage != MESA_SHADER_MESH || mesh->info.mesh.nv ||
        mesh->info.mesh.primitive_type != MESA_PRIM_TRIANGLES || mesh->info.task_payload_size ||
@@ -410,8 +410,18 @@ bc250_safe_direct_candidate(nir_shader *mesh, bool parallel, unsigned max_slots,
               lds_bound, mesh->info.shared_size, util_bitcount64(vertex), v, p);
    if (lds_bound >= (private_bary ? 32 : 30) * 1024)
       return false;
+   /* RADV_BC250_MESH_PP_DIRECT: per-primitive generic outputs are exported as flat attributes of the
+    * provoking corner's fresh slot; they count as vertex slots (already in `vertex`). Only generic
+    * locations: Layer, Viewport, PrimitiveId and CullPrimitive per primitive keep the other routes. */
+   const uint64_t pp_allowed = pp_direct ? (UINT64_C(0xffffffff) << VARYING_SLOT_VAR0) : 0;
    return (vertex & VARYING_BIT_POS) && !(vertex & ~allowed) &&
-          !(mesh->info.per_primitive_outputs & ~special) && util_bitcount64(vertex) <= max_slots;
+          !(mesh->info.per_primitive_outputs & ~(special | pp_allowed)) && util_bitcount64(vertex) <= max_slots;
+}
+
+static bool
+bc250_safe_direct_candidate(nir_shader *mesh, bool parallel, unsigned max_slots, bool private_bary)
+{
+   return bc250_safe_direct_candidate_pp(mesh, parallel, max_slots, private_bary, false);
 }
 
 bool
@@ -5091,6 +5101,35 @@ radv_bc250_prepare_task(struct radv_device *device,
       const bool proven_plain = check_wave_fits && fast_launch <= 256 &&
          bc250_safe_direct_candidate(fast_mesh, true, 16, false) &&
          !radv_bc250_mesh_fs_refused(&device->compiler_info, stages[MESA_SHADER_FRAGMENT].nir);
+      /* RADV_BC250_MESH_PP_DIRECT: per-primitive generic outputs on the same one-wave route, without
+       * private-corner expansion. Needs a static provoking vertex (its corner owns a fresh slot). */
+      const bool pp_direct = !proven_plain && device->compiler_info.bc250x.pp_direct && check_wave_fits &&
+         (device->compiler_info.key.bc250_mesh_direct_read & RADV_BC250_MESH_SAFE_LOCAL_KEY) &&
+         (device->compiler_info.key.bc250_mesh_direct_read & RADV_BC250_MESH_SAFE_CHECK_KEY) &&
+         fast_launch <= 256 && fast_mesh->info.mesh.primitive_type == MESA_PRIM_TRIANGLES &&
+         (fast_mesh->info.per_primitive_outputs & (UINT64_C(0xffffffff) << VARYING_SLOT_VAR0)) &&
+         !gfx_state->key.gfx_state.dynamic_provoking_vtx_mode && 3 * fast_p <= 192 &&
+         bc250_safe_direct_candidate_pp(fast_mesh, true, 16, false, true) &&
+         !radv_bc250_mesh_fs_refused(&device->compiler_info, stages[MESA_SHADER_FRAGMENT].nir);
+      if (pp_direct) {
+         struct radv_shader_stage *ms = &stages[MESA_SHADER_MESH];
+         ms->bc250_safe_fast = true;
+         ms->bc250_pp_direct = 1 | (gfx_state->key.gfx_state.rs.provoking_vtx_last ? 2 << 1 : 0);
+         /* The fragment shader reads the per-primitive data as flat attributes of the provoking vertex. */
+         nir_shader *fs = stages[MESA_SHADER_FRAGMENT].nir;
+         nir_foreach_shader_in_variable(var, fs) {
+            if (var->data.per_primitive && var->data.location >= VARYING_SLOT_VAR0) {
+               var->data.per_primitive = false;
+               var->data.interpolation = INTERP_MODE_FLAT;
+            }
+         }
+         nir_shader_gather_info(fs, nir_shader_get_entrypoint(fs));
+         if (getenv("BC250_TRACE_COMPILE"))
+            fprintf(stderr, "BC250 MESH PP DIRECT: V=%u P=%u provoking=%u per_primitive=0x%" PRIx64 "\n",
+                    fast_v, fast_p, ms->bc250_pp_direct >> 1,
+                    fast_mesh->info.per_primitive_outputs & (UINT64_C(0xffffffff) << VARYING_SLOT_VAR0));
+         return VK_SUCCESS;
+      }
       if (proven_plain || (!radv_bc250_mesh_fs_refused(&device->compiler_info, stages[MESA_SHADER_FRAGMENT].nir) &&
                           bc250_ordered_eligible(fast_mesh, stages[MESA_SHADER_FRAGMENT].nir))) {
          stages[MESA_SHADER_MESH].bc250_safe_fast = true;

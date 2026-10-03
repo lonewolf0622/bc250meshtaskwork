@@ -324,6 +324,9 @@ struct radv_shader_stage {
    bool bc250_compact;
    bool bc250_safe_direct;
    bool bc250_safe_fast;
+   /* RADV_BC250_MESH_PP_DIRECT: per-primitive generic outputs on the fast route (bit 0) with the provoking
+    * corner (bits 1-2: 0 or 2) owning a fresh export slot that carries them as flat attributes. */
+   uint8_t bc250_pp_direct;
    bool bc250_safe_stats;
    bool bc250_safe_owned;
    bool bc250_safe_bary_affine;
@@ -771,7 +774,9 @@ struct radv_compiler_info {
       uint32_t task_multiview : 1;
       /* RADV_BC250_MESH_MULTIVIEW_VTX: the inserted multiview layer is exported per vertex. */
       uint32_t mesh_multiview_vtx : 1;
-      uint32_t padding : 24;
+      /* RADV_BC250_MESH_PP_DIRECT: per-primitive generic outputs on the fast local route without expansion. */
+      uint32_t pp_direct : 1;
+      uint32_t padding : 23;
    } bc250x;
 
    /* Debug/tracing */

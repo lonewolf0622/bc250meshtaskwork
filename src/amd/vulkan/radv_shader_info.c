@@ -407,7 +407,7 @@ assign_outinfo_params(struct radv_vs_output_info *outinfo, uint64_t mask, unsign
 
 static void
 radv_get_output_masks(const struct nir_shader *nir, const struct radv_graphics_state_key *gfx_state,
-                      bool mesh_layer_per_vertex, uint64_t *per_vtx_mask, uint64_t *per_prim_mask)
+                      bool mesh_layer_per_vertex, bool mesh_pp_direct, uint64_t *per_vtx_mask, uint64_t *per_prim_mask)
 {
    /* These are not compiled into neither output param nor position exports. */
    const uint64_t special_mask =
@@ -415,6 +415,14 @@ radv_get_output_masks(const struct nir_shader *nir, const struct radv_graphics_s
 
    *per_prim_mask = nir->info.outputs_written & nir->info.per_primitive_outputs & ~special_mask;
    *per_vtx_mask = nir->info.outputs_written & ~nir->info.per_primitive_outputs & ~special_mask;
+
+   /* RADV_BC250_MESH_PP_DIRECT: per-primitive generic outputs are flat attributes of the provoking
+    * corner's slot, exported with the per-vertex parameters. */
+   if (nir->info.stage == MESA_SHADER_MESH && mesh_pp_direct) {
+      const uint64_t generic = *per_prim_mask & (UINT64_C(0xffffffff) << VARYING_SLOT_VAR0);
+      *per_prim_mask &= ~generic;
+      *per_vtx_mask |= generic;
+   }
 
    /* Mesh multiview is only lowered in ac_nir_lower_ngg, so we have to fake it here.
     * RADV_BC250_MESH_MULTIVIEW_VTX: GFX10.1 has no layer field in the primitive export; the inserted
@@ -435,7 +443,8 @@ radv_set_vs_output_param(enum amd_gfx_level gfx_level, const struct nir_shader *
    struct radv_vs_output_info *outinfo = &info->outinfo;
    uint64_t per_vtx_mask, per_prim_mask;
 
-   radv_get_output_masks(nir, gfx_state, mesh_layer_per_vertex, &per_vtx_mask, &per_prim_mask);
+   radv_get_output_masks(nir, gfx_state, mesh_layer_per_vertex, info->ms.bc250_pp_direct != 0, &per_vtx_mask,
+                         &per_prim_mask);
 
    memset(outinfo->vs_output_param_offset, AC_EXP_PARAM_UNDEFINED, sizeof(outinfo->vs_output_param_offset));
 
@@ -808,7 +817,8 @@ calc_mesh_workgroup_size(const struct radv_compiler_info *compiler_info, const n
       const unsigned v = nir->info.mesh.max_vertices_out;
       const unsigned p = nir->info.mesh.max_primitives_out;
       const unsigned corners = mesa_vertices_per_prim(nir->info.mesh.primitive_type);
-      const unsigned bound = v <= 32 ? MIN2(v, corners * p) : corners * p;
+      /* RADV_BC250_MESH_PP_DIRECT: every provoking corner owns a fresh slot, so up to 3P slots. */
+      const unsigned bound = v <= 32 && !info->ms.bc250_pp_direct ? MIN2(v, corners * p) : corners * p;
       info->workgroup_size = align(MAX3(api_workgroup_size, bound, p), info->wave_size);
       assert(bound <= 256 && info->workgroup_size <= 256);
       /* Fast launch 0 must provision every export lane, including duplicates. */
@@ -1193,7 +1203,8 @@ radv_nir_shader_info_pass(const struct radv_compiler_info *compiler_info, const 
       struct radv_vs_output_info *outinfo = &info->outinfo;
       uint64_t per_vtx_mask, per_prim_mask;
 
-      radv_get_output_masks(nir, gfx_state, compiler_info->bc250x.mesh_multiview_vtx, &per_vtx_mask, &per_prim_mask);
+      radv_get_output_masks(nir, gfx_state, compiler_info->bc250x.mesh_multiview_vtx, info->ms.bc250_pp_direct != 0,
+                            &per_vtx_mask, &per_prim_mask);
 
       /* Mesh multiview is only lowered in ac_nir_lower_ngg, so we have to fake it here. */
       if (nir->info.stage == MESA_SHADER_MESH && gfx_state->has_multiview_view_index)

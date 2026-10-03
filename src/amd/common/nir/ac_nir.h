@@ -288,6 +288,10 @@ typedef struct {
    bool bc250_safe_direct;
    bool bc250_safe_fast;
    bool bc250_safe_local;
+   /* RADV_BC250_MESH_PP_DIRECT (bit 0) and the provoking corner (bits 1-2): per-primitive generic outputs on the
+    * local route. Every provoking corner owns a fresh slot; slot k exports the per-primitive outputs of the
+    * triangle that created it as flat per-vertex parameters. */
+   uint8_t bc250_pp_direct;
    bool bc250_safe_check;
    bool bc250_safe_corners;
    /* RADV_BC250_MESH_SAFE_ADAPTIVE (with bc250_safe_corners, no owned per-primitive data): a

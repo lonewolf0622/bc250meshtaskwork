@@ -279,6 +279,7 @@ struct radv_shader_info {
       bool has_query;
       bool bc250_safe_direct;
       bool bc250_safe_fast;
+      uint8_t bc250_pp_direct; /* RADV_BC250_MESH_PP_DIRECT (radv_shader_stage::bc250_pp_direct). */
       bool bc250_safe_autocull; /* Proven-capacity W31 closure path. */
       bool bc250_safe_stats; /* RADV_BC250_MESH_SAFE_STATS: mapped per-draw SAFE_FAST diagnostics. */
       uint8_t bc250_route_reason; /* NO_SPLIT observer: why a safe direct proof was not admitted. */

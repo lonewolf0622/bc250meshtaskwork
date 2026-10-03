@@ -1129,6 +1129,16 @@ radv_lower_ngg(const struct radv_compiler_info *compiler_info, struct radv_shade
          ((compiler_info->key.bc250_mesh_direct_read & RADV_BC250_MESH_SAFE_LOCAL_KEY) || options.bc250_safe_corners);
       options.bc250_safe_check = options.bc250_safe_local &&
          ((compiler_info->key.bc250_mesh_direct_read & RADV_BC250_MESH_SAFE_CHECK_KEY) || options.bc250_safe_corners);
+      /* RADV_BC250_MESH_PP_DIRECT: the one-wave local planner only (it keeps each provoking corner fresh);
+       * the private-corner, adaptive, compact and owned-sharing representations do not apply. */
+      options.bc250_pp_direct = ngg_stage->bc250_pp_direct;
+      if (options.bc250_pp_direct) {
+         assert(options.bc250_safe_local && options.bc250_safe_check);
+         options.bc250_safe_corners = false;
+         options.bc250_safe_adaptive = false;
+         options.bc250_safe_compact = false;
+         options.bc250_pp_share = false;
+      }
       if (options.bc250_safe_local)
          options.bc250_compact_lds = true;
       options.bc250_safe_stats = ngg_stage->bc250_safe_stats;
@@ -1140,7 +1150,7 @@ radv_lower_ngg(const struct radv_compiler_info *compiler_info, struct radv_shade
       }
       options.bc250_safe_direct = ngg_stage->bc250_safe_direct;
       const unsigned mesh_corners = mesa_vertices_per_prim(nir->info.mesh.primitive_type);
-      options.bc250_safe_direct_bound = nir->info.mesh.max_vertices_out <= 32 ?
+      options.bc250_safe_direct_bound = nir->info.mesh.max_vertices_out <= 32 && !options.bc250_pp_direct ?
          MIN2(nir->info.mesh.max_vertices_out, mesh_corners * nir->info.mesh.max_primitives_out) :
          mesh_corners * nir->info.mesh.max_primitives_out;
       options.bc250_safe_direct_index_staging = ngg_stage->bc250_safe_owned ? NULL : ngg_stage->bc250_index_staging;
