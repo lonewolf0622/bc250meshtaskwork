@@ -1256,9 +1256,11 @@ emit_ms_vertex(nir_builder *b, nir_def *index, nir_def *row, bool exports, bool 
          nir_u2u32(b, nir_load_shared(b, 1, 8, addr, .base = s->layout.lds.indices_addr));
       index = nir_umin(b, source, nir_iadd_imm(b, s->original_vertex_count, -1));
    }
-   ms_emit_arrayed_outputs(b, index, per_vertex_outputs, s);
+   const bool layer_vtx = s->insert_layer_output && s->options->multiview_layer_per_vertex;
+   /* The inserted layer has no stored value: it is the view index (below). */
+   ms_emit_arrayed_outputs(b, index, per_vertex_outputs & ~(layer_vtx ? VARYING_BIT_LAYER : 0), s);
    /* RADV_BC250_MESH_MULTIVIEW_VTX: every vertex of the draw carries the view index as its layer. */
-   if (s->insert_layer_output && s->options->multiview_layer_per_vertex) {
+   if (layer_vtx) {
       s->out.outputs[VARYING_SLOT_LAYER][0] = nir_load_view_index(b);
       s->out.infos[VARYING_SLOT_LAYER].as_sysval_mask |= 1;
    }
@@ -2939,6 +2941,8 @@ emit_ms_epilogue(nir_builder *b, lower_ngg_ms_state *s)
    if (s->insert_layer_output && s->options->multiview_layer_per_vertex) {
       b->shader->info.outputs_written |= VARYING_BIT_LAYER;
       per_vertex_outputs |= VARYING_BIT_LAYER;
+      /* ac_nir_export_position reads the state mask: the misc vector carries the layer. */
+      s->per_vertex_outputs |= VARYING_BIT_LAYER;
    } else if (s->insert_layer_output) {
       b->shader->info.outputs_written |= VARYING_BIT_LAYER;
       b->shader->info.per_primitive_outputs |= VARYING_BIT_LAYER;
