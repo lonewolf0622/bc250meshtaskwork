@@ -776,7 +776,9 @@ struct radv_compiler_info {
       uint32_t mesh_multiview_vtx : 1;
       /* RADV_BC250_MESH_PP_DIRECT: per-primitive generic outputs on the fast local route without expansion. */
       uint32_t pp_direct : 1;
-      uint32_t padding : 23;
+      /* RADV_BC250_MESH_PIECES_65: 65..85-primitive Mesh shaders take the safe pieces. */
+      uint32_t pieces65 : 1;
+      uint32_t padding : 22;
    } bc250x;
 
    /* Debug/tracing */

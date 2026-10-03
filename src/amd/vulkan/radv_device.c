@@ -1560,6 +1560,7 @@ radv_device_init_compiler_info(struct radv_device *device)
    info.bc250x.task_multiview = bc250_mesh && debug_get_bool_option("RADV_BC250_TASK_MULTIVIEW", false);
    info.bc250x.mesh_multiview_vtx = bc250_mesh && debug_get_bool_option("RADV_BC250_MESH_MULTIVIEW_VTX", false);
    info.bc250x.pp_direct = bc250_mesh && debug_get_bool_option("RADV_BC250_MESH_PP_DIRECT", false);
+   info.bc250x.pieces65 = bc250_mesh && debug_get_bool_option("RADV_BC250_MESH_PIECES_65", false);
 
    device->compiler_info = info;
 }

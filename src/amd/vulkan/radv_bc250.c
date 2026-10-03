@@ -4726,7 +4726,10 @@ bc250_prepare_safe_pieces(struct radv_device *device, struct radv_graphics_pipel
    const bool bary = radv_bc250_mesh_private_bary(&device->compiler_info, fs->nir);
    if (!original || !fs->nir || (original->info.min_subgroup_size != 64 &&
                                 !device->compiler_info.key.bc250_mesh_safe_bary_last) ||
-       original->info.mesh.max_primitives_out <= 85 || original->info.mesh.max_primitives_out > 256 ||
+       /* RADV_BC250_MESH_PIECES_65: 65..85 primitives take the safe pieces too (instead of the unsplit
+        * private-corner expansion); measured 1.7x vs 2.6x of VS on the 65/80-primitive classes. */
+       original->info.mesh.max_primitives_out <= (device->compiler_info.bc250x.pieces65 ? 64u : 85u) ||
+       original->info.mesh.max_primitives_out > 256 ||
        original->info.workgroup_size[0] * original->info.workgroup_size[1] * original->info.workgroup_size[2] > 192 ||
        (!bary && radv_bc250_mesh_fs_refused(&device->compiler_info, fs->nir)))
       return false;
