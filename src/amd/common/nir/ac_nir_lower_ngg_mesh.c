@@ -4145,8 +4145,11 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
       /* RADV_BC250_MESH_LDS_PLAN: one dword per (interval, vertex) for the local slot planner. */
       const unsigned plan_intervals = options->bc250_pp_direct || max_vertices > 32 ? DIV_ROUND_UP(options->wave_size, 10) : 1;
       const uint32_t plan_size = 4 * plan_intervals * max_vertices;
+      /* Hardware: the 3.5 KB table of 128-vertex pieces (9.5 KB in all) is 16% faster; the 7 KB table of
+       * 256-vertex pieces (18 KB in all) is 24% slower (fewer resident workgroups). Keep the table small. */
       if (options->bc250_lds_plan && options->bc250_safe_local && !options->bc250_safe_corners &&
-          max_primitives <= options->wave_size && align(layout.lds.total_size, 4) + plan_size + 6 * max_primitives <= 32 * 1024) {
+          max_primitives <= options->wave_size && plan_size <= 4096 &&
+          align(layout.lds.total_size, 4) + plan_size + 6 * max_primitives <= 12 * 1024) {
          lds_plan = true;
          lds_plan_addr = align(layout.lds.total_size, 4);
          layout.lds.total_size = lds_plan_addr + plan_size;
