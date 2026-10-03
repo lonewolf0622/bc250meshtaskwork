@@ -778,7 +778,9 @@ struct radv_compiler_info {
       uint32_t pp_direct : 1;
       /* RADV_BC250_MESH_PIECES_65: 65..85-primitive Mesh shaders take the safe pieces. */
       uint32_t pieces65 : 1;
-      uint32_t padding : 22;
+      /* RADV_BC250_MESH_LDS_PLAN: the local slot planner finds first occurrences with an LDS table. */
+      uint32_t lds_plan : 1;
+      uint32_t padding : 21;
    } bc250x;
 
    /* Debug/tracing */

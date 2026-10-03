@@ -187,6 +187,9 @@ typedef struct
    unsigned pp_direct;
    uint64_t pp_direct_mask;
    uint32_t pp_direct_creator_addr;
+   /* RADV_BC250_MESH_LDS_PLAN: first-occurrence table (intervals x max_vertices dwords), when lds_plan. */
+   bool lds_plan;
+   uint32_t lds_plan_addr;
    nir_variable *fast_prim_arg;
    uint32_t safe_direct_map_addr;
    uint32_t safe_direct_latest_addr;
@@ -2300,9 +2303,44 @@ ms_safe_local_vertices(nir_builder *b, lower_ngg_ms_state *s, nir_def *idx,
    }
    nir_def *owner_p[3], *owner_c[3], *fresh[3];
    nir_def *owner[3] = {nir_imm_int(b, 192), nir_imm_int(b, 192), nir_imm_int(b, 192)};
+   if (s->lds_plan) {
+      /* RADV_BC250_MESH_LDS_PLAN: the same owners from a table with one dword per (interval, vertex). Every
+       * live corner clears its entry, then takes the minimum with its key 3j + d; the minimum over the
+       * interval's live corners with this vertex is exactly the bit-plane match below. Only this wave uses
+       * the table, and its LDS operations complete in order. */
+      const unsigned V = b->shader->info.mesh.max_vertices_out;
+      nir_def *iv = zero;
+      if (s->pp_direct)
+         iv = nir_udiv_imm(b, lane, 10);
+      else if (V > 32)
+         iv = nir_bcsel(b, nir_ule_imm(b, vc, 32), zero, nir_udiv_imm(b, lane, 10));
+      nir_def *addr[3];
+      for (unsigned c = 0; c < 3; ++c)
+         addr[c] = nir_imul_imm(b, nir_iadd(b, nir_imul_imm(b, iv, V), v[c]), 4);
+      nir_if *clear = nir_push_if(b, live);
+      for (unsigned c = 0; c < 3; ++c)
+         nir_store_shared(b, nir_imm_int(b, ~0u), addr[c], .base = s->lds_plan_addr, .align_mul = 4);
+      nir_pop_if(b, clear);
+      nir_barrier(b, .execution_scope = SCOPE_SUBGROUP, .memory_scope = SCOPE_SUBGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared);
+      nir_if *take = nir_push_if(b, live);
+      for (unsigned c = 0; c < 3; ++c)
+         nir_shared_atomic(b, 32, addr[c], nir_iadd_imm(b, nir_imul_imm(b, lane, 3), c),
+                           .base = s->lds_plan_addr, .atomic_op = nir_atomic_op_umin);
+      nir_pop_if(b, take);
+      nir_barrier(b, .execution_scope = SCOPE_SUBGROUP, .memory_scope = SCOPE_SUBGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared);
+      nir_if *read = nir_push_if(b, live);
+      nir_def *found[3];
+      for (unsigned c = 0; c < 3; ++c)
+         found[c] = nir_load_shared(b, 1, 32, addr[c], .base = s->lds_plan_addr, .align_mul = 4);
+      nir_pop_if(b, read);
+      for (unsigned c = 0; c < 3; ++c)
+         owner[c] = nir_if_phi(b, found[c], owner[c]);
+   }
    /* Consume each plane immediately. Holding all 24 ballots live together
     * needlessly increases SGPR pressure, including on clean workgroups. */
-   for (unsigned d = 0; d < 3; ++d) {
+   for (unsigned d = 0; d < 3 && !s->lds_plan; ++d) {
       nir_def *matches[3];
       for (unsigned c = 0; c < 3; ++c)
          matches[c] = nir_iand(b, live_mask, interval);
@@ -4073,6 +4111,8 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
 
    uint32_t safe_direct_map_addr = 0, safe_direct_latest_addr = 0;
    uint32_t pp_direct_creator_addr = 0;
+   uint32_t lds_plan_addr = 0;
+   bool lds_plan = false;
    uint32_t safe_direct_indices_addr = 0, safe_direct_counts_addr = 0;
    bool safe_compact = false;
    bool pp_share = false;
@@ -4102,6 +4142,18 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
          pp_direct_creator_addr = layout.lds.total_size;
          layout.lds.total_size += options->bc250_safe_direct_bound;
       }
+      /* RADV_BC250_MESH_LDS_PLAN: one dword per (interval, vertex) for the local slot planner. */
+      const unsigned plan_intervals = options->bc250_pp_direct || max_vertices > 32 ? DIV_ROUND_UP(options->wave_size, 10) : 1;
+      const uint32_t plan_size = 4 * plan_intervals * max_vertices;
+      if (options->bc250_lds_plan && options->bc250_safe_local && !options->bc250_safe_corners &&
+          max_primitives <= options->wave_size && align(layout.lds.total_size, 4) + plan_size + 6 * max_primitives <= 32 * 1024) {
+         lds_plan = true;
+         lds_plan_addr = align(layout.lds.total_size, 4);
+         layout.lds.total_size = lds_plan_addr + plan_size;
+      }
+      if (options->bc250_lds_plan && getenv("BC250_TRACE_COMPILE"))
+         fprintf(stderr, "BC250 MESH LDS PLAN: %s V=%u P=%u intervals=%u bytes=%u\n", lds_plan ? "applied" : "not applied",
+                 max_vertices, max_primitives, plan_intervals, lds_plan ? plan_size : 0);
       /* RADV_BC250_MESH_SAFE_COMPACT: the renumbered survivor indices follow the counts. Without the
        * room (or with barycentric reference slots, whose corner numbers need private corners) the
        * shader keeps the three adaptive cases. The vertex map needs at most 3 * survivors entries,
@@ -4211,6 +4263,8 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
       .pp_direct_mask = safe_direct && options->bc250_pp_direct ?
          per_primitive_outputs & (UINT64_C(0xffffffff) << VARYING_SLOT_VAR0) : 0,
       .pp_direct_creator_addr = pp_direct_creator_addr,
+      .lds_plan = lds_plan,
+      .lds_plan_addr = lds_plan_addr,
       .safe_direct_latest_addr = safe_direct_latest_addr,
       .safe_direct_indices_addr = safe_direct_indices_addr,
       .safe_direct_counts_addr = safe_direct_counts_addr,

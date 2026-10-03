@@ -292,6 +292,10 @@ typedef struct {
     * local route. Every provoking corner owns a fresh slot; slot k exports the per-primitive outputs of the
     * triangle that created it as flat per-vertex parameters. */
    uint8_t bc250_pp_direct;
+   /* RADV_BC250_MESH_LDS_PLAN: the local slot planner (ms_safe_local_vertices) finds each corner's first
+    * occurrence in its interval with an LDS table (atomic min of corner keys) instead of bit-plane ballots.
+    * Same plan. */
+   bool bc250_lds_plan;
    bool bc250_safe_check;
    bool bc250_safe_corners;
    /* RADV_BC250_MESH_SAFE_ADAPTIVE (with bc250_safe_corners, no owned per-primitive data): a

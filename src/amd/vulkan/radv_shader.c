@@ -1121,6 +1121,7 @@ radv_lower_ngg(const struct radv_compiler_info *compiler_info, struct radv_shade
          !ngg_stage->bc250_safe_owned;
       options.bc250_safe_compact = options.bc250_safe_adaptive && compiler_info->hw.bc250_mesh_safe_compact;
       options.bc250_lean_check = compiler_info->bc250x.lean_check;
+      options.bc250_lds_plan = compiler_info->bc250x.lds_plan;
       options.bc250_pp_share = options.bc250_safe_corners && ngg_stage->bc250_safe_owned &&
          compiler_info->bc250x.pp_share &&
          (ngg_stage->bc250_compact_owned == 0x1 || ngg_stage->bc250_compact_owned == 0x4);
