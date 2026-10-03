@@ -769,7 +769,9 @@ struct radv_compiler_info {
       uint32_t task_tail : 1;
       /* RADV_BC250_TASK_MULTIVIEW: hybrid Task with a view mask when the Task shader ignores the view. */
       uint32_t task_multiview : 1;
-      uint32_t padding : 25;
+      /* RADV_BC250_MESH_MULTIVIEW_VTX: the inserted multiview layer is exported per vertex. */
+      uint32_t mesh_multiview_vtx : 1;
+      uint32_t padding : 24;
    } bc250x;
 
    /* Debug/tracing */

@@ -328,6 +328,9 @@ typedef struct {
     * instead of the "API waves in flight reached zero" check, which can end one barrier early. */
    bool bc250_wave_sync;
    bool multiview;
+   /* RADV_BC250_MESH_MULTIVIEW_VTX: the inserted multiview layer is a per-vertex output (GFX10.1 has no
+    * layer field in the primitive export). */
+   bool multiview_layer_per_vertex;
 } ac_nir_lower_ngg_options;
 
 /* RADV_BC250_MESH_COMPACT: the hardware-proven backjump window (MESH_PERF/rawroot:

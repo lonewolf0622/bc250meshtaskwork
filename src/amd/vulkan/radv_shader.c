@@ -1082,6 +1082,7 @@ radv_lower_ngg(const struct radv_compiler_info *compiler_info, struct radv_shade
       options.has_gen_prim_query = info->ms.has_query;
       options.has_ms_gs_invocations_query = info->ms.has_query;
       options.multiview = gfx_state->has_multiview_view_index;
+      options.multiview_layer_per_vertex = compiler_info->bc250x.mesh_multiview_vtx;
       options.bc250_cull_compact = compiler_info->key.bc250_cull_compact;
       options.bc250_pack_triangle_vertices = compiler_info->key.bc250_pack_triangle_vertices;
       options.bc250_autocull = info->ms.bc250_autocull;

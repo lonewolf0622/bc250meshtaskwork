@@ -1257,6 +1257,11 @@ emit_ms_vertex(nir_builder *b, nir_def *index, nir_def *row, bool exports, bool 
       index = nir_umin(b, source, nir_iadd_imm(b, s->original_vertex_count, -1));
    }
    ms_emit_arrayed_outputs(b, index, per_vertex_outputs, s);
+   /* RADV_BC250_MESH_MULTIVIEW_VTX: every vertex of the draw carries the view index as its layer. */
+   if (s->insert_layer_output && s->options->multiview_layer_per_vertex) {
+      s->out.outputs[VARYING_SLOT_LAYER][0] = nir_load_view_index(b);
+      s->out.infos[VARYING_SLOT_LAYER].as_sysval_mask |= 1;
+   }
 
    /* BC250 barycentrics: the reference slots carry the position just loaded. */
    if (s->bary_ref_mask && parameters) {
@@ -1305,7 +1310,7 @@ emit_ms_primitive(nir_builder *b, nir_def *index, nir_def *row, bool exports, bo
    ms_emit_arrayed_outputs(b, index, per_primitive_outputs, s);
 
    /* Insert layer output store if the pipeline uses multiview but the API shader doesn't write it. */
-   if (s->insert_layer_output) {
+   if (s->insert_layer_output && !s->options->multiview_layer_per_vertex) {
       s->out.outputs[VARYING_SLOT_LAYER][0] = nir_load_view_index(b);
       s->out.infos[VARYING_SLOT_LAYER].as_sysval_mask |= 1;
    }
@@ -2931,7 +2936,10 @@ emit_ms_epilogue(nir_builder *b, lower_ngg_ms_state *s)
       s->per_primitive_outputs & ~s->layout.attr_ring.prm_attr.mask & ~SPECIAL_MS_OUT_MASK;
 
    /* Insert layer output store if the pipeline uses multiview but the API shader doesn't write it. */
-   if (s->insert_layer_output) {
+   if (s->insert_layer_output && s->options->multiview_layer_per_vertex) {
+      b->shader->info.outputs_written |= VARYING_BIT_LAYER;
+      per_vertex_outputs |= VARYING_BIT_LAYER;
+   } else if (s->insert_layer_output) {
       b->shader->info.outputs_written |= VARYING_BIT_LAYER;
       b->shader->info.per_primitive_outputs |= VARYING_BIT_LAYER;
       per_primitive_outputs |= VARYING_BIT_LAYER;
