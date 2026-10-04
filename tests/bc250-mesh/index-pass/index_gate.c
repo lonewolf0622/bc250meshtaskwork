@@ -1,6 +1,13 @@
 /* One parameterized Mesh or Task+Mesh draw, followed by RGBA8 readback.
  * Hardware execution is released only by the audited one-shot launcher.
  * Attachment clear/copy commands are additional to the application draw.
+ * Optional cases (environment):
+ *   INDEX_CLEAR_BETWEEN=1  draw, vkCmdClearAttachments over part of the image, draw again (meta operation between
+ *                          two draws of the same pipeline; the second draw restores the cleared area)
+ *   INDEX_QUERY=1          pipeline-statistics query active around the draw
+ *   INDEX_MULTIVIEW=1      render pass view mask 0b11 (two layers; layer 0 is read back)
+ *   INDEX_CYCLE=free|reset submit and wait every recording, then free its command buffer or reset it and leave
+ *                          it idle (each recording uses a new command buffer)
  */
 #include <vulkan/vulkan.h>
 #include <stdio.h>
@@ -55,6 +62,12 @@ int main(int argc, char **argv)
    const int reference = getenv("INDEX_REFERENCE") != NULL;
    const int last = getenv("INDEX_LAST_VERTEX") != NULL;
    const int offline = !strcmp(argv[1], "--offline");
+   const int clear_between = getenv("INDEX_CLEAR_BETWEEN") != NULL;
+   const int query = getenv("INDEX_QUERY") != NULL;
+   const int multiview = getenv("INDEX_MULTIVIEW") != NULL;
+   const char *cycle_env = getenv("INDEX_CYCLE");
+   const int cycle = !cycle_env ? 0 : !strcmp(cycle_env, "free") ? 1 : !strcmp(cycle_env, "reset") ? 2 : -1;
+   if (cycle < 0) { fputs("INDEX_CYCLE must be free or reset\n", stderr); return 2; }
    const char *gpu=getenv("AMDGPU_GPU_ID"), *preload=getenv("LD_PRELOAD"), *safe=getenv("RADV_BC250_MESH_SAFE_FAST");
    if (!offline && (!safe || strcmp(safe, "1"))) { fputs("REFUSE: SAFE_FAST must be enabled\n", stderr); return 3; }
    if (offline) {
@@ -100,6 +113,8 @@ int main(int argc, char **argv)
    vkGetPhysicalDeviceFeatures2(pd,&features);
    if (!features.features.geometryShader) { fputs("REFUSE: geometryShader (gl_PrimitiveID) unavailable\n",stderr); return 3; }
    if (!mesh_support.meshShader || !support13.maintenance4) { fputs("REFUSE: Mesh unavailable\n",stderr); return 3; }
+   if (query && !features.features.pipelineStatisticsQuery) { fputs("REFUSE: pipeline statistics unavailable\n",stderr); return 3; }
+   if (multiview && (reference ? 0 : !mesh_support.multiviewMeshShader)) { fputs("REFUSE: multiview Mesh unavailable\n",stderr); return 3; }
    uint32_t nq=0; vkGetPhysicalDeviceQueueFamilyProperties(pd,&nq,NULL);
    VkQueueFamilyProperties *qp=calloc(nq,sizeof(*qp)); if (!qp) return 2;
    vkGetPhysicalDeviceQueueFamilyProperties(pd,&nq,qp);
@@ -110,11 +125,14 @@ int main(int argc, char **argv)
       .queueCount=1,.pQueuePriorities=&priority};
    VkPhysicalDeviceProvokingVertexFeaturesEXT provoking_enable={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT,.provokingVertexLast=VK_TRUE};
    VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR bary_enable={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR,.pNext=&provoking_enable,.fragmentShaderBarycentric=VK_TRUE};
-   VkPhysicalDeviceMeshShaderFeaturesEXT mesh_enable={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT,.pNext=&bary_enable,.meshShader=VK_TRUE,.taskShader=task};
+   VkPhysicalDeviceMeshShaderFeaturesEXT mesh_enable={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT,.pNext=&bary_enable,.meshShader=VK_TRUE,.taskShader=task,
+      .multiviewMeshShader=multiview&&mesh_support.multiviewMeshShader};
+   VkPhysicalDeviceVulkan11Features enable11={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,.pNext=&mesh_enable,.multiview=multiview};
    VkPhysicalDeviceVulkan13Features enable13={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-      .pNext=&mesh_enable,.maintenance4=VK_TRUE};
+      .pNext=&enable11,.maintenance4=VK_TRUE};
    const char *mesh_exts[3]={"VK_EXT_mesh_shader","VK_KHR_fragment_shader_barycentric","VK_EXT_provoking_vertex"};
-   VkPhysicalDeviceFeatures base_enable={.geometryShader=VK_TRUE}; /* SPIR-V Geometry capability for gl_PrimitiveID */
+   VkPhysicalDeviceFeatures base_enable={.geometryShader=VK_TRUE, /* SPIR-V Geometry capability for gl_PrimitiveID */
+      .pipelineStatisticsQuery=query};
    VkDeviceCreateInfo dci={.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,.pNext=&enable13,.pEnabledFeatures=&base_enable,
       .queueCreateInfoCount=1,.pQueueCreateInfos=&qci,.enabledExtensionCount=3,.ppEnabledExtensionNames=mesh_exts};
    VkDevice dev; CK(vkCreateDevice(pd,&dci,NULL,&dev));
@@ -134,7 +152,11 @@ int main(int argc, char **argv)
       {.srcSubpass=0,.dstSubpass=VK_SUBPASS_EXTERNAL,.srcStageMask=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
        .dstStageMask=VK_PIPELINE_STAGE_TRANSFER_BIT,.srcAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
        .dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT}};
-   VkRenderPassCreateInfo rpci={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,.attachmentCount=1,.pAttachments=&attachment,
+   const uint32_t view_mask=3;
+   VkRenderPassMultiviewCreateInfo multiview_ci={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO,
+      .subpassCount=1,.pViewMasks=&view_mask};
+   VkRenderPassCreateInfo rpci={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,.pNext=multiview?&multiview_ci:NULL,
+      .attachmentCount=1,.pAttachments=&attachment,
       .subpassCount=1,.pSubpasses=&subpass,.dependencyCount=2,.pDependencies=dependencies};
    VkRenderPass rp; CK(vkCreateRenderPass(dev,&rpci,NULL,&rp));
    VkShaderModule modules[3]={load(dev,argv[2]),load(dev,argv[3]),task?load(dev,argv[5]):VK_NULL_HANDLE};
@@ -157,14 +179,15 @@ int main(int argc, char **argv)
       .pVertexInputState=reference?&vertex:NULL,.pInputAssemblyState=reference?&assembly:NULL,.pViewportState=&vs,.pRasterizationState=&rs,.pMultisampleState=&ms,.pColorBlendState=&bs,.layout=layout,.renderPass=rp};
    VkPipeline pipeline; CK(vkCreateGraphicsPipelines(dev,VK_NULL_HANDLE,1,&pci,NULL,&pipeline));
    VkImageCreateInfo image_ci={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,.imageType=VK_IMAGE_TYPE_2D,
-      .format=VK_FORMAT_R8G8B8A8_UNORM,.extent={SIDE,SIDE,1},.mipLevels=1,.arrayLayers=1,.samples=VK_SAMPLE_COUNT_1_BIT,
+      .format=VK_FORMAT_R8G8B8A8_UNORM,.extent={SIDE,SIDE,1},.mipLevels=1,.arrayLayers=multiview?2:1,.samples=VK_SAMPLE_COUNT_1_BIT,
       .tiling=VK_IMAGE_TILING_OPTIMAL,.usage=VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
    VkImage image; CK(vkCreateImage(dev,&image_ci,NULL,&image));
    VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev,image,&mr);
    VkMemoryAllocateInfo mai={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=mr.size,.memoryTypeIndex=memtype(pd,mr.memoryTypeBits,0)};
    VkDeviceMemory image_mem; CK(vkAllocateMemory(dev,&mai,NULL,&image_mem)); CK(vkBindImageMemory(dev,image,image_mem,0));
-   VkImageViewCreateInfo ivci={.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,.image=image,.viewType=VK_IMAGE_VIEW_TYPE_2D,
-      .format=VK_FORMAT_R8G8B8A8_UNORM,.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}};
+   VkImageViewCreateInfo ivci={.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,.image=image,
+      .viewType=multiview?VK_IMAGE_VIEW_TYPE_2D_ARRAY:VK_IMAGE_VIEW_TYPE_2D,
+      .format=VK_FORMAT_R8G8B8A8_UNORM,.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,multiview?2:1}};
    VkImageView view; CK(vkCreateImageView(dev,&ivci,NULL,&view));
    VkFramebufferCreateInfo fbci={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=rp,.attachmentCount=1,
       .pAttachments=&view,.width=SIDE,.height=SIDE,.layers=1};
@@ -174,17 +197,27 @@ int main(int argc, char **argv)
    mai.allocationSize=mr.size; mai.memoryTypeIndex=memtype(pd,mr.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
    VkDeviceMemory buffer_mem; CK(vkAllocateMemory(dev,&mai,NULL,&buffer_mem)); CK(vkBindBufferMemory(dev,buffer,buffer_mem,0));
    void *mapped; CK(vkMapMemory(dev,buffer_mem,0,VK_WHOLE_SIZE,0,&mapped)); memset(mapped,0xa5,BYTES);
-   VkCommandPoolCreateInfo cpci={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.queueFamilyIndex=family};
+   VkCommandPoolCreateInfo cpci={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.queueFamilyIndex=family,
+      .flags=cycle==2?VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT:0};
+   VkQueryPool queries=VK_NULL_HANDLE;
+   if (query) {
+      VkQueryPoolCreateInfo qpci={.sType=VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,.queryType=VK_QUERY_TYPE_PIPELINE_STATISTICS,
+         .queryCount=1,.pipelineStatistics=VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT};
+      CK(vkCreateQueryPool(dev,&qpci,NULL,&queries));
+   }
+   VkFenceCreateInfo fci={.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence fence; CK(vkCreateFence(dev,&fci,NULL,&fence));
+   int released=0;
    VkCommandPool pool; CK(vkCreateCommandPool(dev,&cpci,NULL,&pool));
    VkCommandBufferAllocateInfo cbai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=pool,
       .level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
    unsigned recordings=getenv("INDEX_RECORDINGS")?atoi(getenv("INDEX_RECORDINGS")):1;
    if (!recordings || recordings>96) return 2;
-   VkCommandBuffer cb;
+   VkCommandBuffer cb=VK_NULL_HANDLE;
    for (unsigned recording=0; recording<recordings; recording++) {
    CK(vkAllocateCommandBuffers(dev,&cbai,&cb));
    VkCommandBufferBeginInfo cbi={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
    CK(vkBeginCommandBuffer(cb,&cbi));
+   if (query) vkCmdResetQueryPool(cb,queries,0,1);
    VkClearValue clear={.color={{0,0,0,0}}};
    VkRenderPassBeginInfo rbi={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,.renderPass=rp,.framebuffer=fb,
       .renderArea=rect,.clearValueCount=1,.pClearValues=&clear};
@@ -192,8 +225,17 @@ int main(int argc, char **argv)
    const uint32_t constants[4]={7,0,0,0}; vkCmdPushConstants(cb,layout,VK_SHADER_STAGE_MESH_BIT_EXT|VK_SHADER_STAGE_VERTEX_BIT,0,16,constants);
    PFN_vkCmdDrawMeshTasksEXT draw=(PFN_vkCmdDrawMeshTasksEXT)vkGetDeviceProcAddr(dev,"vkCmdDrawMeshTasksEXT");
    if (!draw) return 2;
-   if (reference) vkCmdDraw(cb,64*3*atoi(getenv("INDEX_PRIMITIVES")),1,0,0);
-   else draw(cb,64,1,1);
+   if (query) vkCmdBeginQuery(cb,queries,0,0);
+   for (int pass=0; pass<(clear_between?2:1); pass++) {
+      if (pass) {
+         VkClearAttachment ca={.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT,.colorAttachment=0,.clearValue={.color={{0,0,0,0}}}};
+         VkClearRect cr={.rect={{0,0},{SIDE/2,SIDE/2}},.baseArrayLayer=0,.layerCount=1};
+         vkCmdClearAttachments(cb,1,&ca,1,&cr);
+      }
+      if (reference) vkCmdDraw(cb,64*3*atoi(getenv("INDEX_PRIMITIVES")),1,0,0);
+      else draw(cb,64,1,1);
+   }
+   if (query) vkCmdEndQuery(cb,queries,0);
    vkCmdEndRenderPass(cb);
    VkBufferImageCopy copy={.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.imageExtent={SIDE,SIDE,1}};
    vkCmdCopyImageToBuffer(cb,image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,buffer,1,&copy);
@@ -202,22 +244,35 @@ int main(int argc, char **argv)
       .buffer=buffer,.size=VK_WHOLE_SIZE};
    vkCmdPipelineBarrier(cb,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,NULL,1,&host,0,NULL);
    CK(vkEndCommandBuffer(cb));
-   }
+   if (!cycle && recording+1<recordings) continue;
    if (validation_errors) { fputs("REFUSE: validation errors before submit\n",stderr); return 1; }
-   VkFenceCreateInfo fci={.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence fence; CK(vkCreateFence(dev,&fci,NULL,&fence));
    VkSubmitInfo submit={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&cb};
-   printf("INDEX_READY mode=%s mesh_draws=1 workgroups=64,1,1 submits=1\n",offline?"noop":"hardware");
-   /* The one-shot launcher verifies the actual compilation before releasing
-    * this single submission. EOF, a bad token, or launcher failure stops here. */
-   if (!offline) {
-      char token=0;
-      if (read(STDIN_FILENO,&token,1)!=1 || token!='S') {
-         fputs("REFUSE: submission not released by audited launcher\n",stderr); return 3;
+   if (!released) {
+      printf("INDEX_READY mode=%s mesh_draws=%d workgroups=64,1,1 submits=%u\n",offline?"noop":"hardware",
+             clear_between?2:1,cycle?recordings:1);
+      /* The one-shot launcher verifies the actual compilation before releasing
+       * the submissions. EOF, a bad token, or launcher failure stops here. */
+      if (!offline) {
+         char token=0;
+         if (read(STDIN_FILENO,&token,1)!=1 || token!='S') {
+            fputs("REFUSE: submission not released by audited launcher\n",stderr); return 3;
+         }
       }
+      released=1;
    }
    CK(vkQueueSubmit(queue,1,&submit,fence));
    VkResult wait=vkWaitForFences(dev,1,&fence,VK_TRUE,30000000000ull);
    if (wait!=VK_SUCCESS) { fprintf(stderr,"INDEX_STOP fence=%d; retain .last; do not retry\n",wait); fflush(NULL); _Exit(124); }
+   CK(vkResetFences(dev,1,&fence));
+   if (cycle==1) vkFreeCommandBuffers(dev,pool,1,&cb);
+   else if (cycle==2) CK(vkResetCommandBuffer(cb,0)); /* kept allocated but idle */
+   }
+   if (query && !offline) { /* the noop device never writes query results */
+      uint64_t stats=0;
+      CK(vkGetQueryPoolResults(dev,queries,0,1,sizeof(stats),&stats,sizeof(stats),VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WAIT_BIT));
+      printf("INDEX_QUERY fragment_invocations=%llu\n",(unsigned long long)stats);
+   }
+   if (queries) vkDestroyQueryPool(dev,queries,NULL);
    if (offline) {
       const unsigned char *p=mapped;
       for (unsigned i=0;i<BYTES;i++) if (p[i]!=0xa5) { fputs("NOOP_SENTINEL_CHANGED\n",stderr); return 1; }

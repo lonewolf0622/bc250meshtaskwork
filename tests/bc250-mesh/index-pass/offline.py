@@ -50,3 +50,45 @@ log = r.stdout.decode(errors='replace')
 if r.returncode or log.count('direct Mesh fallback (storage unavailable)') < 16 or 'VALIDATION_ERRORS=0' not in log:
     raise SystemExit(f'FAIL memory pressure rc={r.returncode}; see {out}')
 print('PASS memory pressure: bounded storage falls back without command buffer errors', flush=True)
+
+def run(tag, mesh, extra):
+    e = dict(env)
+    for k in ('INDEX_RECORDINGS', 'BC250_IDX_TRACE', 'INDEX_LAST_VERTEX', 'INDEX_REFERENCE'):
+        e.pop(k, None)
+    e.update(RADV_BC250_MESH_IDXPASS='1', INDEX_PRIMITIVES='64', BC250_TRACE_USAGE='1', **extra)
+    cmd = ['bwrap', '--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc', '--tmpfs', '/tmp',
+           '--bind', str(out), str(out), '--unshare-pid', '--die-with-parent', '--', 'env', '-i',
+           *(f'{k}={v}' for k, v in e.items()), str(here / 'index_gate'), '--offline',
+           str(here / mesh), str(here / 'plain.frag.spv'), str(out / f'{tag}.rgba')]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300)
+    log = r.stdout.decode(errors='replace')
+    (out / f'{tag}.log').write_text(log)
+    if r.returncode or re.search(r'validation failed|ACO ERROR|VALIDATION:.*Error|Assertion', log) or \
+       'VALIDATION_ERRORS=0' not in log:
+        raise SystemExit(f'FAIL {tag} rc={r.returncode}; see {out}')
+    usage = re.findall(r'idx_direct=(\d+)', log)
+    return log, int(usage[-1]) if usage else 0
+
+# A meta operation (vkCmdClearAttachments) between two draws: both draws keep the index route.
+log, n = run('clear-between', 'j64.mesh.spv', dict(INDEX_CLEAR_BETWEEN='1'))
+if n != 2:
+    raise SystemExit(f'FAIL clear-between: idx_direct={n}, expected 2 (draw after the clear lost the route)')
+print('PASS clear-between: both draws on the index route', flush=True)
+# Pipeline-statistics query active: the draw keeps the Mesh route.
+log, n = run('query', 'j64.mesh.spv', dict(INDEX_QUERY='1'))
+if n != 0 or 'MESH IDXPASS: applied' not in log:
+    raise SystemExit(f'FAIL query: idx_direct={n}, expected 0 with an applied pipeline')
+print('PASS query: Mesh route while a counting query is active', flush=True)
+# Multiview render pass: the index route is declined at pipeline creation.
+# The Mesh route needs the per-vertex layer export for this shape on GFX10.1.
+log, n = run('multiview', 'j64.mesh.spv', dict(INDEX_MULTIVIEW='1', RADV_BC250_MESH_MULTIVIEW_VTX='1'))
+if 'MESH IDXPASS: declined (multiview)' not in log or 'MESH IDXPASS: applied' in log or n:
+    raise SystemExit('FAIL multiview: index route not declined')
+print('PASS multiview: declined', flush=True)
+# Recycled storage: 80 recordings submitted one after another, each in a new command buffer that is then freed or
+# reset and left idle; returned storage is reused, so none runs out of the 64 MiB budget.
+for mode in ('free', 'reset'):
+    log, n = run(f'cycle-{mode}', 'j64.mesh.spv', dict(INDEX_CYCLE=mode, INDEX_RECORDINGS='80', BC250_IDX_TRACE='1'))
+    if 'storage unavailable' in log or 'idx_direct=1 ' not in log or log.count('INDEX_READY') != 1:
+        raise SystemExit(f'FAIL cycle-{mode}: storage fallback or no index route; see {out}')
+    print(f'PASS cycle-{mode}: 80 recordings reuse storage', flush=True)
