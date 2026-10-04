@@ -4382,6 +4382,9 @@ radv_graphics_pipeline_create(VkDevice _device, VkPipelineCache _cache, const Vk
    radv_bc250_report_mesh_route(device, pipeline->base.shaders[MESA_SHADER_MESH],
       "pipeline", pipeline->bc250_direct_split_pieces, pipeline->bc250_task_pipeline != VK_NULL_HANDLE,
       pipeline->bc250_ordered, pipeline->bc250_plan.flags & RADV_BC250_PLAN_EMPTY);
+   /* RADV_BC250_MESH_IDXPASS: a declined or failed index route keeps the Mesh route. */
+   if (device->compiler_info.bc250x.idxpass && pipeline->base.shaders[MESA_SHADER_MESH] && !pipeline->bc250_task_pipeline)
+      radv_bc250_idx_create(device, pipeline, pCreateInfo);
 
    radv_pipeline_report_pso_history(device, &pipeline->base);
 
@@ -4409,6 +4412,18 @@ radv_destroy_graphics_pipeline(struct radv_device *device, struct radv_graphics_
    }
    if (pipeline->bc250_task_pipeline)
       radv_DestroyPipeline(radv_device_to_handle(device), pipeline->bc250_task_pipeline, NULL);
+   if (pipeline->bc250_idx_cs)
+      radv_DestroyPipeline(radv_device_to_handle(device), pipeline->bc250_idx_cs, NULL);
+   if (pipeline->bc250_idx_gfx)
+      radv_DestroyPipeline(radv_device_to_handle(device), pipeline->bc250_idx_gfx, NULL);
+   if (pipeline->bc250_idx_layout)
+      radv_DestroyPipelineLayout(radv_device_to_handle(device), pipeline->bc250_idx_layout, NULL);
+   if (pipeline->bc250_idx_setup)
+      radv_DestroyPipeline(radv_device_to_handle(device), pipeline->bc250_idx_setup, NULL);
+   if (pipeline->bc250_idx_setup_layout)
+      radv_DestroyPipelineLayout(radv_device_to_handle(device), pipeline->bc250_idx_setup_layout, NULL);
+   if (pipeline->bc250_idx_cs_ind)
+      radv_DestroyPipeline(radv_device_to_handle(device), pipeline->bc250_idx_cs_ind, NULL);
    if (pipeline->bc250_setup_pipeline && !pipeline->bc250_shared_setup)
       radv_DestroyPipeline(radv_device_to_handle(device), pipeline->bc250_setup_pipeline, NULL);
    if (pipeline->bc250_task_layout && !pipeline->bc250_shared_setup)

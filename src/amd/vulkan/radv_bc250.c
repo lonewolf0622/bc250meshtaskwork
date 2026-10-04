@@ -27,6 +27,8 @@
 struct radv_graphics_pipeline *
 radv_bc250_mesh_pipeline(const struct radv_cmd_buffer *cmd_buffer)
 {
+   if (cmd_buffer->bc250_idx_restore)
+      return cmd_buffer->bc250_idx_restore;
    if (cmd_buffer->state.graphics_pipeline)
       return cmd_buffer->state.graphics_pipeline;
    const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
@@ -5051,6 +5053,785 @@ decline:
    return false;
 }
 
+/* RADV_BC250_MESH_IDXPASS (prototype): a Mesh-only triangle pipeline whose per-vertex outputs depend only on
+ * (workgroup, vertex) is drawn as an index pass plus an ordinary indexed draw. The index pass is a compute
+ * shader built from the Mesh shader without its vertex work: it writes 32-bit triangle indices
+ * (workgroup * V + vertex) in primitive order, unused primitive slots as degenerate triangles. The draw's
+ * vertex shader is built from the Mesh shader too: vertex k of workgroup g runs the body as invocation
+ * k % workgroup size and keeps only its own vertex's stores. The primitive assembler then sees ordinary
+ * indexed triangles in the original order, so no Mesh export, check or split is needed. */
+
+struct bc250_idx_scan {
+   unsigned threads;
+   const char *why;
+};
+
+static bool
+bc250_idx_is_lane(nir_scalar s)
+{
+   s = nir_scalar_chase_movs(s);
+   return nir_scalar_is_intrinsic(s) && nir_scalar_intrinsic_op(s) == nir_intrinsic_load_local_invocation_index;
+}
+
+/* The vertex index is invocation + k * threads (k >= 0): the invocation that stores vertex v is v % threads. */
+static bool
+bc250_idx_owner(nir_scalar s, unsigned threads, unsigned depth)
+{
+   s = nir_scalar_chase_movs(s);
+   if (depth > 6)
+      return false;
+   if (bc250_idx_is_lane(s))
+      return true;
+   if (nir_scalar_is_alu(s) && nir_scalar_alu_op(s) == nir_op_iadd) {
+      for (unsigned i = 0; i < 2; i++) {
+         nir_scalar o = nir_scalar_chase_alu_src(s, !i);
+         if (nir_scalar_is_const(o) && nir_scalar_as_uint(o) % threads == 0 &&
+             bc250_idx_owner(nir_scalar_chase_alu_src(s, i), threads, depth + 1))
+            return true;
+      }
+   }
+   if (nir_def_instr(s.def)->type == nir_instr_type_phi) {
+      nir_phi_instr *phi = nir_instr_as_phi(nir_def_instr(s.def));
+      nir_cf_node *parent = phi->instr.block->cf_node.parent;
+      if (parent->type != nir_cf_node_loop || nir_loop_first_block(nir_cf_node_as_loop(parent)) != phi->instr.block)
+         return false;
+      unsigned inits = 0;
+      nir_foreach_phi_src(src, phi) {
+         nir_scalar v = nir_scalar_chase_movs(nir_get_scalar(src->src.ssa, 0));
+         if (nir_scalar_is_alu(v) && nir_scalar_alu_op(v) == nir_op_iadd) {
+            nir_scalar a = nir_scalar_chase_alu_src(v, 0), c = nir_scalar_chase_alu_src(v, 1);
+            if ((a.def == &phi->def && nir_scalar_is_const(c) && nir_scalar_as_uint(c) % threads == 0) ||
+                (c.def == &phi->def && nir_scalar_is_const(a) && nir_scalar_as_uint(a) % threads == 0))
+               continue;
+         }
+         if (!bc250_idx_owner(v, threads, depth + 1))
+            return false;
+         inits++;
+      }
+      return inits > 0;
+   }
+   return false;
+}
+
+/* A value read with read_first_invocation is the same in every invocation when nothing it is built from depends
+ * on the invocation: invocation-independent sources, and for phis the conditions that pick their source (the if
+ * before a merge, every break of a loop). Values still being checked count as independent (loop cycles). */
+static bool bc250_idx_lane_free_rec(nir_def *def, unsigned depth, struct set *visiting);
+
+static bool
+bc250_idx_cf_lane_free(nir_cf_node *node, nir_cf_node *stop, unsigned depth, struct set *visiting)
+{
+   for (nir_cf_node *n = node; n && n != stop; n = n->parent) {
+      if (n->type == nir_cf_node_if &&
+          !bc250_idx_lane_free_rec(nir_cf_node_as_if(n)->condition.ssa, depth + 1, visiting))
+         return false;
+      if (n->type == nir_cf_node_function)
+         break;
+   }
+   return true;
+}
+
+static nir_instr *bc250_idx_lane_culprit;
+
+static bool
+bc250_idx_lane_free_rec(nir_def *def, unsigned depth, struct set *visiting)
+{
+   bc250_idx_lane_culprit = nir_def_instr(def);
+   if (depth > 64)
+      return false;
+   if (_mesa_set_search(visiting, def))
+      return true;
+   _mesa_set_add(visiting, def);
+   nir_instr *instr = nir_def_instr(def);
+   switch (instr->type) {
+   case nir_instr_type_load_const:
+   case nir_instr_type_undef:
+      return true;
+   case nir_instr_type_alu: {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
+         if (!bc250_idx_lane_free_rec(alu->src[i].src.ssa, depth + 1, visiting))
+            return false;
+      return true;
+   }
+   case nir_instr_type_intrinsic: {
+      nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+      switch (in->intrinsic) {
+      case nir_intrinsic_load_local_invocation_index:
+      case nir_intrinsic_load_local_invocation_id:
+      case nir_intrinsic_load_subgroup_invocation:
+         return false;
+      case nir_intrinsic_read_first_invocation:
+      case nir_intrinsic_load_subgroup_id:
+      case nir_intrinsic_load_num_subgroups:
+         /* Same in every invocation of a subgroup; read_first of it reads the first invocation's. */
+         return in->intrinsic != nir_intrinsic_load_subgroup_id;
+      default:
+         break;
+      }
+      if (!(nir_intrinsic_infos[in->intrinsic].flags & NIR_INTRINSIC_CAN_ELIMINATE))
+         return false;
+      for (unsigned i = 0; i < nir_intrinsic_infos[in->intrinsic].num_srcs; i++)
+         if (!bc250_idx_lane_free_rec(in->src[i].ssa, depth + 1, visiting))
+            return false;
+      return true;
+   }
+   case nir_instr_type_deref: {
+      nir_deref_instr *d = nir_instr_as_deref(instr);
+      if (d->deref_type == nir_deref_type_var)
+         return true;
+      if (d->deref_type == nir_deref_type_array && !bc250_idx_lane_free_rec(d->arr.index.ssa, depth + 1, visiting))
+         return false;
+      return d->deref_type == nir_deref_type_cast ? bc250_idx_lane_free_rec(d->parent.ssa, depth + 1, visiting) :
+             bc250_idx_lane_free_rec(&nir_deref_instr_parent(d)->def, depth + 1, visiting);
+   }
+   case nir_instr_type_tex: {
+      /* Fetches and explicit-LOD lookups: the same result for the same sources. */
+      nir_tex_instr *tex = nir_instr_as_tex(instr);
+      if (tex->op != nir_texop_txf && tex->op != nir_texop_txl && tex->op != nir_texop_txs &&
+          tex->op != nir_texop_txf_ms && tex->op != nir_texop_query_levels)
+         return false;
+      for (unsigned i = 0; i < tex->num_srcs; i++)
+         if (!bc250_idx_lane_free_rec(tex->src[i].src.ssa, depth + 1, visiting))
+            return false;
+      return true;
+   }
+   case nir_instr_type_phi: {
+      nir_phi_instr *phi = nir_instr_as_phi(instr);
+      nir_foreach_phi_src(src, phi)
+         if (!bc250_idx_lane_free_rec(src->src.ssa, depth + 1, visiting))
+            return false;
+      nir_block *block = phi->instr.block;
+      nir_cf_node *parent = block->cf_node.parent;
+      if (parent->type == nir_cf_node_loop && nir_loop_first_block(nir_cf_node_as_loop(parent)) == block) {
+         /* Loop header: every break must be taken uniformly. */
+         nir_loop *loop = nir_cf_node_as_loop(parent);
+         nir_foreach_block_in_cf_node(lb, &loop->cf_node) {
+            nir_foreach_instr(li, lb) {
+               if (li->type == nir_instr_type_jump && nir_instr_as_jump(li)->type == nir_jump_break &&
+                   !bc250_idx_cf_lane_free(lb->cf_node.parent, &loop->cf_node, depth, visiting))
+                  return false;
+            }
+         }
+         return bc250_idx_cf_lane_free(parent->parent, NULL, depth, visiting);
+      }
+      /* Merge after an if (or after a loop): the construct right before this block. */
+      nir_cf_node *prev = nir_cf_node_prev(&block->cf_node);
+      if (prev && prev->type == nir_cf_node_if)
+         return bc250_idx_cf_lane_free(prev, NULL, depth, visiting);
+      if (prev && prev->type == nir_cf_node_loop) {
+         nir_loop *loop = nir_cf_node_as_loop(prev);
+         nir_foreach_block_in_cf_node(lb, &loop->cf_node) {
+            nir_foreach_instr(li, lb) {
+               if (li->type == nir_instr_type_jump && nir_instr_as_jump(li)->type == nir_jump_break &&
+                   !bc250_idx_cf_lane_free(lb->cf_node.parent, &loop->cf_node, depth, visiting))
+                  return false;
+            }
+         }
+         return bc250_idx_cf_lane_free(prev->parent, NULL, depth, visiting);
+      }
+      return false;
+   }
+   default:
+      return false;
+   }
+}
+
+static bool
+bc250_idx_lane_free(nir_def *def, unsigned depth)
+{
+   struct set *visiting = _mesa_pointer_set_create(NULL);
+   const bool r = bc250_idx_lane_free_rec(def, depth, visiting);
+   _mesa_set_destroy(visiting, NULL);
+   return r;
+}
+
+/* The deref of a Mesh output array element: the vertex (or primitive) level array deref right below the variable. */
+static nir_deref_instr *
+bc250_idx_element(nir_deref_instr *d)
+{
+   while (d && d->deref_type != nir_deref_type_var) {
+      nir_deref_instr *parent = nir_deref_instr_parent(d);
+      if (parent && parent->deref_type == nir_deref_type_var)
+         return d->deref_type == nir_deref_type_array ? d : NULL;
+      d = parent;
+   }
+   return NULL;
+}
+
+/* Admission of the Mesh shader itself. The index pass runs the whole body as a compute shader (shared memory,
+ * barriers and subgroup operations included); the vertex shader keeps only the per-vertex work and is checked
+ * separately after it is built (bc250_idx_build_vs). */
+static bool
+bc250_idx_eligible(nir_shader *mesh, nir_shader *fs, const char **why)
+{
+   const unsigned threads = mesh->info.workgroup_size[0] * mesh->info.workgroup_size[1] * mesh->info.workgroup_size[2];
+   *why = NULL;
+   if (mesh->info.mesh.primitive_type != MESA_PRIM_TRIANGLES) { *why = "not triangles"; return false; }
+   if (mesh->info.workgroup_size[1] != 1 || mesh->info.workgroup_size[2] != 1) { *why = "2D/3D workgroup"; return false; }
+   if (mesh->info.task_payload_size) { *why = "task payload"; return false; }
+   if (mesh->info.mesh.max_vertices_out > 256 || mesh->info.mesh.max_primitives_out > 256 || !threads) { *why = "size"; return false; }
+   /* Measured: at most 32 vertices the Mesh route is faster (no split, one wave). */
+   if (mesh->info.mesh.max_vertices_out <= 32) { *why = "at most 32 vertices"; return false; }
+   nir_foreach_shader_in_variable(v, fs) {
+      if (v->data.per_primitive) { *why = "fragment per-primitive input"; return false; }
+   }
+   if (BITSET_TEST(fs->info.system_values_read, SYSTEM_VALUE_PRIMITIVE_ID) ||
+       BITSET_TEST(fs->info.system_values_read, SYSTEM_VALUE_BARYCENTRIC_PERSP_PIXEL) ||
+       fs->info.inputs_read & (VARYING_BIT_PRIMITIVE_ID | VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT)) {
+      *why = "fragment reads primitive-level data"; return false;
+   }
+   bool indices = false;
+   nir_foreach_shader_out_variable(v, mesh) {
+      if (v->data.location == VARYING_SLOT_PRIMITIVE_INDICES) {
+         indices = glsl_type_is_array(v->type) && glsl_get_vector_elements(glsl_get_array_element(v->type)) == 3;
+         continue;
+      }
+      if (v->data.per_primitive) { *why = "per-primitive output"; return false; }
+      if (!glsl_type_is_array(v->type)) { *why = "vertex output type"; return false; }
+   }
+   if (!indices) { *why = "no triangle indices"; return false; }
+   unsigned counts = 0;
+   nir_foreach_function_impl(impl, mesh) {
+      if (impl != nir_shader_get_entrypoint(mesh)) { *why = "function calls"; return false; }
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+            switch (in->intrinsic) {
+            case nir_intrinsic_set_vertex_and_primitive_count:
+               counts++;
+               break;
+            case nir_intrinsic_load_deref: {
+               nir_variable *var = nir_deref_instr_get_variable(nir_src_as_deref(in->src[0]));
+               if (!var || var->data.mode == nir_var_shader_out) { *why = "reads outputs"; return false; }
+               break;
+            }
+            case nir_intrinsic_store_deref: {
+               nir_deref_instr *d = nir_src_as_deref(in->src[0]);
+               nir_variable *var = nir_deref_instr_get_variable(d);
+               if (!var || var->data.mode != nir_var_shader_out)
+                  break;
+               nir_deref_instr *e = bc250_idx_element(d);
+               if (!e) { *why = "output store shape"; return false; }
+               if (var->data.location == VARYING_SLOT_PRIMITIVE_INDICES) {
+                  if (e != d) { *why = "index store shape"; return false; }
+               } else if (!bc250_idx_owner(nir_get_scalar(e->arr.index.ssa, 0), threads, 0)) {
+                  *why = "vertex store not owned by invocation % workgroup size"; return false;
+               }
+               break;
+            }
+            default: {
+               const char *name = nir_intrinsic_infos[in->intrinsic].name;
+               if (strstr(name, "payload") || strstr(name, "launch") || strstr(name, "view_index") ||
+                   strstr(name, "terminate") || strstr(name, "demote")) {
+                  *why = name; return false;
+               }
+               if (!strcmp(name, "load_num_workgroups")) { *why = name; return false; }
+               break;
+            }
+            }
+         }
+      }
+   }
+   if (counts != 1) { *why = "not one SetMeshOutputs"; return false; }
+   return true;
+}
+
+/* Indirect index pass (RADV_BC250_MESH_IDXPASS): one dispatch covers every record of an indirect call. The
+ * setup pass published, at constants.xyz, {records n, total workgroups} and the exclusive workgroup prefix of
+ * each record (n + 1 entries from +32); constants.input holds each record's size (x, y, z) and
+ * constants.input_count its indexed-draw command (firstIndex at +8). A workgroup finds its record r by binary
+ * search and runs as workgroup "flat - prefix[r]" of record r with DrawID r. */
+static void
+bc250_idx_indirect_prologue(nir_builder *b, unsigned V, unsigned P, nir_variable *wg_var, nir_variable *draw_var,
+                            nir_def **vbase, nir_def **ibase)
+{
+   nir_def *tab = bc250_pointer(b, 0);
+   nir_def *hdr = nir_load_global(b, 2, 32, tab, .align_mul = 4);
+   nir_def *n = nir_channel(b, hdr, 0), *total = nir_channel(b, hdr, 1);
+   nir_def *wid = nir_load_workgroup_id(b);
+   nir_def *flat = nir_iadd(b, nir_channel(b, wid, 0), nir_imul_imm(b, nir_channel(b, wid, 1), 65535));
+   nir_push_if(b, nir_uge(b, flat, total));
+   nir_jump(b, nir_jump_return);
+   nir_pop_if(b, NULL);
+   nir_variable *lo = nir_local_variable_create(b->impl, glsl_uint_type(), "bc250_idx_lo");
+   nir_variable *hi = nir_local_variable_create(b->impl, glsl_uint_type(), "bc250_idx_hi");
+   nir_store_var(b, lo, nir_imm_int(b, 0), 1);
+   nir_store_var(b, hi, n, 1);
+   nir_def *prefix = nir_iadd_imm(b, tab, 32);
+   nir_push_loop(b);
+   {
+      nir_def *l = nir_load_var(b, lo), *h = nir_load_var(b, hi);
+      nir_break_if(b, nir_uge(b, l, h));
+      nir_def *mid = nir_ushr_imm(b, nir_iadd(b, l, h), 1);
+      nir_def *pv = nir_load_global(b, 1, 32, nir_iadd(b, prefix, nir_u2u64(b, nir_imul_imm(b, nir_iadd_imm(b, mid, 1), 4))),
+                                    .align_mul = 4);
+      nir_push_if(b, nir_uge(b, flat, pv));
+      nir_store_var(b, lo, nir_iadd_imm(b, mid, 1), 1);
+      nir_push_else(b, NULL);
+      nir_store_var(b, hi, mid, 1);
+      nir_pop_if(b, NULL);
+   }
+   nir_pop_loop(b, NULL);
+   nir_def *r = nir_load_var(b, lo);
+   nir_def *local = nir_isub(b, flat, nir_load_global(b, 1, 32, nir_iadd(b, prefix, nir_u2u64(b, nir_imul_imm(b, r, 4))),
+                                                      .align_mul = 4));
+   nir_def *dims = nir_load_global(b, 3, 32, nir_iadd(b, bc250_pointer(b, 32), nir_u2u64(b, nir_imul_imm(b, r, 12))),
+                                   .align_mul = 4);
+   nir_def *dx = nir_channel(b, dims, 0), *dxy = nir_imul(b, dx, nir_channel(b, dims, 1));
+   nir_def *z = nir_udiv(b, local, dxy);
+   nir_def *rest = nir_isub(b, local, nir_imul(b, z, dxy));
+   nir_def *y = nir_udiv(b, rest, dx);
+   nir_store_var(b, wg_var, nir_vec3(b, nir_isub(b, rest, nir_imul(b, y, dx)), y, z), 7);
+   nir_store_var(b, draw_var, r, 1);
+   nir_def *first = nir_load_global(b, 1, 32, nir_iadd(b, bc250_pointer(b, 40), nir_u2u64(b, nir_iadd_imm(b, nir_imul_imm(b, r, 20), 8))),
+                                    .align_mul = 4);
+   *vbase = nir_imul_imm(b, local, V);
+   *ibase = nir_iadd(b, bc250_pointer(b, 8),
+                     nir_u2u64(b, nir_iadd(b, nir_imul_imm(b, first, 4), nir_imul_imm(b, local, P * 12))));
+}
+
+static nir_shader *
+bc250_idx_build_cs(struct radv_device *device, const nir_shader *mesh, bool indirect)
+{
+   nir_shader *cs = nir_shader_clone(NULL, mesh);
+   NIR_PASS(_, cs, nir_split_var_copies);
+   NIR_PASS(_, cs, nir_lower_var_copies);
+   const unsigned V = cs->info.mesh.max_vertices_out, P = cs->info.mesh.max_primitives_out;
+   const unsigned threads = cs->info.workgroup_size[0];
+   nir_function_impl *impl = nir_shader_get_entrypoint(cs);
+   nir_builder b = nir_builder_create(impl);
+   nir_variable *wg_var = NULL, *draw_var = NULL;
+   if (indirect) {
+      /* The application's WorkGroupID and DrawID are the record's, found in the prologue. */
+      wg_var = nir_local_variable_create(impl, glsl_uvec_type(3), "bc250_idx_wg");
+      draw_var = nir_local_variable_create(impl, glsl_uint_type(), "bc250_idx_draw");
+      nir_foreach_block_safe(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+            if (in->intrinsic != nir_intrinsic_load_workgroup_id && in->intrinsic != nir_intrinsic_load_draw_id)
+               continue;
+            b.cursor = nir_before_instr(instr);
+            nir_def *v = nir_load_var(&b, in->intrinsic == nir_intrinsic_load_draw_id ? draw_var : wg_var);
+            nir_def_rewrite_uses(&in->def, nir_trim_vector(&b, v, in->def.num_components));
+            nir_instr_remove(instr);
+         }
+      }
+   }
+   /* Direct: the whole grid is one dispatch, WorkGroupID and NumWorkGroups stay the hardware values. */
+   NIR_PASS(_, cs, nir_shader_intrinsics_pass, bc250_lower_application_constants, nir_metadata_none, NULL);
+   /* Application returns end the body only: the epilogue below runs in every invocation. The prologue's exit
+    * (whole workgroup) is lowered after the epilogue exists. */
+   NIR_PASS(_, cs, nir_lower_returns);
+   nir_variable *count = nir_variable_create(cs, nir_var_mem_shared, glsl_uint_type(), "bc250_idx_count");
+   b = nir_builder_create(impl);
+   b.cursor = nir_before_impl(impl);
+   nir_def *vbase, *ibase;
+   if (indirect) {
+      bc250_idx_indirect_prologue(&b, V, P, wg_var, draw_var, &vbase, &ibase);
+   } else {
+      nir_def *flat = nir_iadd(&b, nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 64), .base = 0,
+                                                        .range = sizeof(struct bc250_constants)),
+                               bc250_task_index(&b));
+      vbase = nir_imul_imm(&b, flat, V);
+      ibase = bc250_payload_address(&b, nir_imm_int(&b, 0), true);
+   }
+   nir_foreach_block_safe(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+         if (in->intrinsic == nir_intrinsic_set_vertex_and_primitive_count) {
+            b.cursor = nir_before_instr(instr);
+            nir_def *pc = nir_bcsel(&b, nir_ieq_imm(&b, in->src[0].ssa, 0), nir_imm_int(&b, 0),
+                                    nir_umin_imm(&b, in->src[1].ssa, P));
+            nir_store_var(&b, count, pc, 1);
+            nir_instr_remove(instr);
+            continue;
+         }
+         if (in->intrinsic != nir_intrinsic_store_deref)
+            continue;
+         nir_deref_instr *d = nir_src_as_deref(in->src[0]);
+         nir_variable *var = nir_deref_instr_get_variable(d);
+         if (!var || var->data.mode != nir_var_shader_out)
+            continue;
+         b.cursor = nir_before_instr(instr);
+         if (var->data.location == VARYING_SLOT_PRIMITIVE_INDICES) {
+            nir_def *t = d->arr.index.ssa;
+            nir_def *value = nir_iadd(&b, nir_u2u32(&b, in->src[1].ssa), vbase);
+            nir_store_global(&b, value, nir_iadd(&b, ibase, nir_u2u64(&b, nir_imul_imm(&b, t, 12))),
+                             .write_mask = nir_intrinsic_write_mask(in), .align_mul = 4);
+         }
+         nir_instr_remove(instr);
+      }
+   }
+   b.cursor = nir_before_impl(impl);
+   nir_push_if(&b, nir_ieq_imm(&b, nir_load_local_invocation_index(&b), 0));
+   nir_store_var(&b, count, nir_imm_int(&b, 0), 1);
+   nir_pop_if(&b, NULL);
+   bc250_ordered_barrier(&b);
+   /* Unused primitive slots: degenerate triangles on the workgroup's first vertex (no fragments). */
+   b.cursor = nir_after_impl(impl);
+   bc250_ordered_barrier(&b);
+   nir_def *pc = nir_load_var(&b, count);
+   nir_def *lane = nir_load_local_invocation_index(&b);
+   for (unsigned first = 0; first < P; first += threads) {
+      nir_def *t = nir_iadd_imm(&b, lane, first);
+      nir_push_if(&b, nir_iand(&b, nir_uge(&b, t, pc), nir_ult_imm(&b, t, P)));
+      nir_store_global(&b, nir_vec3(&b, vbase, vbase, vbase),
+                       nir_iadd(&b, ibase, nir_u2u64(&b, nir_imul_imm(&b, t, 12))), .write_mask = 7, .align_mul = 4);
+      nir_pop_if(&b, NULL);
+   }
+   nir_progress(true, impl, nir_metadata_none);
+   NIR_PASS(_, cs, nir_lower_returns);
+   NIR_PASS(_, cs, nir_lower_vars_to_ssa);
+   NIR_PASS(_, cs, nir_opt_dce);
+   NIR_PASS(_, cs, nir_remove_dead_derefs);
+   nir_foreach_shader_out_variable_safe(v, cs)
+      exec_node_remove(&v->node);
+   cs->info.stage = MESA_SHADER_COMPUTE;
+   cs->info.outputs_written = 0;
+   cs->info.per_primitive_outputs = 0;
+   cs->info.name = ralloc_asprintf(cs, "bc250_idx_cs%s:%u:%u", indirect ? "_ind" : "", V, P);
+   NIR_PASS(_, cs, nir_lower_vars_to_explicit_types, nir_var_mem_shared, bc250_shared_type);
+   NIR_PASS(_, cs, nir_lower_explicit_io, nir_var_mem_shared, nir_address_format_32bit_offset);
+   NIR_PASS(_, cs, nir_opt_dce);
+   nir_shader_gather_info(cs, impl);
+   nir_validate_shader(cs, "BC250 index pass");
+   return cs;
+}
+
+/* Vertex shader: vertex k = gl_VertexIndex of workgroup g = k / V runs the body as invocation (k % V) % threads
+ * and keeps the stores whose vertex index is k % V. WorkGroupID is g unflattened against the grid size; the
+ * subgroup of invocation l is l / wave and its lane l % wave, as in the Mesh workgroup. Stores to memory, image
+ * stores, atomics with unused results and barriers are dropped (the index pass performs them once per
+ * workgroup); anything that still needs another invocation (shared memory, cross-lane operations) after dead
+ * code removal refuses the route. */
+static bool
+bc250_idx_vs_forbidden(nir_intrinsic_instr *in, const char **why)
+{
+   const char *name = nir_intrinsic_infos[in->intrinsic].name;
+   if (in->intrinsic == nir_intrinsic_load_deref || in->intrinsic == nir_intrinsic_store_deref) {
+      nir_variable *var = nir_deref_instr_get_variable(nir_src_as_deref(in->src[0]));
+      if (var && var->data.mode == nir_var_mem_shared) { *why = "vertex work uses shared memory"; return true; }
+      if (var && var->data.mode != nir_var_function_temp && var->data.mode != nir_var_shader_out &&
+          in->intrinsic == nir_intrinsic_store_deref) { *why = "vertex work stores memory"; return true; }
+      return false;
+   }
+   if (nir_intrinsic_has_semantic(in, NIR_INTRINSIC_SUBGROUP) || nir_intrinsic_has_semantic(in, NIR_INTRINSIC_QUADGROUP) ||
+       strstr(name, "shared") || strstr(name, "barrier") || strstr(name, "ballot") || strstr(name, "vote") ||
+       strstr(name, "shuffle") || strstr(name, "reduce") || strstr(name, "scan") || strstr(name, "read_invocation") ||
+       strstr(name, "read_first") || strstr(name, "atomic") || strstr(name, "store") || strstr(name, "payload")) {
+      *why = name;
+      return true;
+   }
+   return false;
+}
+
+static nir_shader *
+bc250_idx_build_vs(struct radv_device *device, const nir_shader *mesh, const char **why)
+{
+   nir_shader *vs = nir_shader_clone(NULL, mesh);
+   NIR_PASS(_, vs, nir_split_var_copies);
+   NIR_PASS(_, vs, nir_lower_var_copies);
+   const unsigned V = vs->info.mesh.max_vertices_out;
+   const unsigned threads = vs->info.workgroup_size[0];
+   const unsigned wave = mesh->info.min_subgroup_size ? mesh->info.min_subgroup_size : 64;
+   nir_function_impl *impl = nir_shader_get_entrypoint(vs);
+   nir_builder b = nir_builder_create(impl);
+   b.cursor = nir_before_impl(impl);
+   nir_def *k = nir_load_vertex_id(&b);
+   nir_def *g = nir_udiv_imm(&b, k, V);
+   nir_def *v = nir_isub(&b, k, nir_imul_imm(&b, g, V));
+   nir_def *lane = nir_umod_imm(&b, v, threads);
+   /* The draw passes the grid's x and y sizes in firstInstance (x | y << 16). */
+   nir_def *dims = nir_load_base_instance(&b);
+   nir_def *gx = nir_iand_imm(&b, dims, 0xffff), *gy = nir_ushr_imm(&b, dims, 16);
+   nir_def *gxy = nir_imul(&b, gx, gy);
+   nir_def *gz_id = nir_udiv(&b, g, gxy);
+   nir_def *rest = nir_isub(&b, g, nir_imul(&b, gz_id, gxy));
+   nir_def *gy_id = nir_udiv(&b, rest, gx);
+   nir_def *wg = nir_vec3(&b, nir_isub(&b, rest, nir_imul(&b, gy_id, gx)), gy_id, gz_id);
+   nir_def *sg_id = nir_udiv_imm(&b, lane, wave), *sg_lane = nir_umod_imm(&b, lane, wave);
+   nir_def *num_sg = nir_imm_int(&b, DIV_ROUND_UP(threads, wave));
+   struct hash_table *outs = _mesa_pointer_hash_table_create(NULL);
+   nir_variable *vertex_outputs[64];
+   unsigned noutputs = 0;
+   nir_foreach_shader_out_variable(var, vs) {
+      if (var->data.location != VARYING_SLOT_PRIMITIVE_INDICES && !var->data.per_primitive && noutputs < ARRAY_SIZE(vertex_outputs))
+         vertex_outputs[noutputs++] = var;
+   }
+   for (unsigned n = 0; n < noutputs; n++) {
+      nir_variable *var = vertex_outputs[n];
+      nir_variable *o = nir_variable_clone(var, vs);
+      o->type = glsl_get_array_element(var->type);
+      o->name = ralloc_asprintf(vs, "%s_vs", var->name ? var->name : "out");
+      nir_shader_add_variable(vs, o);
+      _mesa_hash_table_insert(outs, var, o);
+   }
+   nir_foreach_block_safe(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+         b.cursor = nir_before_instr(instr);
+         nir_def *repl = NULL;
+         switch (in->intrinsic) {
+         case nir_intrinsic_load_workgroup_id:
+            repl = wg;
+            break;
+         case nir_intrinsic_load_workgroup_index:
+            repl = g;
+            break;
+         case nir_intrinsic_load_local_invocation_index:
+            repl = lane;
+            break;
+         case nir_intrinsic_load_local_invocation_id:
+            repl = nir_vec3(&b, lane, nir_imm_int(&b, 0), nir_imm_int(&b, 0));
+            break;
+         case nir_intrinsic_load_subgroup_id:
+            repl = sg_id;
+            break;
+         case nir_intrinsic_load_subgroup_invocation:
+            repl = sg_lane;
+            break;
+         case nir_intrinsic_load_num_subgroups:
+            repl = num_sg;
+            break;
+         case nir_intrinsic_read_first_invocation:
+            if (!bc250_idx_lane_free(in->src[0].ssa, 0))
+               continue;
+            repl = in->src[0].ssa;
+            break;
+         case nir_intrinsic_set_vertex_and_primitive_count:
+         case nir_intrinsic_barrier:
+            nir_instr_remove(instr);
+            continue;
+         case nir_intrinsic_store_deref: {
+            nir_deref_instr *d = nir_src_as_deref(in->src[0]);
+            nir_variable *var = nir_deref_instr_get_variable(d);
+            if (var && var->data.mode == nir_var_function_temp)
+               continue;
+            struct hash_entry *e = var ? _mesa_hash_table_search(outs, var) : NULL;
+            if (e) {
+               /* Rebuild the deref chain below the vertex element on the per-vertex variable. */
+               nir_deref_instr *path[8];
+               unsigned depth = 0;
+               nir_deref_instr *elem = bc250_idx_element(d);
+               for (nir_deref_instr *p = d; p != elem && depth < ARRAY_SIZE(path); p = nir_deref_instr_parent(p))
+                  path[depth++] = p;
+               nir_push_if(&b, nir_ieq(&b, nir_u2u32(&b, elem->arr.index.ssa), v));
+               nir_deref_instr *cur = nir_build_deref_var(&b, e->data);
+               for (int i = depth - 1; i >= 0; i--) {
+                  if (path[i]->deref_type == nir_deref_type_array)
+                     cur = nir_build_deref_array(&b, cur, path[i]->arr.index.ssa);
+                  else if (path[i]->deref_type == nir_deref_type_struct)
+                     cur = nir_build_deref_struct(&b, cur, path[i]->strct.index);
+               }
+               nir_store_deref(&b, cur, in->src[1].ssa, nir_intrinsic_write_mask(in));
+               nir_pop_if(&b, NULL);
+            }
+            nir_instr_remove(instr);
+            continue;
+         }
+         default: {
+            /* Memory side effects belong to the index pass. */
+            const char *name = nir_intrinsic_infos[in->intrinsic].name;
+            const bool store = strstr(name, "store") != NULL && in->intrinsic != nir_intrinsic_store_deref;
+            const bool atomic = strstr(name, "atomic") != NULL && nir_def_is_unused(&in->def);
+            if (store || atomic)
+               nir_instr_remove(instr);
+            continue;
+         }
+         }
+         nir_def_rewrite_uses(&in->def, repl);
+         nir_instr_remove(instr);
+      }
+   }
+   nir_progress(true, impl, nir_metadata_none);
+   /* Mixed Mesh/vertex output layouts until the Mesh outputs are gone: no validation in between. */
+   nir_opt_dce(vs);
+   nir_remove_dead_derefs(vs);
+   hash_table_foreach(outs, e) exec_node_remove(&((nir_variable *)e->key)->node);
+   nir_foreach_shader_out_variable_safe(var, vs) {
+      if (var->data.location == VARYING_SLOT_PRIMITIVE_INDICES || var->data.per_primitive)
+         exec_node_remove(&var->node);
+   }
+   _mesa_hash_table_destroy(outs, NULL);
+   vs->info.stage = MESA_SHADER_VERTEX;
+   bool progress = true;
+   while (progress) {
+      progress = false;
+      NIR_PASS(progress, vs, nir_opt_dce);
+      NIR_PASS(progress, vs, nir_remove_dead_derefs);
+      NIR_PASS(progress, vs, nir_opt_dead_cf);
+   }
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic && bc250_idx_vs_forbidden(nir_instr_as_intrinsic(instr), why)) {
+            if (getenv("BC250_TRACE_COMPILE") && nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_read_first_invocation) {
+               fprintf(stderr, "BC250 MESH IDXPASS: broadcast of: ");
+               nir_print_instr(nir_def_instr(nir_instr_as_intrinsic(instr)->src[0].ssa), stderr);
+               bc250_idx_lane_free(nir_instr_as_intrinsic(instr)->src[0].ssa, 0);
+               fprintf(stderr, " | depends on: ");
+               nir_print_instr(bc250_idx_lane_culprit, stderr);
+               fprintf(stderr, "\n");
+            }
+            ralloc_free(vs);
+            return NULL;
+         }
+      }
+   }
+   NIR_PASS(_, vs, nir_remove_dead_variables, nir_var_mem_shared, NULL);
+   /* Per-component output stores (array derefs of vectors) as write-masked vector stores. */
+   NIR_PASS(_, vs, nir_lower_array_deref_of_vec, nir_var_shader_out, NULL,
+            nir_lower_direct_array_deref_of_vec_store | nir_lower_indirect_array_deref_of_vec_store);
+   vs->info.shared_size = 0;
+   vs->info.stage = MESA_SHADER_VERTEX;
+   vs->info.name = ralloc_asprintf(vs, "bc250_idx_vs:%u", V);
+   memset(&vs->info.mesh, 0, sizeof(vs->info.mesh));
+   nir_shader_gather_info(vs, impl);
+   nir_validate_shader(vs, "BC250 index-pass vertex shader");
+   return vs;
+}
+
+/* RADV_BC250_MESH_IDXPASS setup pass for one indirect call (one invocation, records in order). */
+struct bc250_idx_setup_args {
+   uint64_t records, count, table, dims, draws, mesh, pool;
+   uint32_t stride, max_count, capacity, prims;
+   /* First setup of the command buffer: the pool is empty. */
+   uint32_t reset, pad;
+};
+
+static nir_def *
+bc250_idx_arg(nir_builder *b, unsigned offset, unsigned bits)
+{
+   nir_def *v = nir_load_push_constant(b, bits == 64 ? 2 : 1, 32, nir_imm_int(b, offset), .base = 0,
+                                       .range = sizeof(struct bc250_idx_setup_args));
+   return bits == 64 ? nir_pack_64_2x32(b, v) : v;
+}
+
+/* 64 records per step: wave prefix sums of the index counts (each clamped to capacity + 1, capacity <= 2^25, so
+ * no 32-bit sum overflows) and of the workgroup counts, plus running carries. The offsets only grow, so a record
+ * fits exactly when its inclusive end is within the capacity; every record from the first that does not fit goes
+ * to the Mesh fallback. */
+static nir_shader *
+bc250_idx_build_setup(struct radv_device *device)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+      &device->compiler_info.nir_options[MESA_SHADER_COMPUTE], "bc250_idx_setup");
+   b.shader->info.workgroup_size[0] = 64;
+   b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.min_subgroup_size = b.shader->info.max_subgroup_size = 64;
+   b.shader->info.api_subgroup_size = 64;
+   nir_def *records = bc250_idx_arg(&b, 0, 64), *count = bc250_idx_arg(&b, 8, 64);
+   nir_def *table = bc250_idx_arg(&b, 16, 64), *dims = bc250_idx_arg(&b, 24, 64);
+   nir_def *draws = bc250_idx_arg(&b, 32, 64), *mesh = bc250_idx_arg(&b, 40, 64), *pool = bc250_idx_arg(&b, 48, 64);
+   nir_def *stride = bc250_idx_arg(&b, 56, 32), *max_count = bc250_idx_arg(&b, 60, 32);
+   nir_def *capacity = bc250_idx_arg(&b, 64, 32), *prims = bc250_idx_arg(&b, 68, 32);
+   nir_def *lane = nir_load_subgroup_invocation(&b);
+   nir_def *zero = nir_imm_int(&b, 0);
+   nir_variable *n_var = nir_local_variable_create(b.impl, glsl_uint_type(), "n");
+   nir_store_var(&b, n_var, max_count, 1);
+   nir_push_if(&b, nir_ine_imm(&b, count, 0));
+   nir_store_var(&b, n_var, nir_umin(&b, nir_read_first_invocation(&b, nir_load_global(&b, 1, 32, count, .align_mul = 4)),
+                                     max_count), 1);
+   nir_pop_if(&b, NULL);
+   nir_def *n = nir_load_var(&b, n_var);
+   nir_variable *base_var = nir_local_variable_create(b.impl, glsl_uint_type(), "base");
+   nir_store_var(&b, base_var, zero, 1);
+   nir_push_if(&b, nir_ieq_imm(&b, bc250_idx_arg(&b, 72, 32), 0));
+   nir_store_var(&b, base_var, nir_read_first_invocation(&b, nir_load_global(&b, 1, 32, pool, .align_mul = 4)), 1);
+   nir_pop_if(&b, NULL);
+   nir_def *base = nir_load_var(&b, base_var);
+   nir_def *limit = nir_iadd_imm(&b, capacity, 1);
+   /* carry: index offset (saturated at capacity + 1); gcarry: fitting workgroups; fb: records sent to the fallback. */
+   nir_variable *first_var = nir_local_variable_create(b.impl, glsl_uint_type(), "first");
+   nir_variable *carry_var = nir_local_variable_create(b.impl, glsl_uint_type(), "carry");
+   nir_variable *gcarry_var = nir_local_variable_create(b.impl, glsl_uint_type(), "gcarry");
+   nir_variable *fb_var = nir_local_variable_create(b.impl, glsl_uint_type(), "fallback");
+   nir_store_var(&b, first_var, zero, 1);
+   nir_store_var(&b, carry_var, nir_umin(&b, base, limit), 1);
+   nir_store_var(&b, gcarry_var, zero, 1);
+   nir_store_var(&b, fb_var, zero, 1);
+   nir_def *prefix = nir_iadd_imm(&b, table, 32);
+   nir_push_loop(&b);
+   {
+      nir_def *first = nir_load_var(&b, first_var);
+      nir_break_if(&b, nir_uge(&b, first, max_count));
+      nir_def *r = nir_iadd(&b, first, lane);
+      nir_def *active = nir_ult(&b, r, n);
+      /* Records past the GPU count: zero fallback records (the fallback may read all max_count). */
+      nir_push_if(&b, nir_iand(&b, nir_inot(&b, active), nir_ult(&b, r, max_count)));
+      nir_store_global(&b, nir_imm_ivec3(&b, 0, 0, 0), nir_iadd(&b, mesh, nir_u2u64(&b, nir_imul_imm(&b, r, 12))),
+                       .align_mul = 4);
+      nir_pop_if(&b, NULL);
+      nir_def *rec_zero = nir_imm_ivec3(&b, 0, 0, 0);
+      nir_push_if(&b, active);
+      nir_def *rec = nir_load_global(&b, 3, 32, nir_iadd(&b, records, nir_u2u64(&b, nir_imul(&b, r, stride))), .align_mul = 4);
+      nir_pop_if(&b, NULL);
+      rec = nir_if_phi(&b, rec, rec_zero);
+      nir_def *x = nir_channel(&b, rec, 0), *y = nir_channel(&b, rec, 1), *z = nir_channel(&b, rec, 2);
+      nir_def *total = nir_imul(&b, nir_imul(&b, nir_u2u64(&b, x), nir_u2u64(&b, y)), nir_u2u64(&b, z));
+      nir_def *valid = nir_iand(&b, active,
+                                nir_iand(&b, nir_iand(&b, nir_ult_imm(&b, x, 65536), nir_ult_imm(&b, y, 65536)),
+                                         nir_iand(&b, nir_ult_imm(&b, z, 65536), nir_ult_imm(&b, total, 4194305))));
+      nir_def *g = nir_bcsel(&b, valid, nir_u2u32(&b, total), zero);
+      nir_def *need64 = nir_imul(&b, nir_u2u64(&b, g), nir_u2u64(&b, nir_imul_imm(&b, prims, 3)));
+      nir_def *need = nir_u2u32(&b, nir_umin(&b, need64, nir_u2u64(&b, limit)));
+      nir_def *carry = nir_load_var(&b, carry_var);
+      nir_def *end = nir_iadd(&b, carry, nir_inclusive_scan(&b, need, .reduction_op = nir_op_iadd));
+      nir_def *fits = nir_iand(&b, active, nir_uge(&b, capacity, end));
+      nir_def *gfit = nir_bcsel(&b, fits, g, zero);
+      nir_def *gstart = nir_iadd(&b, nir_load_var(&b, gcarry_var), nir_exclusive_scan(&b, gfit, .reduction_op = nir_op_iadd));
+      nir_def *start = nir_isub(&b, end, need);
+      nir_push_if(&b, active);
+      {
+         nir_store_global(&b, gstart, nir_iadd(&b, prefix, nir_u2u64(&b, nir_imul_imm(&b, r, 4))), .align_mul = 4);
+         nir_def *dz = nir_imm_ivec3(&b, 0, 0, 0);
+         nir_store_global(&b, nir_bcsel(&b, fits, rec, dz), nir_iadd(&b, dims, nir_u2u64(&b, nir_imul_imm(&b, r, 12))),
+                          .align_mul = 4);
+         nir_def *daddr = nir_iadd(&b, draws, nir_u2u64(&b, nir_imul_imm(&b, r, 20)));
+         nir_def *draw = nir_vec4(&b, nir_bcsel(&b, fits, need, zero),
+                                  nir_b2i32(&b, nir_iand(&b, fits, nir_ine_imm(&b, g, 0))),
+                                  nir_bcsel(&b, fits, start, zero), zero);
+         nir_store_global(&b, draw, daddr, .align_mul = 4);
+         nir_store_global(&b, nir_bcsel(&b, fits, nir_ior(&b, x, nir_ishl_imm(&b, y, 16)), zero), nir_iadd_imm(&b, daddr, 16),
+                          .align_mul = 4);
+         nir_store_global(&b, nir_bcsel(&b, nir_iand(&b, valid, nir_inot(&b, fits)), rec, dz),
+                          nir_iadd(&b, mesh, nir_u2u64(&b, nir_imul_imm(&b, r, 12))), .align_mul = 4);
+      }
+      nir_pop_if(&b, NULL);
+      nir_store_var(&b, carry_var, nir_umin(&b, nir_iadd(&b, carry, nir_reduce(&b, need, .reduction_op = nir_op_iadd)), limit), 1);
+      nir_store_var(&b, gcarry_var, nir_iadd(&b, nir_load_var(&b, gcarry_var), nir_reduce(&b, gfit, .reduction_op = nir_op_iadd)), 1);
+      nir_def *nfb = nir_reduce(&b, nir_b2i32(&b, nir_iand(&b, active, nir_inot(&b, fits))), .reduction_op = nir_op_iadd);
+      nir_store_var(&b, fb_var, nir_iadd(&b, nir_load_var(&b, fb_var), nfb), 1);
+      nir_store_var(&b, first_var, nir_iadd_imm(&b, first, 64), 1);
+   }
+   nir_pop_loop(&b, NULL);
+   nir_push_if(&b, nir_ieq_imm(&b, lane, 0));
+   {
+      nir_def *gt = nir_load_var(&b, gcarry_var);
+      nir_store_global(&b, gt, nir_iadd(&b, prefix, nir_u2u64(&b, nir_imul_imm(&b, n, 4))), .align_mul = 4);
+      nir_def *dx = nir_umin_imm(&b, gt, 65535);
+      nir_def *dy = nir_bcsel(&b, nir_ieq_imm(&b, gt, 0), nir_imm_int(&b, 1),
+                              nir_udiv_imm(&b, nir_iadd_imm(&b, gt, 65534), 65535));
+      nir_def *fallback = nir_bcsel(&b, nir_ine_imm(&b, nir_load_var(&b, fb_var), 0), n, zero);
+      nir_store_global(&b, nir_vec4(&b, n, gt, dx, dy), table, .align_mul = 4);
+      nir_store_global(&b, nir_vec2(&b, nir_imm_int(&b, 1), fallback), nir_iadd_imm(&b, table, 16), .align_mul = 4);
+      /* Pool use: the fitting records' end (the carry saturates past the capacity only on overflow). */
+      nir_store_global(&b, nir_umin(&b, nir_load_var(&b, carry_var), capacity), pool, .align_mul = 4);
+   }
+   nir_pop_if(&b, NULL);
+   NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+   nir_validate_shader(b.shader, "BC250 index setup");
+   return b.shader;
+}
+
 VkResult
 radv_bc250_prepare_task(struct radv_device *device,
                        struct radv_graphics_pipeline *pipeline,
@@ -6002,6 +6783,27 @@ void
 radv_bc250_task_tails_free(struct radv_cmd_buffer *cmd_buffer)
 {
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   /* RADV_BC250_IDX_DEBUG: the GPU-written setup tables of this command buffer's first indirect calls. */
+   for (unsigned i = 0; i < cmd_buffer->bc250_idx_dbg_n; i++) {
+      const uint32_t *t = cmd_buffer->bc250_idx_dbg_map[i];
+      const uint32_t max = cmd_buffer->bc250_idx_dbg_max[i];
+      const uint32_t prefix_dw = ALIGN_POT(32 + (max + 1) * 4, 16) / 4, dims_dw = ALIGN_POT(max * 12, 16) / 4;
+      const uint32_t draws_dw = ALIGN_POT(max * 20, 16) / 4;
+      const uint32_t *draws = t + prefix_dw + dims_dw, *mesh = draws + draws_dw;
+      uint64_t indices = 0;
+      unsigned drawn = 0, fallback = 0;
+      for (unsigned r = 0; r < MIN2(t[0], max); r++) {
+         indices += draws[r * 5];
+         drawn += draws[r * 5] != 0;
+         fallback += mesh[r * 3] != 0;
+      }
+      fprintf(stderr, "BC250 IDX DEBUG: call=%u n=%u groups=%u dispatch=%u,%u,%u fallback_count=%u drawn=%u indices=%llu "
+              "fallback_records=%u first_draw={%u,%u,%u,%d,%x} first_mesh={%u,%u,%u} pool=%u\n", i, t[0], t[1], t[2], t[3],
+              t[4], t[5], drawn, (unsigned long long)indices, fallback, draws[0], draws[1], draws[2], (int)draws[3],
+              draws[4], mesh[0], mesh[1], mesh[2], cmd_buffer->bc250_idx_dbg_pool ? cmd_buffer->bc250_idx_dbg_pool[0] : 0);
+   }
+   cmd_buffer->bc250_idx_dbg_n = 0;
+   cmd_buffer->bc250_idx_dbg_pool = NULL;
    util_dynarray_foreach (&cmd_buffer->bc250_task_tails, struct radv_cmd_stream *, tail)
       radv_destroy_cmd_stream(device, *tail);
    util_dynarray_fini(&cmd_buffer->bc250_task_tails);
@@ -7044,4 +7846,688 @@ radv_bc250_directmesh_env(void)
       snprintf(buf, sizeof(buf), "%s,mesh", perftest);
       setenv("RADV_PERFTEST", buf, 1);
    }
+}
+
+/* RADV_BC250_MESH_IDXPASS (prototype). Built from the application's own create info after the Mesh pipeline
+ * exists, so the Mesh route stays available for every draw the index route declines. */
+void
+radv_bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline *pipeline,
+                      const VkGraphicsPipelineCreateInfo *pCreateInfo)
+{
+   const bool trace = getenv("BC250_TRACE_COMPILE") != NULL;
+   if (pipeline->base.create_flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR ||
+       vk_find_struct_const(pCreateInfo->pNext, PIPELINE_LIBRARY_CREATE_INFO_KHR) || !pCreateInfo->layout) {
+      if (trace)
+         fprintf(stderr, "BC250 MESH IDXPASS: declined (library or no layout)\n");
+      return;
+   }
+   const VkPipelineShaderStageCreateInfo *ms_info = NULL, *fs_info = NULL;
+   for (uint32_t i = 0; i < pCreateInfo->stageCount; i++) {
+      if (pCreateInfo->pStages[i].stage == VK_SHADER_STAGE_MESH_BIT_EXT)
+         ms_info = &pCreateInfo->pStages[i];
+      else if (pCreateInfo->pStages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT)
+         fs_info = &pCreateInfo->pStages[i];
+      else
+         return;
+   }
+   if (!ms_info || !fs_info)
+      return;
+   VK_FROM_HANDLE(radv_pipeline_layout, layout, pCreateInfo->layout);
+   struct radv_shader_stage ms = {0}, fs = {0};
+   const struct radv_shader_stage_key ms_key =
+      radv_pipeline_get_shader_key(&device->compiler_info, ms_info, pipeline->base.create_flags, pCreateInfo->pNext);
+   const struct radv_shader_stage_key fs_key =
+      radv_pipeline_get_shader_key(&device->compiler_info, fs_info, pipeline->base.create_flags, pCreateInfo->pNext);
+   radv_pipeline_stage_init(pipeline->base.create_flags, ms_info, layout, &ms_key, &ms);
+   radv_pipeline_stage_init(pipeline->base.create_flags, fs_info, layout, &fs_key, &fs);
+   struct radv_spirv_to_nir_options options = {.lower_view_index_to_zero = true};
+   nir_shader *mesh = radv_shader_spirv_to_nir_cached(&device->compiler_info, NULL, &ms, &options, false);
+   nir_shader *frag = radv_shader_spirv_to_nir_cached(&device->compiler_info, NULL, &fs, &options, false);
+   nir_shader *cs = NULL, *vs = NULL;
+   const char *why = NULL;
+   if (mesh) {
+      NIR_PASS(_, mesh, nir_split_var_copies);
+      NIR_PASS(_, mesh, nir_lower_var_copies);
+   }
+   if (!mesh || !frag || !bc250_idx_eligible(mesh, frag, &why)) {
+      if (trace)
+         fprintf(stderr, "BC250 MESH IDXPASS: declined (%s)\n", why ? why : "no NIR");
+      goto out;
+   }
+   vs = bc250_idx_build_vs(device, mesh, &why);
+   if (!vs) {
+      if (trace)
+         fprintf(stderr, "BC250 MESH IDXPASS: declined (%s)\n", why);
+      goto out;
+   }
+   cs = bc250_idx_build_cs(device, mesh, false);
+   if (getenv("BC250_IDX_PRINT")) {
+      nir_print_shader(cs, stderr);
+      nir_print_shader(vs, stderr);
+   }
+
+   VkPushConstantRange range = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .size = sizeof(struct bc250_constants)};
+   VkDescriptorSetLayout sets[MAX_SETS];
+   for (unsigned i = 0; i < layout->num_sets; i++)
+      sets[i] = layout->set[i].layout ? radv_descriptor_set_layout_to_handle(layout->set[i].layout) : VK_NULL_HANDLE;
+   VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+      .setLayoutCount = layout->num_sets, .pSetLayouts = sets, .pushConstantRangeCount = 1, .pPushConstantRanges = &range};
+   VkResult result = radv_CreatePipelineLayout(radv_device_to_handle(device), &li, NULL, &pipeline->bc250_idx_layout);
+   if (result != VK_SUCCESS)
+      goto fail;
+   VkPipelineCreateFlags2CreateInfo flags = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
+      .flags = pipeline->base.create_flags & VK_PIPELINE_CREATE_2_DESCRIPTOR_BUFFER_BIT_EXT};
+   VkPipelineRobustnessCreateInfo robust = {.sType = VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO,
+      .pNext = &flags,
+      .storageBuffers = ms.key.storage_robustness2 ? VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2 :
+                                                    VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS,
+      .uniformBuffers = ms.key.uniform_robustness2 ? VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2 :
+                                                    VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS};
+   /* The index pass runs the whole Mesh body: the same wave size, so subgroup operations mean the same. */
+   VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
+      .requiredSubgroupSize = mesh->info.min_subgroup_size == 32 ? 32 : 64};
+   VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .pNext = &robust,
+      .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = &subgroup,
+         .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = vk_shader_module_handle_from_nir(cs), .pName = "main"},
+      .layout = pipeline->bc250_idx_layout};
+   result = radv_compute_pipeline_create(radv_device_to_handle(device), device->meta_state.cache, &ci, NULL,
+                                         &pipeline->bc250_idx_cs);
+   if (result != VK_SUCCESS)
+      goto fail;
+   {
+      nir_shader *ind = bc250_idx_build_cs(device, mesh, true);
+      if (getenv("BC250_IDX_PRINT"))
+         nir_print_shader(ind, stderr);
+      ci.stage.module = vk_shader_module_handle_from_nir(ind);
+      result = radv_compute_pipeline_create(radv_device_to_handle(device), device->meta_state.cache, &ci, NULL,
+                                            &pipeline->bc250_idx_cs_ind);
+      ralloc_free(ind);
+      if (result != VK_SUCCESS)
+         goto fail;
+      VkPushConstantRange srange = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .size = sizeof(struct bc250_idx_setup_args)};
+      VkPipelineLayoutCreateInfo sli = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+         .pushConstantRangeCount = 1, .pPushConstantRanges = &srange};
+      result = radv_CreatePipelineLayout(radv_device_to_handle(device), &sli, NULL, &pipeline->bc250_idx_setup_layout);
+      if (result != VK_SUCCESS)
+         goto fail;
+      nir_shader *setup = bc250_idx_build_setup(device);
+      VkComputePipelineCreateInfo sci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+         .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                   .module = vk_shader_module_handle_from_nir(setup), .pName = "main"},
+         .layout = pipeline->bc250_idx_setup_layout};
+      result = radv_compute_pipeline_create(radv_device_to_handle(device), device->meta_state.cache, &sci, NULL,
+                                            &pipeline->bc250_idx_setup);
+      ralloc_free(setup);
+      if (result != VK_SUCCESS)
+         goto fail;
+   }
+
+   /* The application's graphics state with a vertex shader in place of the Mesh shader: triangle lists from an
+    * index buffer, no vertex attributes. Topology, restart and vertex-input states are not dynamic here. */
+   VkPipelineShaderStageCreateInfo stages[2] = {
+      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
+       .module = vk_shader_module_handle_from_nir(vs), .pName = "main"},
+      *fs_info,
+   };
+   VkPipelineVertexInputStateCreateInfo vis = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+   VkPipelineInputAssemblyStateCreateInfo ias = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+      .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+   VkDynamicState dyn[128];
+   VkPipelineDynamicStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .pDynamicStates = dyn};
+   if (pCreateInfo->pDynamicState) {
+      for (uint32_t i = 0; i < pCreateInfo->pDynamicState->dynamicStateCount && ds.dynamicStateCount < ARRAY_SIZE(dyn); i++) {
+         VkDynamicState d = pCreateInfo->pDynamicState->pDynamicStates[i];
+         if (d == VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY || d == VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE ||
+             d == VK_DYNAMIC_STATE_VERTEX_INPUT_EXT || d == VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE ||
+             d == VK_DYNAMIC_STATE_PATCH_CONTROL_POINTS_EXT)
+            continue;
+         dyn[ds.dynamicStateCount++] = d;
+      }
+   }
+   VkGraphicsPipelineCreateInfo gci = *pCreateInfo;
+   gci.stageCount = 2;
+   gci.pStages = stages;
+   gci.pVertexInputState = &vis;
+   gci.pInputAssemblyState = &ias;
+   gci.pTessellationState = NULL;
+   gci.pDynamicState = pCreateInfo->pDynamicState ? &ds : NULL;
+   gci.flags &= ~(VK_PIPELINE_CREATE_ALLOW_DERIVATIVES_BIT | VK_PIPELINE_CREATE_DERIVATIVE_BIT);
+   gci.basePipelineHandle = VK_NULL_HANDLE;
+   gci.basePipelineIndex = -1;
+   result = radv_CreateGraphicsPipelines(radv_device_to_handle(device), VK_NULL_HANDLE, 1, &gci, NULL,
+                                         &pipeline->bc250_idx_gfx);
+   if (result != VK_SUCCESS) {
+      pipeline->bc250_idx_gfx = VK_NULL_HANDLE;
+      goto fail;
+   }
+   pipeline->bc250_idx_vertices = mesh->info.mesh.max_vertices_out;
+   pipeline->bc250_idx_primitives = mesh->info.mesh.max_primitives_out;
+   if (trace)
+      fprintf(stderr, "BC250 MESH IDXPASS: applied V=%u P=%u threads=%u\n", pipeline->bc250_idx_vertices,
+              pipeline->bc250_idx_primitives, mesh->info.workgroup_size[0]);
+   goto out;
+fail:
+   if (trace)
+      fprintf(stderr, "BC250 MESH IDXPASS: declined (pipeline creation %d)\n", result);
+   if (pipeline->bc250_idx_cs)
+      radv_DestroyPipeline(radv_device_to_handle(device), pipeline->bc250_idx_cs, NULL);
+   if (pipeline->bc250_idx_layout)
+      radv_DestroyPipelineLayout(radv_device_to_handle(device), pipeline->bc250_idx_layout, NULL);
+   if (pipeline->bc250_idx_cs_ind)
+      radv_DestroyPipeline(radv_device_to_handle(device), pipeline->bc250_idx_cs_ind, NULL);
+   if (pipeline->bc250_idx_setup)
+      radv_DestroyPipeline(radv_device_to_handle(device), pipeline->bc250_idx_setup, NULL);
+   if (pipeline->bc250_idx_setup_layout)
+      radv_DestroyPipelineLayout(radv_device_to_handle(device), pipeline->bc250_idx_setup_layout, NULL);
+   pipeline->bc250_idx_cs = pipeline->bc250_idx_cs_ind = pipeline->bc250_idx_setup = VK_NULL_HANDLE;
+   pipeline->bc250_idx_layout = pipeline->bc250_idx_setup_layout = VK_NULL_HANDLE;
+out:
+   ralloc_free(cs);
+   ralloc_free(vs);
+   ralloc_free(mesh);
+   ralloc_free(frag);
+}
+
+/* RADV_BC250_MESH_IDXPASS index buffers: persistent device-local pages (at least 32 MiB), bump allocated; every range
+ * is exclusive to one draw of this recording. */
+static bool
+bc250_idx_alloc(struct radv_cmd_buffer *cmd_buffer, uint64_t bytes, uint64_t *address)
+{
+   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   while (cmd_buffer->bc250_idx_page < cmd_buffer->bc250_idx_npages) {
+      const unsigned p = cmd_buffer->bc250_idx_page;
+      const uint64_t offset = ALIGN_POT(cmd_buffer->bc250_idx_offset, 256);
+      if (offset + bytes <= cmd_buffer->bc250_idx_page_size[p]) {
+         if (!(cmd_buffer->bc250_idx_added & (1u << p))) {
+            radv_cs_add_buffer(device->ws, cmd_buffer->cs->b, cmd_buffer->bc250_idx_pages[p]);
+            cmd_buffer->bc250_idx_added |= 1u << p;
+         }
+         *address = radv_buffer_get_va(cmd_buffer->bc250_idx_pages[p]) + offset;
+         cmd_buffer->bc250_idx_offset = offset + bytes;
+         return true;
+      }
+      cmd_buffer->bc250_idx_page++;
+      cmd_buffer->bc250_idx_offset = 0;
+   }
+   if (cmd_buffer->bc250_idx_npages == ARRAY_SIZE(cmd_buffer->bc250_idx_pages))
+      return false;
+   const uint64_t size = MAX2(ALIGN_POT(bytes, 4096), 32ull << 20);
+   struct radeon_winsys_bo *bo;
+   VkResult result = radv_bo_create(device, &cmd_buffer->vk.base, size, 4096, RADEON_DOMAIN_VRAM,
+                                    RADEON_FLAG_NO_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING,
+                                    RADV_BO_PRIORITY_SCRATCH, 0, true, &bo);
+   if (result != VK_SUCCESS) {
+      vk_command_buffer_set_error(&cmd_buffer->vk, result);
+      return false;
+   }
+   const unsigned p = cmd_buffer->bc250_idx_npages++;
+   cmd_buffer->bc250_idx_pages[p] = bo;
+   cmd_buffer->bc250_idx_page_size[p] = size;
+   cmd_buffer->bc250_idx_page = p;
+   cmd_buffer->bc250_idx_offset = 0;
+   return bc250_idx_alloc(cmd_buffer, bytes, address);
+}
+
+/* Reset: rewind (the pages are kept); destroy: free. */
+void
+radv_bc250_idx_storage_reset(struct radv_cmd_buffer *cmd_buffer, bool destroy)
+{
+   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   if (destroy) {
+      if (cmd_buffer->bc250_idx_side)
+         radv_destroy_cmd_stream(device, cmd_buffer->bc250_idx_side);
+      cmd_buffer->bc250_idx_side = NULL;
+      for (unsigned p = 0; p < cmd_buffer->bc250_idx_npages; p++)
+         radv_bo_destroy(device, &cmd_buffer->vk.base, cmd_buffer->bc250_idx_pages[p]);
+      if (cmd_buffer->bc250_idx_pool_bo)
+         radv_bo_destroy(device, &cmd_buffer->vk.base, cmd_buffer->bc250_idx_pool_bo);
+      cmd_buffer->bc250_idx_npages = 0;
+      cmd_buffer->bc250_idx_pool_bo = NULL;
+      cmd_buffer->bc250_idx_pool = 0;
+   }
+   cmd_buffer->bc250_idx_page = 0;
+   cmd_buffer->bc250_idx_offset = 0;
+   cmd_buffer->bc250_idx_added = 0;
+   cmd_buffer->bc250_idx_pool_used = false;
+}
+
+/* Compute state tracked for the stream being recorded: everything is re-emitted after a stream switch. */
+static void
+bc250_idx_dirty_compute(struct radv_cmd_buffer *cmd_buffer)
+{
+   struct radv_descriptor_state *d = radv_get_descriptors_state(cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE);
+   cmd_buffer->state.dirty |= RADV_CMD_DIRTY_COMPUTE_PIPELINE;
+   d->dirty |= d->valid;
+   d->dirty_dynamic = true;
+   d->dirty_heaps |= d->valid_heaps;
+   cmd_buffer->push_constant_stages |= VK_SHADER_STAGE_COMPUTE_BIT;
+}
+
+/* One index pass: the graphics descriptors on the compute bind point, the pass's own constants. */
+static void
+bc250_idx_emit_compute(struct radv_cmd_buffer *cmd_buffer, VkPipeline compute, const void *constants, unsigned size,
+                       const struct radv_dispatch_info *dispatch, bool graphics_descriptors);
+
+static void
+bc250_idx_emit_pass(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pipeline *pipeline,
+                    const struct bc250_constants *constants, uint32_t x, uint32_t y, uint32_t z)
+{
+   struct radv_dispatch_info dispatch = {.blocks = {x, y, z}};
+   bc250_idx_emit_compute(cmd_buffer, pipeline->bc250_idx_cs, constants, sizeof(*constants), &dispatch, true);
+}
+
+static void
+bc250_idx_emit_compute(struct radv_cmd_buffer *cmd_buffer, VkPipeline compute, const void *constants, unsigned size,
+                       const struct radv_dispatch_info *dispatch, bool graphics_descriptors)
+{
+   VkCommandBuffer handle = radv_cmd_buffer_to_handle(cmd_buffer);
+   struct radv_descriptor_state *compute_descriptors =
+      radv_get_descriptors_state(cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE);
+   struct radv_descriptor_state saved_compute_descriptors = *compute_descriptors;
+   if (graphics_descriptors)
+      *compute_descriptors = *radv_get_descriptors_state(cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   compute_descriptors->dirty |= compute_descriptors->valid;
+   compute_descriptors->dirty_dynamic = true;
+   compute_descriptors->dirty_heaps |= compute_descriptors->valid_heaps;
+   struct radv_compute_pipeline *old = cmd_buffer->state.compute_pipeline;
+   uint8_t saved[128];
+   assert(size <= sizeof(saved));
+   memcpy(saved, cmd_buffer->push_constants, size);
+   radv_CmdBindPipeline(handle, VK_PIPELINE_BIND_POINT_COMPUTE, compute);
+   memcpy(cmd_buffer->push_constants, constants, size);
+   cmd_buffer->push_constant_stages |= VK_SHADER_STAGE_COMPUTE_BIT;
+   bc250_chain_dispatch(cmd_buffer, dispatch, "idx_pass");
+   if (old)
+      radv_CmdBindPipeline(handle, VK_PIPELINE_BIND_POINT_COMPUTE, radv_pipeline_to_handle(&old->base));
+   memcpy(cmd_buffer->push_constants, saved, size);
+   cmd_buffer->push_constant_stages |= VK_SHADER_STAGE_ALL;
+   *compute_descriptors = saved_compute_descriptors;
+   compute_descriptors->dirty |= compute_descriptors->valid;
+   compute_descriptors->dirty_dynamic = true;
+   compute_descriptors->dirty_heaps |= compute_descriptors->valid_heaps;
+}
+
+#define BC250_IDX_BATCH_DW (1u << 13)
+#define BC250_IDX_PASS_DW 2048u
+
+static void
+bc250_idx_nop_fill(uint32_t *p, uint32_t n)
+{
+   while (n) {
+      uint32_t m = MIN2(n, 16384u);
+      if (n - m == 1)
+         m--;
+      if (m == 1) {
+         p[0] = PKT3_NOP_PAD;
+      } else {
+         p[0] = PKT3(PKT3_NOP, m - 2, 0);
+         memset(p + 1, 0, (m - 1) * 4);
+      }
+      p += m;
+      n -= m;
+   }
+}
+
+/* Reserve the batch call at the current position: the commands recorded into the side stream until the batch
+ * closes run here, before every draw recorded after this point. */
+static bool
+bc250_idx_batch_open(struct radv_cmd_buffer *cmd_buffer)
+{
+   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   if (cmd_buffer->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY || cmd_buffer->gang.cs ||
+       cmd_buffer->bc250_dgc_upload_va || cmd_buffer->cs->buffered_sh_regs.num || !device->ws->cs_merge_buffers)
+      return false;
+   unsigned offset;
+   void *map;
+   struct radv_cmd_stream *side;
+   if (!radv_cmd_buffer_upload_alloc_aligned(cmd_buffer, BC250_IDX_BATCH_DW * 4, 256, &offset, &map))
+      return false;
+   const uint64_t va = radv_cmd_buffer_upload_va(cmd_buffer) + offset;
+   if (cmd_buffer->bc250_idx_side) {
+      side = cmd_buffer->bc250_idx_side;
+      radv_reset_cmd_stream(device, side);
+   } else {
+      if (radv_create_cmd_stream(device, AMD_IP_GFX, true, &side) != VK_SUCCESS)
+         return false;
+      cmd_buffer->bc250_idx_side = side;
+   }
+   radeon_check_space(device->ws, side->b, BC250_IDX_BATCH_DW);
+   /* Pending flushes belong to earlier commands: before the call. */
+   radv_emit_cache_flush(cmd_buffer);
+   radeon_check_space(device->ws, cmd_buffer->cs->b, 8);
+   device->ws->cs_execute_ib(cmd_buffer->cs->b, NULL, va, BC250_IDX_BATCH_DW, false);
+   /* The call changes compute registers: forget what this stream knows. */
+   radv_init_cmd_stream(device, cmd_buffer->cs, AMD_IP_GFX);
+   bc250_idx_dirty_compute(cmd_buffer);
+   cmd_buffer->bc250_idx_batch = side;
+   cmd_buffer->bc250_idx_batch_body = map;
+   cmd_buffer->bc250_idx_batch_buf = side->b->buf;
+   cmd_buffer->bc250_idx_batch_capacity = BC250_IDX_BATCH_DW;
+   return true;
+}
+
+void
+radv_bc250_idx_batch_close(struct radv_cmd_buffer *cmd_buffer, bool discard)
+{
+   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   struct radv_cmd_stream *side = cmd_buffer->bc250_idx_batch;
+   if (!side)
+      return;
+   cmd_buffer->bc250_idx_batch = NULL;
+   if (!discard) {
+      /* One wait for every pass of the batch, still inside the call. */
+      struct radv_cmd_stream *main_cs = cmd_buffer->cs;
+      const enum radv_cmd_flush_bits saved = cmd_buffer->state.flush_bits;
+      cmd_buffer->cs = side;
+      cmd_buffer->state.flush_bits = RADV_CMD_FLAG_CS_PARTIAL_FLUSH;
+      radv_emit_cache_flush(cmd_buffer);
+      /* Indirect draw arguments written by the passes are fetched ahead by the PFP. */
+      radeon_check_space(device->ws, side->b, 4);
+      ac_emit_cp_pfp_sync_me(side->b, false);
+      cmd_buffer->cs = main_cs;
+      cmd_buffer->state.flush_bits = saved;
+      uint32_t *body = cmd_buffer->bc250_idx_batch_body;
+      const uint32_t cap = cmd_buffer->bc250_idx_batch_capacity;
+      if (getenv("BC250_IDX_TRACE"))
+         fprintf(stderr, "BC250 IDX BATCH: close dw=%u of %u unchained=%u\n", side->b->cdw, cap,
+                 side->b->buf == cmd_buffer->bc250_idx_batch_buf);
+      if (side->b->buf == cmd_buffer->bc250_idx_batch_buf && side->b->cdw <= cap) {
+         memcpy(body, side->b->buf, side->b->cdw * 4);
+         bc250_idx_nop_fill(body + side->b->cdw, cap - side->b->cdw);
+      } else {
+         bc250_idx_nop_fill(body, cap);
+         vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      }
+      device->ws->cs_merge_buffers(main_cs->b, side->b);
+   }
+}
+
+/* Switch recording to the open batch (opening one when needed) for about dw dwords of compute work.
+ * False: record inline. */
+static bool
+bc250_idx_batch_begin(struct radv_cmd_buffer *cmd_buffer, struct radv_cmd_stream **main_cs,
+                      enum radv_cmd_flush_bits *saved_flush)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = debug_get_bool_option("RADV_BC250_MESH_IDXPASS_BATCH", true);
+   if (!enabled)
+      return false;
+   if (cmd_buffer->bc250_idx_batch &&
+       cmd_buffer->bc250_idx_batch->b->cdw + BC250_IDX_PASS_DW > cmd_buffer->bc250_idx_batch_capacity)
+      radv_bc250_idx_batch_close(cmd_buffer, false);
+   if (!cmd_buffer->bc250_idx_batch && !bc250_idx_batch_open(cmd_buffer))
+      return false;
+   *main_cs = cmd_buffer->cs;
+   *saved_flush = cmd_buffer->state.flush_bits;
+   cmd_buffer->state.flush_bits = 0;
+   cmd_buffer->cs = cmd_buffer->bc250_idx_batch;
+   bc250_idx_dirty_compute(cmd_buffer);
+   return true;
+}
+
+static void
+bc250_idx_batch_end(struct radv_cmd_buffer *cmd_buffer, struct radv_cmd_stream *main_cs,
+                    enum radv_cmd_flush_bits saved_flush)
+{
+   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   cmd_buffer->state.flush_bits = 0;
+   cmd_buffer->cs = main_cs;
+   bc250_idx_dirty_compute(cmd_buffer);
+   cmd_buffer->state.flush_bits = saved_flush;
+   device->ws->cs_merge_buffers(main_cs->b, cmd_buffer->bc250_idx_batch->b);
+}
+
+static bool
+bc250_idx_batch_add(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pipeline *pipeline,
+                    const struct bc250_constants *constants, uint32_t x, uint32_t y, uint32_t z)
+{
+   struct radv_cmd_stream *main_cs;
+   enum radv_cmd_flush_bits saved;
+   if (!bc250_idx_batch_begin(cmd_buffer, &main_cs, &saved))
+      return false;
+   bc250_idx_emit_pass(cmd_buffer, pipeline, constants, x, y, z);
+   bc250_idx_batch_end(cmd_buffer, main_cs, saved);
+   return true;
+}
+
+/* Rebind the application pipeline the index route stands in for. */
+void
+radv_bc250_idx_restore(struct radv_cmd_buffer *cmd_buffer)
+{
+   struct radv_graphics_pipeline *app = cmd_buffer->bc250_idx_restore;
+   if (!app || cmd_buffer->bc250_idx_drawing)
+      return;
+   cmd_buffer->bc250_idx_restore = NULL;
+   radv_CmdBindPipeline(radv_cmd_buffer_to_handle(cmd_buffer), VK_PIPELINE_BIND_POINT_GRAPHICS,
+                        radv_pipeline_to_handle(&app->base));
+}
+
+/* Indexed draws of the index route. The route's pipeline stays bound for the application's following index-route
+ * draws of this pipeline (radv_bc250_idx_restore rebinds the application pipeline before anything else draws).
+ * Topology and primitive restart, the only states that differ, and the index buffer return after the draw.
+ * Queries stay active: these are the application's draws. */
+struct bc250_idx_saved {
+   uint32_t topology;
+   bool restart;
+   struct radv_index_buffer_state ib;
+   uint32_t restart_index;
+};
+
+static void
+bc250_idx_draw_begin(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pipeline *pipeline, uint64_t ib_va,
+                     uint64_t ib_size, struct bc250_idx_saved *saved)
+{
+   VkCommandBuffer handle = radv_cmd_buffer_to_handle(cmd_buffer);
+   VK_FROM_HANDLE(radv_pipeline, internal, pipeline->bc250_idx_gfx);
+   if (cmd_buffer->bc250_idx_restore != pipeline ||
+       cmd_buffer->state.graphics_pipeline != radv_pipeline_to_graphics(internal)) {
+      radv_CmdBindPipeline(handle, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->bc250_idx_gfx);
+      cmd_buffer->bc250_idx_restore = pipeline;
+   }
+   /* The application pushes constants for the Mesh stage. */
+   cmd_buffer->push_constant_stages |= VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+   struct radv_dynamic_state *dyn = &cmd_buffer->state.dynamic;
+   saved->topology = dyn->vk.ia.primitive_topology;
+   saved->restart = dyn->vk.ia.primitive_restart_enable;
+   dyn->vk.ia.primitive_topology = radv_translate_prim(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+   dyn->vk.ia.primitive_restart_enable = false;
+   cmd_buffer->state.dirty_dynamic |= RADV_DYNAMIC_PRIMITIVE_TOPOLOGY | RADV_DYNAMIC_PRIMITIVE_RESTART_ENABLE;
+   saved->ib = cmd_buffer->state.index_buffer;
+   saved->restart_index = cmd_buffer->state.primitive_restart_index;
+   VkBindIndexBuffer3InfoKHR bind = {.sType = VK_STRUCTURE_TYPE_BIND_INDEX_BUFFER_3_INFO_KHR,
+      .addressRange = {.address = ib_va, .size = ib_size}, .indexType = VK_INDEX_TYPE_UINT32};
+   radv_CmdBindIndexBuffer3KHR(handle, &bind);
+   cmd_buffer->bc250_idx_drawing = true;
+}
+
+static void
+bc250_idx_draw_end(struct radv_cmd_buffer *cmd_buffer, const struct bc250_idx_saved *saved)
+{
+   cmd_buffer->bc250_idx_drawing = false;
+   struct radv_dynamic_state *dyn = &cmd_buffer->state.dynamic;
+   dyn->vk.ia.primitive_topology = saved->topology;
+   dyn->vk.ia.primitive_restart_enable = saved->restart;
+   cmd_buffer->state.dirty_dynamic |= RADV_DYNAMIC_PRIMITIVE_TOPOLOGY | RADV_DYNAMIC_PRIMITIVE_RESTART_ENABLE;
+   cmd_buffer->state.index_buffer = saved->ib;
+   cmd_buffer->state.primitive_restart_index = saved->restart_index;
+   cmd_buffer->state.dirty |= RADV_CMD_DIRTY_INDEX_BUFFER;
+}
+
+static void
+bc250_idx_draw_direct(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pipeline *pipeline, uint64_t ib_va,
+                      uint64_t ib_size, uint32_t count, uint32_t first_instance)
+{
+   struct bc250_idx_saved saved;
+   bc250_idx_draw_begin(cmd_buffer, pipeline, ib_va, ib_size, &saved);
+   radv_CmdDrawIndexed(radv_cmd_buffer_to_handle(cmd_buffer), count, 1, 0, 0, first_instance);
+   bc250_idx_draw_end(cmd_buffer, &saved);
+}
+
+/* Indirect index route: a setup pass validates the records and places them in the command buffer's index pool,
+ * one indirect index pass covers every record, one indexed indirect-count draw renders them with DrawID = record.
+ * Records that do not fit in the pool (from the first one that does not fit) go to the Mesh route in a second
+ * indirect-count draw, in order and with their own DrawID (its count is 0 when every record fits). */
+/* At most 2^25 indices (+ 256 bytes header) keep the setup sums within 32 bits. 32 MiB per command buffer (applications
+ * keep many alive); records beyond take the Mesh fallback. */
+#define BC250_IDX_POOL_MAX_BYTES ((128ull << 20) + 256)
+#define BC250_IDX_POOL_BYTES ((32ull << 20) + 256)
+
+bool
+radv_bc250_draw_idx_indirect(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pipeline *pipeline,
+                             uint64_t records, uint32_t max_count, uint32_t stride, uint64_t count_va)
+{
+   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   if (!max_count)
+      return true;
+   if (cmd_buffer->bc250_dgc_upload_va || max_count > 65536 || !pipeline->bc250_idx_cs_ind)
+      return false;
+   /* One-record calls pay the setup pass, its wait and the fallback draw for one record: on hardware (Control,
+    * 64-vertex meshlets) far more than the route saves. Keep those on the Mesh route unless the meshlets are large. */
+   if (max_count == 1 && pipeline->bc250_idx_vertices <= 64)
+      return false;
+   cmd_buffer->bc250_diag_idx_indirect++;
+   cmd_buffer->bc250_diag_idx_records += max_count;
+   /* The pool is kept across resets; the first setup of each recording starts it empty. */
+   if (!cmd_buffer->bc250_idx_pool_bo) {
+      /* RADV_BC250_IDX_POOL_BYTES (debug): a smaller pool exercises the Mesh fallback. */
+      static uint64_t pool_bytes = 0;
+      if (!pool_bytes)
+         pool_bytes = CLAMP(debug_get_num_option("RADV_BC250_IDX_POOL_BYTES", BC250_IDX_POOL_BYTES), 4096,
+                            BC250_IDX_POOL_MAX_BYTES);
+      const bool dbg = getenv("RADV_BC250_IDX_DEBUG") != NULL;
+      if (radv_bo_create(device, &cmd_buffer->vk.base, pool_bytes, 4096, dbg ? RADEON_DOMAIN_GTT : RADEON_DOMAIN_VRAM,
+                         (dbg ? RADEON_FLAG_CPU_ACCESS : RADEON_FLAG_NO_CPU_ACCESS) | RADEON_FLAG_NO_INTERPROCESS_SHARING,
+                         RADV_BO_PRIORITY_SCRATCH, 0, true, &cmd_buffer->bc250_idx_pool_bo) != VK_SUCCESS)
+         return false;
+      cmd_buffer->bc250_idx_pool = radv_buffer_get_va(cmd_buffer->bc250_idx_pool_bo);
+      cmd_buffer->bc250_idx_pool_capacity = (pool_bytes - 256) / 4;
+      if (dbg)
+         cmd_buffer->bc250_idx_dbg_pool = radv_buffer_map(device->ws, cmd_buffer->bc250_idx_pool_bo);
+   }
+   const bool reset = !cmd_buffer->bc250_idx_pool_used;
+   if (reset) {
+      radv_cs_add_buffer(device->ws, cmd_buffer->cs->b, cmd_buffer->bc250_idx_pool_bo);
+      cmd_buffer->bc250_idx_pool_used = true;
+   }
+   const uint64_t pool = cmd_buffer->bc250_idx_pool;
+   const unsigned P = pipeline->bc250_idx_primitives;
+   const uint64_t prefix_bytes = ALIGN_POT(32 + (uint64_t)(max_count + 1) * 4, 16);
+   const uint64_t dims_bytes = ALIGN_POT((uint64_t)max_count * 12, 16), draws_bytes = ALIGN_POT((uint64_t)max_count * 20, 16);
+   uint64_t table;
+   const uint64_t table_bytes = prefix_bytes + dims_bytes + draws_bytes + (uint64_t)max_count * 12;
+   if (getenv("RADV_BC250_IDX_DEBUG") && cmd_buffer->bc250_idx_dbg_n < 8 && table_bytes < (1u << 20)) {
+      unsigned toff;
+      void *tmap;
+      if (!radv_cmd_buffer_upload_alloc_aligned(cmd_buffer, table_bytes, 256, &toff, &tmap))
+         return true;
+      table = radv_cmd_buffer_upload_va(cmd_buffer) + toff;
+      cmd_buffer->bc250_idx_dbg_map[cmd_buffer->bc250_idx_dbg_n] = tmap;
+      cmd_buffer->bc250_idx_dbg_max[cmd_buffer->bc250_idx_dbg_n++] = max_count;
+   } else if (!bc250_idx_alloc(cmd_buffer, table_bytes, &table)) {
+      return true;
+   }
+   const uint64_t dims = table + prefix_bytes, draws = dims + dims_bytes, mesh = draws + draws_bytes;
+   unsigned coffset;
+   void *cmap;
+   if (!radv_cmd_buffer_upload_alloc_aligned(cmd_buffer, MAX_PUSH_CONSTANTS_SIZE, 256, &coffset, &cmap))
+      return true;
+   memcpy(cmap, cmd_buffer->push_constants, MAX_PUSH_CONSTANTS_SIZE);
+   const struct bc250_idx_setup_args args = {
+      .records = records, .count = count_va, .table = table, .dims = dims, .draws = draws, .mesh = mesh, .pool = pool,
+      .stride = stride, .max_count = max_count, .capacity = cmd_buffer->bc250_idx_pool_capacity, .prims = P,
+      .reset = reset,
+   };
+   const struct bc250_constants constants = {
+      .xyz = table, .payload = pool + 256,
+      .application_constants = radv_cmd_buffer_upload_va(cmd_buffer) + coffset,
+      .input = dims, .input_count = draws,
+   };
+
+   struct radv_cmd_stream *main_cs;
+   enum radv_cmd_flush_bits saved_flush;
+   const bool batched = bc250_idx_batch_begin(cmd_buffer, &main_cs, &saved_flush);
+   const struct radv_dispatch_info one = {.blocks = {1, 1, 1}};  /* one wave64 */
+   bc250_idx_emit_compute(cmd_buffer, pipeline->bc250_idx_setup, &args, sizeof(args), &one, false);
+   /* The pass reads the tables; the CP reads its dispatch size (ahead, in the PFP). */
+   cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_INV_SCACHE | RADV_CMD_FLAG_INV_VCACHE;
+   radv_emit_cache_flush(cmd_buffer);
+   radeon_check_space(device->ws, cmd_buffer->cs->b, 4);
+   ac_emit_cp_pfp_sync_me(cmd_buffer->cs->b, false);
+   const struct radv_dispatch_info pass = {.indirect_va = table + 8};
+   bc250_idx_emit_compute(cmd_buffer, pipeline->bc250_idx_cs_ind, &constants, sizeof(constants), &pass, true);
+   if (batched) {
+      bc250_idx_batch_end(cmd_buffer, main_cs, saved_flush);
+   } else {
+      cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH;
+      radv_emit_cache_flush(cmd_buffer);
+      radeon_check_space(device->ws, cmd_buffer->cs->b, 4);
+      ac_emit_cp_pfp_sync_me(cmd_buffer->cs->b, false);
+   }
+
+   VkCommandBuffer handle = radv_cmd_buffer_to_handle(cmd_buffer);
+   struct bc250_idx_saved saved;
+   bc250_idx_draw_begin(cmd_buffer, pipeline, pool + 256, (uint64_t)cmd_buffer->bc250_idx_pool_capacity * 4, &saved);
+   const VkDrawIndirectCount2InfoKHR draw = {.sType = VK_STRUCTURE_TYPE_DRAW_INDIRECT_COUNT_2_INFO_KHR,
+      .addressRange = {.address = draws, .size = (uint64_t)max_count * 20, .stride = 20},
+      .countAddressRange = {.address = table, .size = 4}, .maxDrawCount = max_count};
+   radv_CmdDrawIndexedIndirectCount2KHR(handle, &draw);
+   bc250_idx_draw_end(cmd_buffer, &saved);
+
+   radv_bc250_idx_restore(cmd_buffer);
+   const VkDrawIndirectCount2InfoKHR fallback = {.sType = VK_STRUCTURE_TYPE_DRAW_INDIRECT_COUNT_2_INFO_KHR,
+      .addressRange = {.address = mesh, .size = (uint64_t)max_count * 12, .stride = 12},
+      .countAddressRange = {.address = table + 20, .size = 4}, .maxDrawCount = max_count};
+   /* The Mesh fallback: its GPU count is 0 unless records overflowed the pool. (A COND_EXEC around it was skipped
+    * on hardware although the count was set: the flag read raced the L2 write-back.) */
+   cmd_buffer->bc250_idx_drawing = true;
+   radv_CmdDrawMeshTasksIndirectCount2EXT(handle, &fallback);
+   cmd_buffer->bc250_idx_drawing = false;
+   return true;
+}
+
+/* One Mesh draw of x*y*z workgroups: the index pass writes x*y*z*P triangles, then one indexed draw of the
+ * internal pipeline renders them. Returns false (Mesh route) when the grid does not fit the draw's encoding. */
+bool
+radv_bc250_draw_idx(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pipeline *pipeline,
+                    uint32_t x, uint32_t y, uint32_t z)
+{
+   const uint64_t groups = (uint64_t)x * y * z;
+   const unsigned V = pipeline->bc250_idx_vertices, P = pipeline->bc250_idx_primitives;
+   if (!groups)
+      return true;
+   if (x > 0xffff || y > 0xffff || groups * V >= (1ull << 32) || groups * P * 12 > (1ull << 31))
+      return false;
+   if (cmd_buffer->bc250_dgc_upload_va)
+      return false;
+   uint64_t ib_va;
+   unsigned coffset;
+   void *cmap = NULL;
+   if (!bc250_idx_alloc(cmd_buffer, groups * P * 12, &ib_va))
+      return true;
+   if (!radv_cmd_buffer_upload_alloc_aligned(cmd_buffer, MAX_PUSH_CONSTANTS_SIZE + sizeof(struct bc250_task_slot), 256,
+                                             &coffset, &cmap))
+      return true;
+   const uint64_t cva = radv_cmd_buffer_upload_va(cmd_buffer) + coffset;
+   memcpy(cmap, cmd_buffer->push_constants, MAX_PUSH_CONSTANTS_SIZE);
+   struct bc250_task_slot slot = {.full_x = x, .full_y = y, .full_z = z};
+   memcpy((char *)cmap + MAX_PUSH_CONSTANTS_SIZE, &slot, sizeof(slot));
+   struct bc250_constants constants = {
+      .payload = ib_va,
+      .stride = P * 12,
+      .application_constants = cva,
+      .task_slot = cva + MAX_PUSH_CONSTANTS_SIZE,
+   };
+
+   /* Index pass: batched with the other passes before this draw, or inline followed by a wait. */
+   if (!bc250_idx_batch_add(cmd_buffer, pipeline, &constants, x, y, z)) {
+      bc250_idx_emit_pass(cmd_buffer, pipeline, &constants, x, y, z);
+      /* The pass's stores reach L2, which the index fetch reads (GFX10): waiting for the dispatch is enough. */
+      cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH;
+   }
+
+   cmd_buffer->bc250_diag_idx_direct++;
+   bc250_idx_draw_direct(cmd_buffer, pipeline, ib_va, groups * P * 12, groups * P * 3, x | (y << 16));
+   return true;
 }

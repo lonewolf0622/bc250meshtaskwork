@@ -782,6 +782,15 @@ radv_amdgpu_cs_execute_secondary(struct ac_cmdbuf *_parent, struct ac_cmdbuf *_c
 }
 
 static void
+radv_amdgpu_cs_merge_buffers(struct ac_cmdbuf *_parent, struct ac_cmdbuf *_child)
+{
+   struct radv_amdgpu_cs *parent = radv_amdgpu_cs(_parent);
+   struct radv_amdgpu_cs *child = radv_amdgpu_cs(_child);
+   for (unsigned i = 0; i < child->num_buffers; ++i)
+      radv_amdgpu_cs_add_buffer_internal(parent, child->handles[i].bo_handle, child->handles[i].bo_priority);
+}
+
+static void
 radv_amdgpu_cs_execute_ib(struct ac_cmdbuf *_cs, struct radeon_winsys_bo *bo, uint64_t va, const uint32_t cdw,
                           const bool predicate)
 {
@@ -2083,6 +2092,7 @@ radv_amdgpu_cs_init_functions(struct radv_amdgpu_winsys *ws)
    ws->base.cs_add_buffer = radv_amdgpu_cs_add_buffer;
    ws->base.cs_execute_secondary = radv_amdgpu_cs_execute_secondary;
    ws->base.cs_execute_ib = radv_amdgpu_cs_execute_ib;
+   ws->base.cs_merge_buffers = radv_amdgpu_cs_merge_buffers;
    ws->base.cs_chain_dgc_ib = radv_amdgpu_cs_chain_dgc_ib;
    ws->base.cs_submit = radv_amdgpu_winsys_cs_submit;
    ws->base.cs_dump = radv_amdgpu_winsys_cs_dump;

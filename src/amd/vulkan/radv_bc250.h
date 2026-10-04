@@ -8,6 +8,12 @@ struct radv_device;
 struct radv_graphics_pipeline;
 struct radv_graphics_pipeline_state;
 struct radv_cmd_buffer;
+void radv_bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline *pipeline,
+                           const VkGraphicsPipelineCreateInfo *pCreateInfo);
+bool radv_bc250_draw_idx(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pipeline *pipeline,
+                         uint32_t x, uint32_t y, uint32_t z);
+bool radv_bc250_draw_idx_indirect(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pipeline *pipeline,
+                                  uint64_t records, uint32_t max_count, uint32_t stride, uint64_t count_va);
 VkResult radv_bc250_prepare_task(struct radv_device *device,
                                 struct radv_graphics_pipeline *pipeline,
                                 const struct radv_graphics_pipeline_state *gfx_state);
@@ -24,6 +30,9 @@ void radv_bc250_draw_split_indirect(struct radv_cmd_buffer *cmd_buffer, uint64_t
  * every rendering begin/end, barrier, conditional rendering begin/end,
  * vkCmdExecuteCommands and command buffer begin/reset. */
 void radv_bc250_split_batch_close(struct radv_cmd_buffer *cmd_buffer);
+void radv_bc250_idx_batch_close(struct radv_cmd_buffer *cmd_buffer, bool discard);
+void radv_bc250_idx_restore(struct radv_cmd_buffer *cmd_buffer);
+void radv_bc250_idx_storage_reset(struct radv_cmd_buffer *cmd_buffer, bool destroy);
 void radv_bc250_task_tails_free(struct radv_cmd_buffer *cmd_buffer);
 /* RADV_BC250_TASK_TAIL in DGC: the slots after the first start this far into the 1 MiB program. */
 #define BC250_DGC_TAIL_OFFSET 65536u

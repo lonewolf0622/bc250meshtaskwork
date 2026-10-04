@@ -2151,19 +2151,28 @@ radv_queue_submit(struct vk_queue *vqueue, struct vk_queue_submit *submission)
          prof_timer_ns = os_time_get_nano() - t;
    }
    if (result == VK_SUCCESS && device->bc250_env.trace_usage) {
-      static uint64_t submits, mesh_total, task_total;
-      uint64_t mesh = 0, task = 0;
+      static uint64_t submits, mesh_total, task_total, idx_direct_total, idx_indirect_total, idx_records_total;
+      uint64_t mesh = 0, task = 0, idx_direct = 0, idx_indirect = 0, idx_records = 0;
       for (uint32_t j = 0; j < submission->command_buffer_count; j++) {
          struct radv_cmd_buffer *cb = (struct radv_cmd_buffer *)submission->command_buffers[j];
          mesh += cb->bc250_diag_mesh;
          task += cb->bc250_diag_task;
+         idx_direct += cb->bc250_diag_idx_direct;
+         idx_indirect += cb->bc250_diag_idx_indirect;
+         idx_records += cb->bc250_diag_idx_records;
       }
+      __atomic_fetch_add(&idx_direct_total, idx_direct, __ATOMIC_RELAXED);
+      __atomic_fetch_add(&idx_indirect_total, idx_indirect, __ATOMIC_RELAXED);
+      __atomic_fetch_add(&idx_records_total, idx_records, __ATOMIC_RELAXED);
       uint64_t m = __atomic_fetch_add(&mesh_total, mesh, __ATOMIC_RELAXED);
       uint64_t t = __atomic_fetch_add(&task_total, task, __ATOMIC_RELAXED);
       uint64_t n = __atomic_add_fetch(&submits, 1, __ATOMIC_RELAXED);
       if (n == 1 || n % 300 == 0 || (mesh && !m) || (task && !t))
-         fprintf(stderr, "BC250_USAGE v5-diag submits=%llu mesh_only_commands=%llu task_mesh_commands=%llu (accepted submissions; not GPU completion)\n",
-                 (unsigned long long)n, (unsigned long long)(m + mesh), (unsigned long long)(t + task));
+         fprintf(stderr, "BC250_USAGE v5-diag submits=%llu mesh_only_commands=%llu task_mesh_commands=%llu idx_direct=%llu "
+                 "idx_indirect_calls=%llu idx_indirect_max_records=%llu (accepted submissions; not GPU completion)\n",
+                 (unsigned long long)n, (unsigned long long)(m + mesh), (unsigned long long)(t + task),
+                 (unsigned long long)idx_direct_total, (unsigned long long)idx_indirect_total,
+                 (unsigned long long)idx_records_total);
    }
 
 fail:

@@ -403,6 +403,7 @@ bc250_dgc_capture(struct radv_cmd_buffer *owner, const struct radv_cmd_buffer *s
       cmd->bc250_dgc_task_uploads = calloc(1, sizeof(*cmd->bc250_dgc_task_uploads));
    descriptors_ok &= !shape->template_offset || cmd->bc250_dgc_task_uploads;
    cmd->bc250_small_arena = NULL;
+   cmd->bc250_idx_arena = NULL;
    cmd->bc250_ordered_arena = 0;
    cmd->bc250_ordered_arena_size = 0;
    cmd->bc250_split_batch = NULL;

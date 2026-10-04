@@ -1564,6 +1564,7 @@ radv_device_init_compiler_info(struct radv_device *device)
    info.bc250x.lds_plan = bc250_mesh && debug_get_bool_option("RADV_BC250_MESH_LDS_PLAN", false);
    info.bc250x.lds_cover = bc250_mesh && debug_get_bool_option("RADV_BC250_MESH_LDS_COVER", false);
    info.bc250x.merged_check = bc250_mesh && debug_get_bool_option("RADV_BC250_MESH_MERGED_CHECK", false);
+   info.bc250x.idxpass = bc250_mesh && debug_get_bool_option("RADV_BC250_MESH_IDXPASS", false);
 
    device->compiler_info = info;
 }

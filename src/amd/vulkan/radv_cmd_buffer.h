@@ -532,6 +532,8 @@ struct radv_cmd_buffer_queue_state {
 struct radv_cmd_buffer {
    struct vk_command_buffer vk;
    uint64_t bc250_diag_mesh, bc250_diag_task;
+   /* RADV_BC250_MESH_IDXPASS usage: direct index-route draws, indirect calls and their maximum records. */
+   uint64_t bc250_diag_idx_direct, bc250_diag_idx_indirect, bc250_diag_idx_records;
    uint64_t bc250_trace_epoch, bc250_trace_chain, bc250_trace_producer;
    bool bc250_trace_has_target;
    const uint32_t *bc250_trace_start_buf;
@@ -583,6 +585,36 @@ struct radv_cmd_buffer {
    } *bc250_dgc_task_uploads;
    struct radv_cmd_buffer_upload upload;
    struct radv_cmd_buffer_upload *bc250_small_arena;
+   /* RADV_BC250_MESH_IDXPASS: device-local index buffers, bump allocated until reset. */
+   struct radv_cmd_buffer_upload *bc250_idx_arena; /* unused (persistent pages below) */
+   /* RADV_BC250_MESH_IDXPASS: device-local pages kept across resets (allocating them per recording cost a
+    * 32 MiB clear each frame); reset only rewinds the cursor. Freed with the command buffer. */
+   struct radeon_winsys_bo *bc250_idx_pages[16];
+   uint64_t bc250_idx_page_size[16];
+   uint32_t bc250_idx_npages, bc250_idx_page, bc250_idx_added;
+   uint64_t bc250_idx_offset;
+   struct radeon_winsys_bo *bc250_idx_pool_bo;
+   bool bc250_idx_pool_used;
+   /* RADV_BC250_MESH_IDXPASS batch: the index passes of consecutive draws are recorded into this side stream; one
+    * call reserved before the first of those draws runs them (copied into body at close) followed by one wait. */
+   struct radv_cmd_stream *bc250_idx_batch;
+   /* The side stream, kept across batches and resets (reset when a batch opens). */
+   struct radv_cmd_stream *bc250_idx_side;
+   uint32_t *bc250_idx_batch_body;
+   uint32_t *bc250_idx_batch_buf;
+   uint32_t bc250_idx_batch_capacity;
+   /* RADV_BC250_IDX_DEBUG: CPU-visible tables of the first indirect calls, printed when the buffer is reset. */
+   uint32_t *bc250_idx_dbg_map[8];
+   uint32_t bc250_idx_dbg_max[8];
+   uint32_t bc250_idx_dbg_n;
+   uint32_t *bc250_idx_dbg_pool;
+   /* RADV_BC250_MESH_IDXPASS: the index-route pipeline is bound in place of this application pipeline (rebound
+    * before anything else uses graphics state); bc250_idx_drawing marks the route's own indexed draw. */
+   struct radv_graphics_pipeline *bc250_idx_restore;
+   /* Indirect index pool: indices from pool + 256, the GPU-side count of used indices at pool. */
+   uint64_t bc250_idx_pool;
+   uint32_t bc250_idx_pool_capacity;
+   bool bc250_idx_drawing;
    uint64_t bc250_ordered_arena;
    unsigned bc250_ordered_arena_size;
    /* RADV_BC250_SPLIT_BATCH_PREP: CPU mapping of the open split-argument

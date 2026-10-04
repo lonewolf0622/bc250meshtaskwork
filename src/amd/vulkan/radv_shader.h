@@ -784,7 +784,9 @@ struct radv_compiler_info {
       uint32_t lds_cover : 1;
       /* RADV_BC250_MESH_MERGED_CHECK: one ranked check gives the adaptive shared and renumbered results. */
       uint32_t merged_check : 1;
-      uint32_t padding : 19;
+      /* RADV_BC250_MESH_IDXPASS (prototype): eligible Mesh draws become an index pass plus an indexed draw. */
+      uint32_t idxpass : 1;
+      uint32_t padding : 18;
    } bc250x;
 
    /* Debug/tracing */

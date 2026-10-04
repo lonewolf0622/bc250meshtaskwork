@@ -317,6 +317,9 @@ struct radeon_winsys {
 
    void (*cs_execute_secondary)(struct ac_cmdbuf *parent, struct ac_cmdbuf *child, bool allow_ib2);
 
+   /* Add every buffer the child references to the parent's list (no commands). */
+   void (*cs_merge_buffers)(struct ac_cmdbuf *parent, struct ac_cmdbuf *child);
+
    void (*cs_execute_ib)(struct ac_cmdbuf *cs, struct radeon_winsys_bo *bo, const uint64_t va, const uint32_t cdw,
                          const bool predicate);
 
