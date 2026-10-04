@@ -193,6 +193,8 @@ struct radv_bc250_device_env {
 
 struct radv_device {
    struct vk_device vk;
+   /* Shared reservation budget for persistent index-route storage. */
+   uint32_t bc250_idx_storage_bytes;
    struct radv_bc250_device_env bc250_env;
    /* RADV_BC250_ASYNC_COMPILE: background queue for the optimized Mesh/FS binaries of pipelines that were
     * created with an unoptimized ACO build first (radv_pipeline_graphics.c). */

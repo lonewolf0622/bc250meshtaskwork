@@ -1351,7 +1351,6 @@ radv_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer, UNUSED VkCommandB
    cmd_buffer->bc250_diag_idx_direct = cmd_buffer->bc250_diag_idx_indirect = cmd_buffer->bc250_diag_idx_records = 0;
    radv_bc250_timer_cmd_reset(cmd_buffer);
    cmd_buffer->bc250_small_arena = NULL;
-   cmd_buffer->bc250_idx_arena = NULL;
    cmd_buffer->bc250_ordered_arena = 0;
    cmd_buffer->bc250_ordered_arena_size = 0;
    radv_bc250_split_batch_close(cmd_buffer);

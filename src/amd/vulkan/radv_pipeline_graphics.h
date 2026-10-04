@@ -150,6 +150,7 @@ struct radv_graphics_pipeline {
    VkPipelineLayout bc250_idx_setup_layout;
    VkPipeline bc250_idx_cs_ind;
    uint16_t bc250_idx_vertices, bc250_idx_primitives;
+   uint32_t bc250_idx_vertex_stride;
    uint32_t bc250_payload_stride;
    bool bc250_ordered;
    uint32_t bc250_direct_split_pieces;

@@ -348,6 +348,14 @@ bc250_dgc_capture(struct radv_cmd_buffer *owner, const struct radv_cmd_buffer *s
    if (!cmd)
       return false;
    *cmd = *state;
+   /* Index storage belongs to the source recording. Capture uses the application Mesh pipeline
+    * and must neither close its batch nor reuse its persistent ranges. */
+   cmd->state.graphics_pipeline = radv_bc250_mesh_pipeline(state);
+   cmd->bc250_idx_restore = NULL;
+   cmd->bc250_idx_batch = cmd->bc250_idx_side = NULL;
+   cmd->bc250_idx_npages = cmd->bc250_idx_page = cmd->bc250_idx_added = 0;
+   cmd->bc250_idx_pool_bo = NULL;
+   cmd->bc250_idx_pool_used = cmd->bc250_idx_drawing = false;
    /* The shallow copy must not touch the owner's task tails; a capture keeps its own. */
    util_dynarray_init(&cmd->bc250_task_tails, NULL);
    cmd->bc250_dgc_tail = NULL;
@@ -403,7 +411,6 @@ bc250_dgc_capture(struct radv_cmd_buffer *owner, const struct radv_cmd_buffer *s
       cmd->bc250_dgc_task_uploads = calloc(1, sizeof(*cmd->bc250_dgc_task_uploads));
    descriptors_ok &= !shape->template_offset || cmd->bc250_dgc_task_uploads;
    cmd->bc250_small_arena = NULL;
-   cmd->bc250_idx_arena = NULL;
    cmd->bc250_ordered_arena = 0;
    cmd->bc250_ordered_arena_size = 0;
    cmd->bc250_split_batch = NULL;
