@@ -7891,6 +7891,10 @@ radv_bc250_directmesh_env(void)
       {"RADV_BC250_MESH_ALLOW_POS1", "1"}, {"RADV_BC250_MESH_SPLIT_ANY", "1"},
       {"RADV_BC250_MESH_NESTED_SLICE", "1"}, {"RADV_BC250_MESH_SAFE_SPLIT_PIECES", "1"},
       {"RADV_BC250_MESH_SAFE_ADAPTIVE", "1"},
+      /* Additional direct routes; an explicit zero still overrides this preset. */
+      {"RADV_BC250_MESH_LDS_PLAN", "1"}, {"RADV_BC250_MESH_LDS_COVER", "1"},
+      {"RADV_BC250_MESH_MERGED_CHECK", "1"}, {"RADV_BC250_MESH_PP_DIRECT", "1"},
+      {"RADV_BC250_MESH_PIECES_65", "1"}, {"RADV_BC250_MESH_IDXPASS", "1"},
       /* Never the raw route: a Mesh pipeline without a protected route is refused. */
       {"RADV_BC250_MESH_FAIL_CLOSED", "1"},
       /* More shapes admitted to the safe routes (gates PP1, TG1, PX1). */
