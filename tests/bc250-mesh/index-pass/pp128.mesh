@@ -1,0 +1,29 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x=64) in;
+layout(triangles,max_vertices=128,max_primitives=128) out;
+layout(location=1) out vec4 vtx[];
+#if 1
+layout(location=0) perprimitiveEXT flat out vec4 color[];
+#endif
+void main(){
+ uint w=gl_WorkGroupID.x;
+ SetMeshOutputsEXT(128,128);
+ vec2 tile=vec2(float(w&7u),float(w>>3))/4.0-1.0;
+ for(uint i=gl_LocalInvocationIndex;i<128;i+=64){
+  vec2 g=vec2(float(i%16u),float(i/16u))/vec2(16.0,8.0);
+  gl_MeshVerticesEXT[i].gl_Position=vec4(tile+g*0.25+vec2(0.01),0.5,1.0);
+  vtx[i]=vec4(float(i)/128.0,float(w)/64.0,0.75,1.0);
+ }
+ for(uint i=gl_LocalInvocationIndex;i<128;i+=64){
+  /* adversarial: long backjumps, repeated vertices inside and across 10-triangle intervals, top vertex unused */
+  uint M=128-1u;
+  uint a=((i&3u)==3u) ? i%2u : (i*5u+w)%M;
+  uint ob=1u+(i*7u)%(M-1u);
+  uint oc=1u+((ob-1u)+1u+(i*3u)%(M-2u))%(M-1u);
+  gl_PrimitiveTriangleIndicesEXT[i]=uvec3(a,(a+ob)%M,(a+oc)%M);
+#if 1
+  color[i]=vec4(float((i*37u+w*11u)&255u)/255.0,float((i*13u+w*7u)&255u)/255.0,float(i&7u)/7.0,1.0);
+#endif
+ }
+}

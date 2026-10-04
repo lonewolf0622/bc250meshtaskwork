@@ -1,0 +1,23 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x=64) in;
+layout(triangles,max_vertices=64,max_primitives=124) out;
+layout(location=1) out vec4 vtx[];
+void main(){
+ uint w=gl_WorkGroupID.x;
+ SetMeshOutputsEXT(64,124);
+ vec2 tile=vec2(float(w&7u),float(w>>3))/4.0-1.0;
+ uint l=gl_LocalInvocationIndex;
+ vec2 g=vec2(float(l&7u),float(l>>3))/8.0;
+ gl_MeshVerticesEXT[l].gl_Position=vec4(tile+g*0.25+vec2(0.01),0.5,1.0);
+ vtx[l]=vec4(float(l)/64.0,float(w)/64.0,0.75,1.0);
+ for(uint i=l;i<124u;i+=64u){
+  /* two 62-triangle pieces; per workgroup w%3 picks: 0 small backjumps over half the vertices (renumbered),
+   * 1 long backjumps (private corners), 2 strip over all vertices (shared in the piece that covers them) */
+  uint a,b2,c; uint k=w%3u;
+  if(k==0u){ uint s=(i*62u)/124u; a=s; b2=s+1u; c=(s>=10u && (i%3u)==0u) ? s-10u : s+2u; }
+  else if(k==1u){ a=(i*5u+w)%63u; b2=(a+1u+(i*7u)%61u)%63u; c=(a+2u+(i*3u)%59u)%63u; }
+  else { uint s=(i*61u)/123u; a=s; b2=s+1u; c=s+2u; }
+  gl_PrimitiveTriangleIndicesEXT[i]=uvec3(a,b2,c);
+ }
+}

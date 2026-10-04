@@ -1,0 +1,20 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#extension GL_KHR_shader_subgroup_ballot : require
+layout(local_size_x=64) in;
+layout(triangles,max_vertices=64,max_primitives=64) out;
+layout(location=1) out vec4 vtx[];
+void main(){
+ uint w=gl_WorkGroupID.x;
+ SetMeshOutputsEXT(64,64);
+ vec2 tile=vec2(float(w&7u),float(w>>3))/4.0-1.0;
+ uint i=gl_LocalInvocationIndex;
+ uvec4 votes=subgroupBallot(true);
+ uint population=subgroupBallotBitCount(votes);
+ vec2 g=vec2(float(i&7u),float(i>>3))/8.0;
+ gl_MeshVerticesEXT[i].gl_Position=vec4(tile+g*0.25+vec2(0.01),0.5,1.0);
+ vtx[i]=vec4(float(i)/64.0,float(w)/64.0,0.75,1.0);
+ uint a,b2,c;
+ a=((i&3u)==3u) ? i%2u : (i*5u+w)%63u; uint ob=1u+(i*7u)%62u; uint oc=1u+((ob-1u)+1u+(i*3u)%61u)%62u; b2=(a+ob)%63u; c=(a+oc)%63u;
+ gl_PrimitiveTriangleIndicesEXT[i]=population>=32u ? uvec3(a,b2,c) : uvec3(0u);
+}

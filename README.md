@@ -14,6 +14,11 @@ Turn it on with one switch:
 RADV_DIRECTMESH=1 %command%
 ```
 
+**v1.3 candidate:** adds indexed draws for eligible Mesh-only shaders, including generic flat per-primitive
+attributes, plus LDS planning, LDS coverage, merged checks, direct primitive attributes and 65-primitive pieces.
+Offline compilation and validation are complete; v1.3 hardware correctness, CTS and game performance testing
+must finish before release. The download above remains the tested v1.2 release.
+
 ## What you get
 
 - `VK_EXT_mesh_shader` (Mesh + Task) on the BC-250, usable by D3D12 games through normal Proton / vkd3d-proton.
@@ -124,8 +129,17 @@ Useful extras:
 - `RADV_DEBUG=nomeshshader`: hide Mesh shaders, so the game uses its own non-Mesh path (for comparisons).
 - `RADV_BC250_MESH_SAFE_ADAPTIVE=0`: private corners only (no shared-vertex export).
 - `RADV_BC250_MESH_SAFE_COMPACT=0`: no renumbered-vertex export.
+- `RADV_BC250_MESH_IDXPASS=0`: keep the v1.3 Mesh routes while disabling indexed Mesh draws.
 
 ## Changes
+
+- **v1.3 candidate:** eligible Mesh-only triangle pipelines can run their index work as compute and render with
+  ordinary indexed draws. Primitive attributes use private provoking corners and flat fragment inputs. Vertex
+  work that still requires another invocation, small meshlets (at most 32 vertices), single-record indirect calls,
+  externally visible memory writes and simultaneous command buffers keep the protected Mesh route. Persistent
+  index storage shares a 64 MiB device budget, with automatic Mesh fallback on allocation or indirect-pool overflow.
+  The preset also enables LDS planning and coverage, merged checks, direct primitive attributes and 65-primitive
+  pieces. All six additions can be switched off individually; see [release notes](docs/directmesh-v1.3.md).
 
 - **v1.2:** `VK_EXT_device_generated_commands` for Mesh/Task, multiview with Mesh shaders, split Mesh shaders that write
   images, indirect Task draws recorded once per call (many indirect Task draws were very slow), vertex sharing for

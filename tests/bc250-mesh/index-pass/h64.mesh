@@ -1,0 +1,17 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x=64) in;
+layout(triangles,max_vertices=64,max_primitives=64) out;
+layout(location=1) out vec4 vtx[];
+void main(){
+ uint w=gl_WorkGroupID.x;
+ SetMeshOutputsEXT(64,64);
+ vec2 tile=vec2(float(w&7u),float(w>>3))/4.0-1.0;
+ uint i=gl_LocalInvocationIndex;
+ vec2 g=vec2(float(i&7u),float(i>>3))/8.0;
+ gl_MeshVerticesEXT[i].gl_Position=vec4(tile+g*0.25+vec2(0.01),0.5,1.0);
+ vtx[i]=vec4(float(i)/64.0,float(w)/64.0,0.75,1.0);
+ uint a,b2,c;
+ uint s=(i*50u)/64u; uint q=s+s/4u; a=q; b2=min(q+1u+(i%2u),63u); c=(i>=24u && (i%4u)==0u) ? q-20u : min(q+2u,63u); if((a%5u)==4u) a=a-1u; if((b2%5u)==4u) b2=b2-1u; if((c%5u)==4u) c=c-1u;
+ gl_PrimitiveTriangleIndicesEXT[i]=uvec3(a,b2,c);
+}
