@@ -23,14 +23,18 @@ keeps the protected Mesh route. Task pipelines keep their existing routes.
 At most 32 declared vertices stay on Mesh, following the measured performance advantage of the single-wave route.
 Single-record indirect calls also stay on Mesh: repeated calls cannot amortize the setup scan. Multi-record indirect
 and indirect-count calls retain the index route. Dynamic provoking-vertex state, primitive builtins, unsupported
-fragment inputs, task payloads, external memory side effects and simultaneous-use recordings keep Mesh.
-Declining this optional route never refuses the application pipeline.
+fragment inputs, task payloads, external memory side effects, multiview render passes and simultaneous-use
+recordings keep Mesh, as do draws recorded while a pipeline-statistics or primitive-count query is active.
+Declining this optional route never refuses the application pipeline. Clears and other internal driver operations
+between draws keep the index route in place for the following draws.
 
 Index pages are private to each command buffer because recordings can remain pending or be submitted repeatedly.
 A shared device reservation bounds their total with the indirect pools to 64 MiB, within the board's 512 MiB carve-out.
-Each recording has at most 16 MiB of pages and a persistent indirect pool of at most 16 MiB. Side-stream bodies are
-bounded to 8 MiB per recording; subsequent passes run inline. The side stream, pages and pool survive resets and are
-freed with the command buffer. Insufficient optional storage returns to Mesh. Pool overflow and records outside the
+Each recording has at most 16 MiB of pages and an indirect pool of at most 16 MiB. When a command buffer is reset
+or destroyed, its pages and pool return to a device spare list (at most 32 MiB) that later recordings take from, so
+idle command buffers hold no index storage and steady-state frames create no buffers. Side-stream bodies (command
+memory) are bounded to 8 MiB per recording; subsequent passes run inline. Insufficient optional storage returns to
+Mesh. Pool overflow and records outside the
 index encoding become an ordered Mesh suffix with original DrawIDs.
 
 Debugging controls remain available: `RADV_BC250_IDX_POOL_BYTES` (4096 bytes through 16 MiB),
@@ -47,7 +51,10 @@ other capture writes external memory and conservatively keeps Mesh.
 
 PROVEN offline: independent VS reference shaders and both static provoking-vertex modes compile and record cleanly;
 indices-only ballot work is admitted, ballot-dependent vertex work is declined, and exhausting the device storage
-budget keeps recording valid through Mesh fallback. Noop execution does not render pixels or measure GPU speed.
+budget keeps recording valid through Mesh fallback. A clear between two draws keeps both on the index route, a
+multiview pipeline is declined, an active statistics query keeps the draw on Mesh, and 80 recordings whose command
+buffers are freed or reset reuse storage without fallback. Noop execution does not render pixels or measure GPU
+speed.
 
 UNPROVEN for this candidate: hardware image identity, Mesh CTS, game FPS and performance with the bounded pools.
 Earlier index-route hardware checks passed and common larger meshlets improved, but those measurements precede
