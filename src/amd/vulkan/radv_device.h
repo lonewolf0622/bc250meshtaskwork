@@ -195,6 +195,15 @@ struct radv_device {
    struct vk_device vk;
    /* Shared reservation budget for persistent index-route storage. */
    uint32_t bc250_idx_storage_bytes;
+   /* Index-route storage returned by reset or destroyed command buffers, reused by the next recording (counted in
+    * the reservation budget while kept here). */
+   simple_mtx_t bc250_idx_spare_mtx;
+   struct {
+      struct radeon_winsys_bo *bo;
+      uint32_t size;
+      bool pool;
+   } bc250_idx_spare[32];
+   uint32_t bc250_idx_spare_count, bc250_idx_spare_bytes;
    struct radv_bc250_device_env bc250_env;
    /* RADV_BC250_ASYNC_COMPILE: background queue for the optimized Mesh/FS binaries of pipelines that were
     * created with an unoptimized ACO build first (radv_pipeline_graphics.c). */

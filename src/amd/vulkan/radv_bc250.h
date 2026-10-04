@@ -33,6 +33,7 @@ void radv_bc250_split_batch_close(struct radv_cmd_buffer *cmd_buffer);
 void radv_bc250_idx_batch_close(struct radv_cmd_buffer *cmd_buffer, bool discard);
 void radv_bc250_idx_restore(struct radv_cmd_buffer *cmd_buffer);
 void radv_bc250_idx_storage_reset(struct radv_cmd_buffer *cmd_buffer, bool destroy);
+void radv_bc250_idx_device_finish(struct radv_device *device);
 void radv_bc250_task_tails_free(struct radv_cmd_buffer *cmd_buffer);
 /* RADV_BC250_TASK_TAIL in DGC: the slots after the first start this far into the 1 MiB program. */
 #define BC250_DGC_TAIL_OFFSET 65536u

@@ -585,9 +585,9 @@ struct radv_cmd_buffer {
    } *bc250_dgc_task_uploads;
    struct radv_cmd_buffer_upload upload;
    struct radv_cmd_buffer_upload *bc250_small_arena;
-   /* RADV_BC250_MESH_IDXPASS: device-local index buffers, bump allocated until reset. */
-   /* RADV_BC250_MESH_IDXPASS: device-local pages kept across resets (allocating them per recording cost a
-    * 32 MiB clear each frame); reset only rewinds the cursor. Freed with the command buffer. */
+   /* RADV_BC250_MESH_IDXPASS: device-local index pages, bump allocated by this recording. Reset and destroy
+    * return them (and the pool) to the device spare list, so recordings reuse them instead of creating buffers
+    * (a new buffer cost a clear each frame). */
    struct radeon_winsys_bo *bc250_idx_pages[16];
    uint64_t bc250_idx_page_size[16];
    uint32_t bc250_idx_npages, bc250_idx_page, bc250_idx_added;

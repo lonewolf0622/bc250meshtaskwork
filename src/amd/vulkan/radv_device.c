@@ -1621,6 +1621,7 @@ radv_destroy_device(struct radv_device *device, const VkAllocationCallbacks *pAl
       device->bc250_prof_file = NULL;
    }
    radv_bc250_timer_finish(device);
+   radv_bc250_idx_device_finish(device);
    if (device->bc250_async)
       util_queue_destroy(&device->bc250_async_queue);
    radv_device_finish_utrace(device);

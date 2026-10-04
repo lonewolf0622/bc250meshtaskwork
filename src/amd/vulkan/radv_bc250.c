@@ -15,6 +15,7 @@
 #include "radv_constants.h"
 #include "radv_cs.h"
 #include "tools/radv_rmv.h"
+#include "vk_render_pass.h"
 #include "vk_shader_module.h"
 
 #include "util/os_time.h"
@@ -40,6 +41,7 @@ void
 radv_bc250_device_env_init(struct radv_device *device, const struct radv_physical_device *pdev)
 {
    struct radv_bc250_device_env *env = &device->bc250_env;
+   simple_mtx_init(&device->bc250_idx_spare_mtx, mtx_plain);
    env->pipeline_plan = pdev->bc250_native_mesh && !pdev->bc250_native_task &&
       pdev->info.family == CHIP_GFX1013 && debug_get_bool_option("RADV_BC250_PIPELINE_PLAN", false);
    env->gpl_source_link = env->pipeline_plan && debug_get_bool_option("RADV_BC250_GPL_SOURCE_LINK", false);
@@ -5511,7 +5513,10 @@ bc250_idx_build_cs(struct radv_device *device, const nir_shader *mesh, bool indi
    bc250_ordered_barrier(&b);
    /* Unused primitive slots: degenerate triangles on the workgroup's first vertex (no fragments). */
    b.cursor = nir_after_impl(impl);
-   bc250_ordered_barrier(&b);
+   /* Also orders the application's own index stores (slots at or past its primitive count are allowed) before the
+    * degenerate fill of other waves. */
+   nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP, .memory_scope = SCOPE_WORKGROUP,
+               .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared | nir_var_mem_global);
    nir_def *pc = nir_load_var(&b, count);
    nir_def *lane = nir_load_local_invocation_index(&b);
    for (unsigned first = 0; first < P; first += threads) {
@@ -7948,6 +7953,13 @@ radv_bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline 
    }
    if (!ms_info || !fs_info)
       return;
+   /* The index route compiles its shaders for view 0 only. */
+   const VkPipelineRenderingCreateInfo *rendering = vk_get_pipeline_rendering_create_info(pCreateInfo);
+   if (rendering && rendering->viewMask) {
+      if (trace)
+         fprintf(stderr, "BC250 MESH IDXPASS: declined (multiview)\n");
+      return;
+   }
    VK_FROM_HANDLE(radv_pipeline_layout, layout, pCreateInfo->layout);
    struct radv_shader_stage ms = {0}, fs = {0};
    const struct radv_shader_stage_key ms_key =
@@ -8124,12 +8136,70 @@ out:
    ralloc_free(frag);
 }
 
-/* Command buffers may be pending concurrently, or submitted repeatedly, so their written ranges must stay
- * private until destruction. Share a device-wide reservation budget instead of aliasing their storage.
- * The 512 MiB carve-out keeps at most 64 MiB for this optional route; allocation failure takes Mesh.
- * Pages and the side stream persist across resets, with a 16 MiB page limit per command buffer. */
+/* Command buffers may be pending concurrently, or submitted repeatedly, so their written ranges stay private to
+ * the recording until it is reset or destroyed (neither is allowed while it is pending). Share a device-wide
+ * reservation budget instead of aliasing their storage: the 512 MiB carve-out keeps at most 64 MiB for this
+ * optional route, and allocation failure takes Mesh. A reset or destroyed command buffer returns its pages and
+ * pool to a device spare list that the next recording takes from, so steady-state frames create no buffers and
+ * idle command buffers hold no storage. The spare list keeps at most 32 MiB; the rest is freed. A recording uses
+ * at most 16 MiB of pages. The side stream (command memory, not counted here) persists with its command buffer. */
 #define BC250_IDX_STORAGE_BYTES (64u << 20)
 #define BC250_IDX_PAGE_BYTES (16u << 20)
+#define BC250_IDX_SPARE_BYTES (32u << 20)
+
+static void
+bc250_idx_spare_put(struct radv_device *device, struct radeon_winsys_bo *bo, uint32_t size, bool pool)
+{
+   simple_mtx_lock(&device->bc250_idx_spare_mtx);
+   const unsigned n = device->bc250_idx_spare_count;
+   if (n < ARRAY_SIZE(device->bc250_idx_spare) && size <= BC250_IDX_SPARE_BYTES - device->bc250_idx_spare_bytes) {
+      device->bc250_idx_spare[n].bo = bo;
+      device->bc250_idx_spare[n].size = size;
+      device->bc250_idx_spare[n].pool = pool;
+      device->bc250_idx_spare_count = n + 1;
+      device->bc250_idx_spare_bytes += size;
+      bo = NULL;
+   }
+   simple_mtx_unlock(&device->bc250_idx_spare_mtx);
+   if (bo) {
+      radv_bo_destroy(device, NULL, bo);
+      p_atomic_add(&device->bc250_idx_storage_bytes, -(int32_t)size);
+   }
+}
+
+/* The largest spare buffer of the kind with min_size <= size <= max_size, or NULL. */
+static struct radeon_winsys_bo *
+bc250_idx_spare_take(struct radv_device *device, uint32_t min_size, uint32_t max_size, bool pool, uint32_t *size)
+{
+   struct radeon_winsys_bo *bo = NULL;
+   simple_mtx_lock(&device->bc250_idx_spare_mtx);
+   int best = -1;
+   for (unsigned i = 0; i < device->bc250_idx_spare_count; i++) {
+      const uint32_t s = device->bc250_idx_spare[i].size;
+      if (device->bc250_idx_spare[i].pool == pool && s >= min_size && s <= max_size &&
+          (best < 0 || s > device->bc250_idx_spare[best].size))
+         best = i;
+   }
+   if (best >= 0) {
+      bo = device->bc250_idx_spare[best].bo;
+      *size = device->bc250_idx_spare[best].size;
+      device->bc250_idx_spare_bytes -= *size;
+      device->bc250_idx_spare[best] = device->bc250_idx_spare[--device->bc250_idx_spare_count];
+   }
+   simple_mtx_unlock(&device->bc250_idx_spare_mtx);
+   return bo;
+}
+
+void
+radv_bc250_idx_device_finish(struct radv_device *device)
+{
+   for (unsigned i = 0; i < device->bc250_idx_spare_count; i++) {
+      radv_bo_destroy(device, NULL, device->bc250_idx_spare[i].bo);
+      p_atomic_add(&device->bc250_idx_storage_bytes, -(int32_t)device->bc250_idx_spare[i].size);
+   }
+   device->bc250_idx_spare_count = device->bc250_idx_spare_bytes = 0;
+   simple_mtx_destroy(&device->bc250_idx_spare_mtx);
+}
 
 static bool
 bc250_idx_reserve(struct radv_device *device, uint32_t bytes)
@@ -8168,16 +8238,20 @@ bc250_idx_alloc(struct radv_cmd_buffer *cmd_buffer, uint64_t bytes, uint64_t *ad
    uint64_t used = 0;
    for (unsigned p = 0; p < cmd_buffer->bc250_idx_npages; p++)
       used += cmd_buffer->bc250_idx_page_size[p];
-   const uint64_t size = MAX2(ALIGN_POT(bytes, 4096), 1ull << 20);
-   if (size > BC250_IDX_PAGE_BYTES - used || !bc250_idx_reserve(device, size))
+   uint32_t size = MAX2(ALIGN_POT(bytes, 4096), 1ull << 20);
+   if (size > BC250_IDX_PAGE_BYTES - used)
       return false;
-   struct radeon_winsys_bo *bo;
-   VkResult result = radv_bo_create(device, &cmd_buffer->vk.base, size, 4096, RADEON_DOMAIN_VRAM,
-                                    RADEON_FLAG_NO_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING,
-                                    RADV_BO_PRIORITY_SCRATCH, 0, true, &bo);
-   if (result != VK_SUCCESS) {
-      p_atomic_add(&device->bc250_idx_storage_bytes, -(int32_t)size);
-      return false;
+   struct radeon_winsys_bo *bo = bc250_idx_spare_take(device, size, BC250_IDX_PAGE_BYTES - used, false, &size);
+   if (!bo) {
+      if (!bc250_idx_reserve(device, size))
+         return false;
+      VkResult result = radv_bo_create(device, NULL, size, 4096, RADEON_DOMAIN_VRAM,
+                                       RADEON_FLAG_NO_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING,
+                                       RADV_BO_PRIORITY_SCRATCH, 0, true, &bo);
+      if (result != VK_SUCCESS) {
+         p_atomic_add(&device->bc250_idx_storage_bytes, -(int32_t)size);
+         return false;
+      }
    }
    const unsigned p = cmd_buffer->bc250_idx_npages++;
    cmd_buffer->bc250_idx_pages[p] = bo;
@@ -8187,7 +8261,8 @@ bc250_idx_alloc(struct radv_cmd_buffer *cmd_buffer, uint64_t bytes, uint64_t *ad
    return bc250_idx_alloc(cmd_buffer, bytes, address);
 }
 
-/* Reset: rewind (the pages are kept); destroy: free. */
+/* Reset or destroy (the command buffer is not pending): pages and pool go to the device spare list; destroy also
+ * frees the side stream. */
 void
 radv_bc250_idx_storage_reset(struct radv_cmd_buffer *cmd_buffer, bool destroy)
 {
@@ -8196,18 +8271,23 @@ radv_bc250_idx_storage_reset(struct radv_cmd_buffer *cmd_buffer, bool destroy)
       if (cmd_buffer->bc250_idx_side)
          radv_destroy_cmd_stream(device, cmd_buffer->bc250_idx_side);
       cmd_buffer->bc250_idx_side = NULL;
-      for (unsigned p = 0; p < cmd_buffer->bc250_idx_npages; p++) {
-         radv_bo_destroy(device, &cmd_buffer->vk.base, cmd_buffer->bc250_idx_pages[p]);
-         p_atomic_add(&device->bc250_idx_storage_bytes, -(int32_t)cmd_buffer->bc250_idx_page_size[p]);
-      }
-      if (cmd_buffer->bc250_idx_pool_bo) {
-         radv_bo_destroy(device, &cmd_buffer->vk.base, cmd_buffer->bc250_idx_pool_bo);
-         p_atomic_add(&device->bc250_idx_storage_bytes, -(int32_t)(cmd_buffer->bc250_idx_pool_capacity * 4 + 256));
-      }
-      cmd_buffer->bc250_idx_npages = 0;
-      cmd_buffer->bc250_idx_pool_bo = NULL;
-      cmd_buffer->bc250_idx_pool = 0;
    }
+   for (unsigned p = 0; p < cmd_buffer->bc250_idx_npages; p++)
+      bc250_idx_spare_put(device, cmd_buffer->bc250_idx_pages[p], cmd_buffer->bc250_idx_page_size[p], false);
+   cmd_buffer->bc250_idx_npages = 0;
+   if (cmd_buffer->bc250_idx_pool_bo) {
+      const uint32_t pool_bytes = cmd_buffer->bc250_idx_pool_capacity * 4 + 256;
+      if (getenv("RADV_BC250_IDX_DEBUG")) {
+         /* RADV_BC250_IDX_DEBUG keeps its mapped pool private. */
+         radv_bo_destroy(device, NULL, cmd_buffer->bc250_idx_pool_bo);
+         p_atomic_add(&device->bc250_idx_storage_bytes, -(int32_t)pool_bytes);
+         cmd_buffer->bc250_idx_dbg_pool = NULL;
+      } else {
+         bc250_idx_spare_put(device, cmd_buffer->bc250_idx_pool_bo, pool_bytes, true);
+      }
+   }
+   cmd_buffer->bc250_idx_pool_bo = NULL;
+   cmd_buffer->bc250_idx_pool = 0;
    cmd_buffer->bc250_idx_page = 0;
    cmd_buffer->bc250_idx_offset = 0;
    cmd_buffer->bc250_idx_added = 0;
@@ -8254,6 +8334,7 @@ bc250_idx_emit_compute(struct radv_cmd_buffer *cmd_buffer, VkPipeline compute, c
    compute_descriptors->dirty_dynamic = true;
    compute_descriptors->dirty_heaps |= compute_descriptors->valid_heaps;
    struct radv_compute_pipeline *old = cmd_buffer->state.compute_pipeline;
+   struct radv_shader_object *old_object = cmd_buffer->state.shader_objs[MESA_SHADER_COMPUTE];
    uint8_t saved[128];
    assert(size <= sizeof(saved));
    memcpy(saved, cmd_buffer->push_constants, size);
@@ -8261,8 +8342,14 @@ bc250_idx_emit_compute(struct radv_cmd_buffer *cmd_buffer, VkPipeline compute, c
    memcpy(cmd_buffer->push_constants, constants, size);
    cmd_buffer->push_constant_stages |= VK_SHADER_STAGE_COMPUTE_BIT;
    bc250_chain_dispatch(cmd_buffer, dispatch, "idx_pass");
-   if (old)
+   if (old_object) {
+      /* Binding the pass's pipeline unbound the application's compute shader object. */
+      const VkShaderStageFlagBits stage = VK_SHADER_STAGE_COMPUTE_BIT;
+      const VkShaderEXT object = radv_shader_object_to_handle(old_object);
+      radv_CmdBindShadersEXT(handle, 1, &stage, &object);
+   } else if (old) {
       radv_CmdBindPipeline(handle, VK_PIPELINE_BIND_POINT_COMPUTE, radv_pipeline_to_handle(&old->base));
+   }
    memcpy(cmd_buffer->push_constants, saved, size);
    cmd_buffer->push_constant_stages |= VK_SHADER_STAGE_ALL;
    *compute_descriptors = saved_compute_descriptors;
@@ -8423,7 +8510,10 @@ void
 radv_bc250_idx_restore(struct radv_cmd_buffer *cmd_buffer)
 {
    struct radv_graphics_pipeline *app = cmd_buffer->bc250_idx_restore;
-   if (!app || cmd_buffer->bc250_idx_drawing)
+   /* Meta operations (clears, resolves, ...) save the route's pipeline and rebind it when they end; the binding hook
+    * keeps it standing in for the application's. Restoring inside the meta operation would replace the meta
+    * pipeline's draw state and drop the application's pipeline for the following Mesh draws. */
+   if (!app || cmd_buffer->bc250_idx_drawing || cmd_buffer->state.meta.inside_meta_op)
       return;
    cmd_buffer->bc250_idx_restore = NULL;
    radv_CmdBindPipeline(radv_cmd_buffer_to_handle(cmd_buffer), VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -8491,6 +8581,17 @@ bc250_idx_draw_direct(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_p
    bc250_idx_draw_end(cmd_buffer, &saved);
 }
 
+/* Pipeline-statistics and primitive-count queries would count the route's index passes and padded triangles instead
+ * of Mesh work: while one is active, draws keep the Mesh route. */
+static bool
+bc250_idx_counting_queries(const struct radv_cmd_buffer *cmd_buffer)
+{
+   const struct radv_cmd_state *st = &cmd_buffer->state;
+   return st->active_pipeline_queries || st->active_emulated_pipeline_queries || st->active_pipeline_ace_queries ||
+          st->active_prims_gen_queries || st->active_emulated_prims_gen_queries || st->active_prims_xfb_queries ||
+          st->active_emulated_prims_xfb_queries;
+}
+
 /* Indirect index route: a setup pass validates the records and places them in the command buffer's index pool,
  * one indirect index pass covers every record, one indexed indirect-count draw renders them with DrawID = record.
  * Records that do not fit in the pool (from the first one that does not fit) go to the Mesh route in a second
@@ -8508,7 +8609,8 @@ radv_bc250_draw_idx_indirect(struct radv_cmd_buffer *cmd_buffer, struct radv_gra
    if (!max_count)
       return true;
    if ((cmd_buffer->usage_flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT) ||
-       cmd_buffer->bc250_dgc_upload_va || max_count > 65536 || !pipeline->bc250_idx_cs_ind)
+       cmd_buffer->bc250_dgc_upload_va || max_count > 65536 || !pipeline->bc250_idx_cs_ind ||
+       bc250_idx_counting_queries(cmd_buffer))
       return false;
    /* Repeated single-record calls cannot amortize the setup scan; keep all on Mesh.
     * Multi-record calls retain the measured index-route benefit. */
@@ -8516,7 +8618,7 @@ radv_bc250_draw_idx_indirect(struct radv_cmd_buffer *cmd_buffer, struct radv_gra
       return false;
    cmd_buffer->bc250_diag_idx_indirect++;
    cmd_buffer->bc250_diag_idx_records += max_count;
-   /* The pool is kept across resets; the first setup of each recording starts it empty. */
+   /* One pool per recording (from the device spare list when possible); its first setup starts it empty. */
    if (!cmd_buffer->bc250_idx_pool_bo) {
       /* RADV_BC250_IDX_POOL_BYTES (debug): a smaller pool exercises the Mesh fallback. */
       static uint64_t pool_bytes = 0;
@@ -8524,14 +8626,21 @@ radv_bc250_draw_idx_indirect(struct radv_cmd_buffer *cmd_buffer, struct radv_gra
          pool_bytes = CLAMP(debug_get_num_option("RADV_BC250_IDX_POOL_BYTES", BC250_IDX_POOL_BYTES), 4096,
                             BC250_IDX_POOL_MAX_BYTES);
       pool_bytes = ALIGN_POT(pool_bytes, 4096);
-      if (!bc250_idx_reserve(device, pool_bytes))
-         return false;
       const bool dbg = getenv("RADV_BC250_IDX_DEBUG") != NULL;
-      if (radv_bo_create(device, &cmd_buffer->vk.base, pool_bytes, 4096, dbg ? RADEON_DOMAIN_GTT : RADEON_DOMAIN_VRAM,
-                         (dbg ? RADEON_FLAG_CPU_ACCESS : RADEON_FLAG_NO_CPU_ACCESS) | RADEON_FLAG_NO_INTERPROCESS_SHARING,
-                         RADV_BO_PRIORITY_SCRATCH, 0, true, &cmd_buffer->bc250_idx_pool_bo) != VK_SUCCESS) {
-         p_atomic_add(&device->bc250_idx_storage_bytes, -(int32_t)pool_bytes);
-         return false;
+      uint32_t spare_bytes;
+      cmd_buffer->bc250_idx_pool_bo =
+         dbg ? NULL : bc250_idx_spare_take(device, pool_bytes, pool_bytes, true, &spare_bytes);
+      if (!cmd_buffer->bc250_idx_pool_bo) {
+         if (!bc250_idx_reserve(device, pool_bytes))
+            return false;
+         if (radv_bo_create(device, NULL, pool_bytes, 4096, dbg ? RADEON_DOMAIN_GTT : RADEON_DOMAIN_VRAM,
+                            (dbg ? RADEON_FLAG_CPU_ACCESS : RADEON_FLAG_NO_CPU_ACCESS) |
+                               RADEON_FLAG_NO_INTERPROCESS_SHARING,
+                            RADV_BO_PRIORITY_SCRATCH, 0, true, &cmd_buffer->bc250_idx_pool_bo) != VK_SUCCESS) {
+            cmd_buffer->bc250_idx_pool_bo = NULL;
+            p_atomic_add(&device->bc250_idx_storage_bytes, -(int32_t)pool_bytes);
+            return false;
+         }
       }
       cmd_buffer->bc250_idx_pool = radv_buffer_get_va(cmd_buffer->bc250_idx_pool_bo);
       cmd_buffer->bc250_idx_pool_capacity = (pool_bytes - 256) / 4;
@@ -8630,7 +8739,8 @@ radv_bc250_draw_idx(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pip
       return true;
    if (x > 0xffff || y > 0xffff || groups * pipeline->bc250_idx_vertex_stride >= (1ull << 32) || groups * P * 12 > (1ull << 31))
       return false;
-   if (cmd_buffer->bc250_dgc_upload_va || (cmd_buffer->usage_flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT))
+   if (cmd_buffer->bc250_dgc_upload_va || (cmd_buffer->usage_flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT) ||
+       bc250_idx_counting_queries(cmd_buffer))
       return false;
    uint64_t ib_va;
    unsigned coffset;
