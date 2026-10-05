@@ -12823,7 +12823,7 @@ new file mode 100644
 +The suite covers the seven existing connectivity shapes, flat primitive attributes at 64 and 128 vertices,
 +first and last provoking vertices, index-only ballots and rejection of ballot-dependent vertex work. Independent
 +VS shaders compute the same geometry and attributes without the Mesh converter. A memory-pressure check retains
-+80 independent command buffers and verifies automatic fallback after the 64 MiB reservation is exhausted.
++160 independent command buffers and verifies automatic fallback after the 128 MiB reservation is exhausted.
 +Noop runs compile and record commands; they neither render images nor measure hardware performance.
 +
 +The build products (`*.spv` and `index_gate`) are generated and excluded from source control. Frozen hardware kits
@@ -13182,7 +13182,7 @@ new file mode 100644
 +   VkCommandBufferAllocateInfo cbai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=pool,
 +      .level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
 +   unsigned recordings=getenv("INDEX_RECORDINGS")?atoi(getenv("INDEX_RECORDINGS")):1;
-+   if (!recordings || recordings>96) return 2;
++   if (!recordings || recordings>192) return 2;
 +   VkCommandBuffer cb=VK_NULL_HANDLE;
 +   for (unsigned recording=0; recording<recordings; recording++) {
 +   CK(vkAllocateCommandBuffers(dev,&cbai,&cb));
@@ -13545,9 +13545,9 @@ new file mode 100755
 +            if r.returncode or re.search(r'validation failed|ACO ERROR|VALIDATION:.*Error|Assertion', log) or applied != expected:
 +                raise SystemExit(f'FAIL {tag} rc={r.returncode} applied={applied} expected={expected}; see {out}')
 +            print(f'PASS {tag} applied={applied}', flush=True)
-+# Retain enough independent recordings to exhaust the shared reservation budget.
++# Retain enough independent recordings (1 MiB of pages each) to exhaust the 128 MiB shared reservation budget.
 +# Only the final buffer is submitted to the noop device; no GPU nodes are exposed.
-+env.update(RADV_BC250_MESH_IDXPASS='1', INDEX_RECORDINGS='80', BC250_IDX_TRACE='1')
++env.update(RADV_BC250_MESH_IDXPASS='1', INDEX_RECORDINGS='160', BC250_IDX_TRACE='1')
 +env.pop('INDEX_LAST_VERTEX', None)
 +env.pop('INDEX_REFERENCE', None)
 +cmd = ['bwrap', '--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc', '--tmpfs', '/tmp',

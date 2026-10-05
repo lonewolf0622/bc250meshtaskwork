@@ -12608,12 +12608,12 @@ new file mode 100644
 +
 +/* Command buffers may be pending concurrently, or submitted repeatedly, so their written ranges stay private to
 + * the recording until it is reset or destroyed (neither is allowed while it is pending). Share a device-wide
-+ * reservation budget instead of aliasing their storage: the 512 MiB carve-out keeps at most 64 MiB for this
++ * reservation budget instead of aliasing their storage: the 512 MiB carve-out keeps at most 128 MiB for this
 + * optional route, and allocation failure takes Mesh. A reset or destroyed command buffer returns its pages and
 + * pool to a device spare list that the next recording takes from, so steady-state frames create no buffers and
 + * idle command buffers hold no storage. The spare list keeps at most 32 MiB; the rest is freed. A recording uses
 + * at most 16 MiB of pages. The side stream (command memory, not counted here) persists with its command buffer. */
-+#define BC250_IDX_STORAGE_BYTES (64u << 20)
++#define BC250_IDX_STORAGE_BYTES (128u << 20)
 +#define BC250_IDX_PAGE_BYTES (16u << 20)
 +#define BC250_IDX_SPARE_BYTES (32u << 20)
 +
