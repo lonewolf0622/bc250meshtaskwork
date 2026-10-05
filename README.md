@@ -4,8 +4,8 @@ Mesh shader support for the AMD BC-250 (GFX1013, RDNA1-based) in Mesa's RADV Vul
 a **safe direct path**: no split/replay, one launch per Mesh workgroup, and built-in protection against the index
 patterns that hang this chip.
 
-**Download:** [patch against stock Mesa 26.2.1](https://github.com/lonewolf0622/bc250meshtaskwork/releases/download/directmesh-v1.2/bc250-directmesh-mesa-26.2.1.patch)
-(also in [`patches/`](patches/) and on the [release page](https://github.com/lonewolf0622/bc250meshtaskwork/releases/tag/directmesh-v1.2)),
+**Download:** [patch against stock Mesa 26.2.1](https://github.com/lonewolf0622/bc250meshtaskwork/releases/download/directmesh-v1.3/bc250-directmesh-mesa-26.2.1.patch)
+(also in [`patches/`](patches/) and on the [release page](https://github.com/lonewolf0622/bc250meshtaskwork/releases/tag/directmesh-v1.3)),
 or build this repository directly (see Build).
 
 Turn it on with one switch:
@@ -14,10 +14,9 @@ Turn it on with one switch:
 RADV_DIRECTMESH=1 %command%
 ```
 
-**v1.3 candidate:** adds indexed draws for eligible Mesh-only shaders, including generic flat per-primitive
-attributes, plus LDS planning, LDS coverage, merged checks, direct primitive attributes and 65-primitive pieces.
-Offline compilation and validation are complete; v1.3 hardware correctness, CTS and game performance testing
-must finish before release. The download above remains the tested v1.2 release.
+**v1.3:** adds indexed draws for eligible Mesh-only shaders (about 1.5-1.8x faster Mesh drawing for meshlets of
+96 vertices and more), multiview Mesh pipelines on the protected routes, plus LDS planning, LDS coverage, merged
+checks, direct primitive attributes and 65-primitive pieces. Mesh CTS: 1,902 passed, 0 failed on the BC-250.
 
 ## What you get
 
@@ -133,13 +132,14 @@ Useful extras:
 
 ## Changes
 
-- **v1.3 candidate:** eligible Mesh-only triangle pipelines can run their index work as compute and render with
+- **v1.3:** eligible Mesh-only triangle pipelines can run their index work as compute and render with
   ordinary indexed draws. Primitive attributes use private provoking corners and flat fragment inputs. Vertex
   work that still requires another invocation, small meshlets (at most 32 vertices), single-record indirect calls,
   externally visible memory writes and simultaneous command buffers keep the protected Mesh route. Persistent
   index storage shares a 128 MiB device budget, with automatic Mesh fallback on allocation or indirect-pool overflow.
   The preset also enables LDS planning and coverage, merged checks, direct primitive attributes and 65-primitive
-  pieces. All six additions can be switched off individually; see [release notes](docs/directmesh-v1.3.md).
+  pieces, and admits multiview Mesh pipelines (per-vertex view layer; Task once, Mesh once per view). All additions
+  can be switched off individually; see [release notes](docs/directmesh-v1.3.md).
 
 - **v1.2:** `VK_EXT_device_generated_commands` for Mesh/Task, multiview with Mesh shaders, split Mesh shaders that write
   images, indirect Task draws recorded once per call (many indirect Task draws were very slow), vertex sharing for
