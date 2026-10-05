@@ -25,7 +25,12 @@ Single-record indirect calls also stay on Mesh: repeated calls cannot amortize t
 and indirect-count calls retain the index route. Dynamic provoking-vertex state, primitive builtins, unsupported
 fragment inputs, task payloads, external memory side effects, multiview render passes and simultaneous-use
 recordings keep Mesh, as do draws recorded while a pipeline-statistics or primitive-count query is active.
-Declining this optional route never refuses the application pipeline. Clears and other internal driver operations
+Declining this optional route never refuses the application pipeline.
+
+Multiview: `RADV_DIRECTMESH=1` also sets `RADV_BC250_MESH_MULTIVIEW_VTX=1` (the view layer is a per-vertex export, as
+GFX10.1 has no layer field in the primitive export) and `RADV_BC250_TASK_MULTIVIEW=1` (Task+Mesh draws run the Task
+stage once and the Mesh stage once per view). Mesh pipelines with a view mask are then admitted on the protected
+routes instead of being refused. The index route stays off for multiview pipelines. Clears and other internal driver operations
 between draws keep the index route in place for the following draws.
 
 Index pages are private to each command buffer because recordings can remain pending or be submitted repeatedly.

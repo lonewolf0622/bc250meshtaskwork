@@ -7912,6 +7912,9 @@ radv_bc250_directmesh_env(void)
       /* Skip adaptive checks whose result is already known (gate LC1). */
       {"RADV_BC250_MESH_LEAN_CHECK", "1"},
       {"RADV_BC250_EXPOSE_MULTIVIEW_MESH", "1"}, {"RADV_BC250_MESH_SPLIT_STORES", "1"},
+      /* Multiview Mesh: the view layer is a per-vertex export (GFX10.1 has no layer in the primitive export), and
+       * Task+Mesh draws run the Task stage once and the Mesh stage once per view. */
+      {"RADV_BC250_MESH_MULTIVIEW_VTX", "1"}, {"RADV_BC250_TASK_MULTIVIEW", "1"},
       {"RADV_BC250_TASK_TAIL", "1"}, {"RADV_BC250_EXPOSE_DGC", "1"},
       /* GDDR6-class settings for this APU-reported GPU: wider NGG culling admission, 32B DCC blocks. */
       {"RADV_BC250_NGGC_WIDE", "1"}, {"RADV_BC250_DCC_32B", "1"},
