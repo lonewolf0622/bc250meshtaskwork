@@ -8205,7 +8205,7 @@ radv_bc250_idx_device_finish(struct radv_device *device)
 }
 
 static bool
-bc250_idx_reserve(struct radv_device *device, uint32_t bytes)
+bc250_idx_reserve_once(struct radv_device *device, uint32_t bytes)
 {
    uint32_t old = p_atomic_read(&device->bc250_idx_storage_bytes);
    do {
@@ -8216,6 +8216,30 @@ bc250_idx_reserve(struct radv_device *device, uint32_t bytes)
          return true;
       old = seen;
    } while (true);
+}
+
+/* Spare buffers count against the budget. When it is exhausted, free spare buffers (which the caller could not reuse:
+ * the wrong kind or size) until the reservation fits, instead of falling back to Mesh while idle buffers hold it. */
+static bool
+bc250_idx_reserve(struct radv_device *device, uint32_t bytes)
+{
+   while (!bc250_idx_reserve_once(device, bytes)) {
+      struct radeon_winsys_bo *bo = NULL;
+      uint32_t size = 0;
+      simple_mtx_lock(&device->bc250_idx_spare_mtx);
+      if (device->bc250_idx_spare_count) {
+         const unsigned last = --device->bc250_idx_spare_count;
+         bo = device->bc250_idx_spare[last].bo;
+         size = device->bc250_idx_spare[last].size;
+         device->bc250_idx_spare_bytes -= size;
+      }
+      simple_mtx_unlock(&device->bc250_idx_spare_mtx);
+      if (!bo)
+         return false;
+      radv_bo_destroy(device, NULL, bo);
+      p_atomic_add(&device->bc250_idx_storage_bytes, -(int32_t)size);
+   }
+   return true;
 }
 static bool
 bc250_idx_alloc(struct radv_cmd_buffer *cmd_buffer, uint64_t bytes, uint64_t *address)
@@ -8634,8 +8658,11 @@ radv_bc250_draw_idx_indirect(struct radv_cmd_buffer *cmd_buffer, struct radv_gra
       cmd_buffer->bc250_idx_pool_bo =
          dbg ? NULL : bc250_idx_spare_take(device, pool_bytes, pool_bytes, true, &spare_bytes);
       if (!cmd_buffer->bc250_idx_pool_bo) {
-         if (!bc250_idx_reserve(device, pool_bytes))
+         if (!bc250_idx_reserve(device, pool_bytes)) {
+            if (getenv("BC250_IDX_TRACE"))
+               fprintf(stderr, "BC250 IDX: indirect Mesh fallback (storage unavailable)\n");
             return false;
+         }
          if (radv_bo_create(device, NULL, pool_bytes, 4096, dbg ? RADEON_DOMAIN_GTT : RADEON_DOMAIN_VRAM,
                             (dbg ? RADEON_FLAG_CPU_ACCESS : RADEON_FLAG_NO_CPU_ACCESS) |
                                RADEON_FLAG_NO_INTERPROCESS_SHARING,
