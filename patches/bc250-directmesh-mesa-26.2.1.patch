@@ -19600,7 +19600,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
        return;
  
     for (uint32_t i = 0; i < libs_info->libraryCount; i++) {
-@@ -2431,15 +2475,195 @@
+@@ -2431,15 +2475,201 @@
     return binary_stages == active_stages;
  }
  
@@ -19701,6 +19701,12 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
 +   return VK_SUCCESS;
 +}
 +
++/* Multiview Mesh pipelines normally keep to the routes proven for them. One that every such route refused is
++ * compiled once more (the refused-pipeline retry, radv_bc250_split_refused_retry) with this flag set, which lets the
++ * owned and AMD routes take it: their view-index SGPR and per-vertex layer export are the ones the multiview draw
++ * loop already provides. */
++static __thread bool radv_bc250_multiview_fast_retry;
++
 +static enum radv_bc250_mesh_route_reason
 +radv_bc250_mesh_no_split_reason(const struct radv_compiler_info *compiler_info,
 +                                 struct radv_shader_stage *stages,
@@ -19799,7 +19805,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
     for (unsigned s = 0; s < MESA_VULKAN_SHADER_STAGES; s++) {
        if (stages[s].stage == MESA_SHADER_NONE)
           continue;
-@@ -2452,20 +2676,393 @@
+@@ -2452,20 +2682,393 @@
              .lower_view_index_to_zero = !gfx_state->has_multiview_view_index,
              .lower_view_index_to_device_index = stages[s].key.view_index_from_device_index,
           };
@@ -19854,7 +19860,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
 +       !owned_ms->bc250_imported_nir && !owned_ms->bc250_split_mesh &&
 +       !owned_ms->bc250_ordered_export && !owned_ms->bc250_safe_fast && !owned_ms->bc250_safe_owned &&
 +       stages[MESA_SHADER_TASK].stage == MESA_SHADER_NONE &&
-+       !gfx_state->has_multiview_view_index && !gfx_state->vrs_may_be_enabled &&
++       (!gfx_state->has_multiview_view_index || radv_bc250_multiview_fast_retry) && !gfx_state->vrs_may_be_enabled &&
 +       !compiler_info->key.bc250_mesh_amd_size && !compiler_info->key.bc250_mesh_min2waves)
 +      radv_bc250_prepare_bary_affine(compiler_info, owned_ms, stages[MESA_SHADER_FRAGMENT].nir);
 +   const bool private_bary = radv_bc250_mesh_private_bary(compiler_info, stages[MESA_SHADER_FRAGMENT].nir);
@@ -19901,7 +19907,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
 +         owned_ms->bc250_task_replay && owned_ms->bc250_split_pieces == 1)) &&
 +       !owned_ms->bc250_ordered_export &&
 +       !owned_ms->bc250_imported_nir && !owned_ms->bc250_safe_fast && !owned_ms->bc250_safe_owned &&
-+       !gfx_state->has_multiview_view_index && !gfx_state->vrs_may_be_enabled &&
++       (!gfx_state->has_multiview_view_index || radv_bc250_multiview_fast_retry) && !gfx_state->vrs_may_be_enabled &&
 +       (private_bary || tiny_bary || (!gfx_state->dynamic_provoking_vtx_mode && !gfx_state->rs.provoking_vtx_last)) &&
 +       !compiler_info->key.bc250_mesh_amd_size && !compiler_info->key.bc250_mesh_min2waves) {
 +      for (unsigned attempt = 0; attempt < 2; attempt++) {
@@ -20036,7 +20042,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
 +                                stages[MESA_SHADER_TASK].stage != MESA_SHADER_NONE ||
 +                                   stages[MESA_SHADER_MESH].key.has_task_shader ||
 +                                   stages[MESA_SHADER_MESH].bc250_task_replay,
-+                                gfx_state->has_multiview_view_index,
++                                gfx_state->has_multiview_view_index && !radv_bc250_multiview_fast_retry,
 +                                compiler_info->hw.bc250_mesh_allow_pos1 || compiler_info->hw.bc250_mesh_reference_keep_cd));
 +
 +   if (compiler_info->key.bc250_expand_primitives && stages[MESA_SHADER_MESH].nir &&
@@ -20205,7 +20211,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
     }
  
     if (retained_shaders) {
-@@ -2508,6 +3105,38 @@
+@@ -2508,6 +3111,38 @@
  
        radv_nir_shader_info_init(i, next_stage, &stages[i].info);
     }
@@ -20244,7 +20250,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
  
     /* Determine if shaders uses NGG before linking because it's needed for some NIR pass. */
     radv_fill_shader_info_ngg(compiler_info, stages, active_nir_stages);
-@@ -2534,7 +3163,7 @@
+@@ -2534,7 +3169,7 @@
        unsigned num_raster_vertices_per_prim = radv_get_num_raster_vertices_per_prim(stages, gfx_state);
  
        NIR_PASS(_, stages[MESA_SHADER_FRAGMENT].nir, radv_nir_lower_fs_barycentric, gfx_state,
@@ -20253,7 +20259,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
  
        /* frag_depth = gl_FragCoord.z broadcasts to all samples of the fragment shader invocation,
         * so only optimize it away if we know there is only one sample per invocation.
-@@ -2562,7 +3191,15 @@
+@@ -2562,7 +3197,15 @@
               */
              if (var->data.location == VARYING_SLOT_PRIMITIVE_ID || var->data.location == VARYING_SLOT_VIEWPORT ||
                  var->data.location == VARYING_SLOT_LAYER) {
@@ -20270,7 +20276,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
              }
           }
        }
-@@ -2672,6 +3309,12 @@
+@@ -2672,6 +3315,12 @@
  
     /* Optimize varyings on lowered shader I/O (more efficient than optimizing I/O derefs). */
     radv_graphics_shaders_link_varyings(stages, compiler_info->ac->gfx_level);
@@ -20283,7 +20289,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
  
     /* Optimize constant clip/cull distance after linking to operate on scalar io in the last
      * pre raster stage.
-@@ -2720,7 +3363,10 @@
+@@ -2720,7 +3369,10 @@
  
        struct radv_shader_stage *fs_stage = &stages[MESA_SHADER_FRAGMENT];
  
@@ -20295,7 +20301,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
           stages[i].info.force_vrs_per_vertex = false;
  
           if (stages[i].info.outinfo.writes_primitive_shading_rate ||
-@@ -2748,6 +3394,32 @@
+@@ -2748,6 +3400,32 @@
        stages[i].feedback.duration += os_time_get_nano() - stage_start;
     }
  
@@ -20328,7 +20334,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
     if (stages[MESA_SHADER_VERTEX].nir || stages[MESA_SHADER_TESS_EVAL].nir) {
        struct radv_shader_stage *es_stage =
           stages[MESA_SHADER_TESS_EVAL].nir ? &stages[MESA_SHADER_TESS_EVAL] : &stages[MESA_SHADER_VERTEX];
-@@ -2766,6 +3438,7 @@
+@@ -2766,6 +3444,7 @@
     /* Compile NIR shaders to AMD assembly. */
     radv_graphics_shaders_nir_to_asm(compiler_info, cache, stages, gfx_state, active_nir_stages, debug, binaries,
                                      gs_copy_debug, gs_copy_binary);
@@ -20336,7 +20342,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
  }
  
  void
-@@ -2898,6 +3571,24 @@
+@@ -2898,6 +3577,24 @@
     return result;
  }
  
@@ -20361,7 +20367,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
  void
  radv_graphics_pipeline_hash(const struct radv_device *device, const struct radv_graphics_pipeline_state *gfx_state,
                              unsigned char *hash)
-@@ -2922,6 +3613,97 @@
+@@ -2922,6 +3619,97 @@
     }
  
     _mesa_blake3_final(&ctx, hash);
@@ -20459,7 +20465,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
  }
  
  static VkResult
-@@ -2933,6 +3715,9 @@
+@@ -2933,6 +3721,9 @@
     struct radv_shader_binary *binaries[MESA_VULKAN_SHADER_STAGES] = {NULL};
     struct radv_shader_binary *gs_copy_binary = NULL;
     bool skip_shaders_cache = radv_pipeline_skip_shaders_cache(device, &pipeline->base);
@@ -20469,7 +20475,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
     struct radv_shader_stage *stages = gfx_state->stages;
     const VkPipelineCreationFeedbackCreateInfo *creation_feedback =
        vk_find_struct_const(pCreateInfo->pNext, PIPELINE_CREATION_FEEDBACK_CREATE_INFO);
-@@ -2969,9 +3754,33 @@
+@@ -2969,9 +3760,33 @@
        }
     }
  
@@ -20505,7 +20511,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
        if (found_in_application_cache)
           pipeline_feedback.flags |= VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT;
  
-@@ -3007,16 +3816,54 @@
+@@ -3007,16 +3822,54 @@
        retained_shaders = &gfx_pipeline_lib->retained_shaders;
     }
  
@@ -20563,7 +20569,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
        radv_pipeline_cache_insert(device, cache, &pipeline->base);
     }
  
-@@ -3101,6 +3948,7 @@
+@@ -3101,6 +3954,7 @@
     key.tess = !!shaders[MESA_SHADER_TESS_CTRL];
     key.gs = !!shaders[MESA_SHADER_GEOMETRY];
     key.mesh = !!shaders[MESA_SHADER_MESH];
@@ -20571,7 +20577,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
     if (last_vgt_shader->info.is_ngg) {
        key.ngg = 1;
        key.ngg_passthrough = last_vgt_shader->info.is_ngg_passthrough;
-@@ -3176,23 +4024,44 @@
+@@ -3176,23 +4030,44 @@
  
  static VkResult
  radv_graphics_pipeline_import_binaries(struct radv_device *device, struct radv_graphics_pipeline *pipeline,
@@ -20616,7 +20622,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
  
        if (shader->info.stage == MESA_SHADER_VERTEX && i > 0) {
           /* The GS copy-shader is a VS placed after all other stages. */
-@@ -3206,11 +4075,122 @@
+@@ -3206,11 +4081,122 @@
  
     _mesa_blake3_final(&ctx, pipeline_hash);
  
@@ -20739,7 +20745,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
  }
  
  static VkResult
-@@ -3220,6 +4200,12 @@
+@@ -3220,6 +4206,12 @@
     bool fast_linking_enabled = radv_is_fast_linking_enabled(pCreateInfo);
     struct radv_graphics_pipeline_state gfx_state;
     VkResult result = VK_SUCCESS;
@@ -20752,7 +20758,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
  
     pipeline->last_vgt_api_stage = MESA_SHADER_NONE;
  
-@@ -3247,12 +4233,87 @@
+@@ -3247,12 +4239,94 @@
     if (result != VK_SUCCESS)
        return result;
  
@@ -20813,13 +20819,19 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
 +               radv_graphics_pipeline_compile(pipeline, pCreateInfo, &gfx_state, device, cache, fast_linking_enabled);
 +         }
 +         /* RADV_BC250_MESH_SPLIT_ANY: one last attempt for a Mesh pipeline every route refused,
-+          * letting Mesh-only lines/points split. Pipelines that already compile never get here. */
-+         if (result == VK_ERROR_FEATURE_NOT_PRESENT && (active_stages & VK_SHADER_STAGE_MESH_BIT_EXT) &&
-+             debug_get_bool_option("RADV_BC250_MESH_SPLIT_ANY", false) &&
-+             radv_device_physical(device)->bc250_native_mesh && pipeline->base.type == RADV_PIPELINE_GRAPHICS &&
-+             !vk_find_struct_const(pCreateInfo->pNext, PIPELINE_LIBRARY_CREATE_INFO_KHR) &&
-+             radv_bc250_fit_reset(device, pipeline, pCreateInfo, &gfx_state, active_stages, false, 0)) {
++          * letting Mesh-only lines/points split. Pipelines that already compile never get here.
++          * A multiview pipeline that is still refused gets a second pass that also lets the owned and AMD
++          * routes take it (radv_bc250_multiview_fast_retry), so the routes proven for it stay first. */
++         const bool multiview_pipeline = gfx_state.vk.mv && gfx_state.vk.mv->view_mask;
++         for (unsigned pass = 0; pass < (multiview_pipeline ? 2u : 1u); pass++) {
++            if (!(result == VK_ERROR_FEATURE_NOT_PRESENT && (active_stages & VK_SHADER_STAGE_MESH_BIT_EXT) &&
++                  debug_get_bool_option("RADV_BC250_MESH_SPLIT_ANY", false) &&
++                  radv_device_physical(device)->bc250_native_mesh && pipeline->base.type == RADV_PIPELINE_GRAPHICS &&
++                  !vk_find_struct_const(pCreateInfo->pNext, PIPELINE_LIBRARY_CREATE_INFO_KHR) &&
++                  radv_bc250_fit_reset(device, pipeline, pCreateInfo, &gfx_state, active_stages, false, 0)))
++               break;
 +            radv_bc250_split_refused_retry = true;
++            radv_bc250_multiview_fast_retry = pass == 1;
 +            result =
 +               radv_graphics_pipeline_compile(pipeline, pCreateInfo, &gfx_state, device, cache, fast_linking_enabled);
 +            /* The same LDS fit steps (more, smaller pieces) for the retried form. */
@@ -20829,9 +20841,10 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
 +               result =
 +                  radv_graphics_pipeline_compile(pipeline, pCreateInfo, &gfx_state, device, cache, fast_linking_enabled);
 +            radv_bc250_split_refused_retry = false;
++            radv_bc250_multiview_fast_retry = false;
 +            if (getenv("BC250_TRACE_COMPILE"))
-+               fprintf(stderr, "BC250 Mesh refused retry (split any topology): %s\n",
-+                       result == VK_SUCCESS ? "admitted" : "refused");
++               fprintf(stderr, "BC250 Mesh refused retry (split any topology%s): %s\n",
++                       pass ? ", multiview owned/AMD routes" : "", result == VK_SUCCESS ? "admitted" : "refused");
 +         }
 +         if (retries && getenv("BC250_TRACE_COMPILE"))
 +            fprintf(stderr, "BC250 Mesh LDS fit: %s after %u retries (pieces=%u reclaim=%u)\n",
@@ -20841,7 +20854,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
        }
     }
  
-@@ -3318,6 +4379,13 @@
+@@ -3318,6 +4392,13 @@
        return result;
     }
  
@@ -20855,7 +20868,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
     radv_pipeline_report_pso_history(device, &pipeline->base);
  
     *pPipeline = radv_pipeline_to_handle(&pipeline->base);
-@@ -3328,6 +4396,38 @@
+@@ -3328,6 +4409,38 @@
  void
  radv_destroy_graphics_pipeline(struct radv_device *device, struct radv_graphics_pipeline *pipeline)
  {
@@ -20894,7 +20907,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
     for (unsigned i = 0; i < MESA_VULKAN_SHADER_STAGES; ++i) {
        if (pipeline->base.shaders[i])
           radv_shader_unref(device, pipeline->base.shaders[i]);
-@@ -3388,7 +4488,18 @@
+@@ -3388,7 +4501,18 @@
        radv_graphics_pipeline_import_layout(&pipeline->layout, pipeline_layout);
  
     if (import_pipeline_binaries) {
@@ -20914,7 +20927,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
     } else {
        struct radv_graphics_pipeline_state gfx_state;
  
-@@ -3396,9 +4507,63 @@
+@@ -3396,9 +4520,63 @@
        if (result != VK_SUCCESS)
           return result;
  
@@ -20981,7 +20994,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
        radv_graphics_pipeline_state_finish(device, &gfx_state);
     }
  
-@@ -3430,6 +4595,9 @@
+@@ -3430,6 +4608,9 @@
        return result;
     }
  
@@ -20991,7 +21004,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
     radv_pipeline_report_pso_history(device, &pipeline->base.base);
  
     *pPipeline = radv_pipeline_to_handle(&pipeline->base.base);
-@@ -3463,7 +4631,35 @@
+@@ -3463,7 +4644,35 @@
     VkResult result = VK_SUCCESS;
     unsigned i = 0;
  
@@ -21027,7 +21040,7 @@ diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipel
        const VkPipelineCreateFlagBits2 create_flags = vk_graphics_pipeline_create_flags(&pCreateInfos[i]);
        VkResult r;
        if (create_flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) {
-@@ -3478,8 +4674,11 @@
+@@ -3478,8 +4687,11 @@
           if (create_flags & VK_PIPELINE_CREATE_2_EARLY_RETURN_ON_FAILURE_BIT)
              break;
        }
