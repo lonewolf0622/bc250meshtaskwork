@@ -35,9 +35,9 @@ for name in ('l32', 's64', 'h64', 'j64', 'm124', 'l128', 'n256', 'pp64', 'pp128'
             if r.returncode or re.search(r'validation failed|ACO ERROR|VALIDATION:.*Error|Assertion', log) or applied != expected:
                 raise SystemExit(f'FAIL {tag} rc={r.returncode} applied={applied} expected={expected}; see {out}')
             print(f'PASS {tag} applied={applied}', flush=True)
-# Retain enough independent recordings to exhaust the shared reservation budget.
+# Retain enough independent recordings (1 MiB of pages each) to exhaust the 128 MiB shared reservation budget.
 # Only the final buffer is submitted to the noop device; no GPU nodes are exposed.
-env.update(RADV_BC250_MESH_IDXPASS='1', INDEX_RECORDINGS='80', BC250_IDX_TRACE='1')
+env.update(RADV_BC250_MESH_IDXPASS='1', INDEX_RECORDINGS='160', BC250_IDX_TRACE='1')
 env.pop('INDEX_LAST_VERTEX', None)
 env.pop('INDEX_REFERENCE', None)
 cmd = ['bwrap', '--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc', '--tmpfs', '/tmp',

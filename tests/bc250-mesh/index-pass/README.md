@@ -7,7 +7,7 @@ are unavailable. NIR, ACO and Vulkan validation are enabled.
 The suite covers the seven existing connectivity shapes, flat primitive attributes at 64 and 128 vertices,
 first and last provoking vertices, index-only ballots and rejection of ballot-dependent vertex work. Independent
 VS shaders compute the same geometry and attributes without the Mesh converter. A memory-pressure check retains
-80 independent command buffers and verifies automatic fallback after the 64 MiB reservation is exhausted.
+160 independent command buffers and verifies automatic fallback after the 128 MiB reservation is exhausted.
 Noop runs compile and record commands; they neither render images nor measure hardware performance.
 
 The build products (`*.spv` and `index_gate`) are generated and excluded from source control. Frozen hardware kits

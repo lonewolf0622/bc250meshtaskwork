@@ -137,7 +137,7 @@ Useful extras:
   ordinary indexed draws. Primitive attributes use private provoking corners and flat fragment inputs. Vertex
   work that still requires another invocation, small meshlets (at most 32 vertices), single-record indirect calls,
   externally visible memory writes and simultaneous command buffers keep the protected Mesh route. Persistent
-  index storage shares a 64 MiB device budget, with automatic Mesh fallback on allocation or indirect-pool overflow.
+  index storage shares a 128 MiB device budget, with automatic Mesh fallback on allocation or indirect-pool overflow.
   The preset also enables LDS planning and coverage, merged checks, direct primitive attributes and 65-primitive
   pieces. All six additions can be switched off individually; see [release notes](docs/directmesh-v1.3.md).
 

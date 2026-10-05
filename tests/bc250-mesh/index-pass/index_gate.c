@@ -211,7 +211,7 @@ int main(int argc, char **argv)
    VkCommandBufferAllocateInfo cbai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=pool,
       .level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
    unsigned recordings=getenv("INDEX_RECORDINGS")?atoi(getenv("INDEX_RECORDINGS")):1;
-   if (!recordings || recordings>96) return 2;
+   if (!recordings || recordings>192) return 2;
    VkCommandBuffer cb=VK_NULL_HANDLE;
    for (unsigned recording=0; recording<recordings; recording++) {
    CK(vkAllocateCommandBuffers(dev,&cbai,&cb));

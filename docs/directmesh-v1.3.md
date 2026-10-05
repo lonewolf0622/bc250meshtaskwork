@@ -36,7 +36,7 @@ route stays off for multiview pipelines. Clears and other internal driver operat
 between draws keep the index route in place for the following draws.
 
 Index pages are private to each command buffer because recordings can remain pending or be submitted repeatedly.
-A shared device reservation bounds their total with the indirect pools to 64 MiB, within the board's 512 MiB carve-out.
+A shared device reservation bounds their total with the indirect pools to 128 MiB, within the board's 512 MiB carve-out.
 Each recording has at most 16 MiB of pages and an indirect pool of at most 16 MiB. When a command buffer is reset
 or destroyed, its pages and pool return to a device spare list (at most 32 MiB) that later recordings take from, so
 idle command buffers hold no index storage and steady-state frames create no buffers. Side-stream bodies (command
