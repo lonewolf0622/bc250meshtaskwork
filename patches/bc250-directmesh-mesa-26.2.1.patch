@@ -4464,7 +4464,7 @@ diff --git a/src/amd/vulkan/radv_bc250.c b/src/amd/vulkan/radv_bc250.c
 new file mode 100644
 --- /dev/null
 +++ b/src/amd/vulkan/radv_bc250.c
-@@ -0,0 +1,8780 @@
+@@ -0,0 +1,8807 @@
 +/* SPDX-License-Identifier: MIT
 + * Experimental BC250 TASK scheduling on the graphics queue.
 + * No ACE queue, task rings, native TASK packets, or device-generation spoofing.
@@ -12672,7 +12672,7 @@ new file mode 100644
 +}
 +
 +static bool
-+bc250_idx_reserve(struct radv_device *device, uint32_t bytes)
++bc250_idx_reserve_once(struct radv_device *device, uint32_t bytes)
 +{
 +   uint32_t old = p_atomic_read(&device->bc250_idx_storage_bytes);
 +   do {
@@ -12683,6 +12683,30 @@ new file mode 100644
 +         return true;
 +      old = seen;
 +   } while (true);
++}
++
++/* Spare buffers count against the budget. When it is exhausted, free spare buffers (which the caller could not reuse:
++ * the wrong kind or size) until the reservation fits, instead of falling back to Mesh while idle buffers hold it. */
++static bool
++bc250_idx_reserve(struct radv_device *device, uint32_t bytes)
++{
++   while (!bc250_idx_reserve_once(device, bytes)) {
++      struct radeon_winsys_bo *bo = NULL;
++      uint32_t size = 0;
++      simple_mtx_lock(&device->bc250_idx_spare_mtx);
++      if (device->bc250_idx_spare_count) {
++         const unsigned last = --device->bc250_idx_spare_count;
++         bo = device->bc250_idx_spare[last].bo;
++         size = device->bc250_idx_spare[last].size;
++         device->bc250_idx_spare_bytes -= size;
++      }
++      simple_mtx_unlock(&device->bc250_idx_spare_mtx);
++      if (!bo)
++         return false;
++      radv_bo_destroy(device, NULL, bo);
++      p_atomic_add(&device->bc250_idx_storage_bytes, -(int32_t)size);
++   }
++   return true;
 +}
 +static bool
 +bc250_idx_alloc(struct radv_cmd_buffer *cmd_buffer, uint64_t bytes, uint64_t *address)
@@ -13101,8 +13125,11 @@ new file mode 100644
 +      cmd_buffer->bc250_idx_pool_bo =
 +         dbg ? NULL : bc250_idx_spare_take(device, pool_bytes, pool_bytes, true, &spare_bytes);
 +      if (!cmd_buffer->bc250_idx_pool_bo) {
-+         if (!bc250_idx_reserve(device, pool_bytes))
++         if (!bc250_idx_reserve(device, pool_bytes)) {
++            if (getenv("BC250_IDX_TRACE"))
++               fprintf(stderr, "BC250 IDX: indirect Mesh fallback (storage unavailable)\n");
 +            return false;
++         }
 +         if (radv_bo_create(device, NULL, pool_bytes, 4096, dbg ? RADEON_DOMAIN_GTT : RADEON_DOMAIN_VRAM,
 +                            (dbg ? RADEON_FLAG_CPU_ACCESS : RADEON_FLAG_NO_CPU_ACCESS) |
 +                               RADEON_FLAG_NO_INTERPROCESS_SHARING,
