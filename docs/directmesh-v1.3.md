@@ -71,15 +71,19 @@ speed.
   and 128 vertices with both provoking modes, index-only ballots, a clear between two draws, an active statistics
   query, 80 reset command buffers, storage exhaustion, direct and indirect draws, lattice shapes, 1,000 calls, mixed
   Mesh and vertex-shader draws and indirect-pool overflow. All pass; no GPU faults.
-- Speed, 1 million triangles per draw set, index route vs Mesh route:
+- Speed at 2000 MHz, 1 million triangles per draw set. v1.3 against v1.2 (the same bench and board with v1.2's
+  Mesh routes), and the indexed draws against v1.3's own Mesh route (which the other v1.3 additions made faster):
 
-| Meshlet | Direct draws | Indirect draws | Mixed Mesh + VS |
-|---|---|---|---|
-| 256 vertices | 213 vs 380 us (1.78x) | 216 vs 377 us (1.74x) | 1.79x |
-| 128 vertices | 190 vs 304 us (1.60x) | 198 vs 293 us (1.48x) | 1.60x |
-| 96 vertices | 200 vs 327 us (1.64x) | 212 vs 315 us (1.48x) | 1.64x |
-| 64 vertices | 194 vs 200 us (1.03x) | 204 vs 201 us (0.98x) | 1.03x |
-| 32 vertices | stays on Mesh | stays on Mesh | stays on Mesh |
+| Meshlet | Direct: vs v1.2 | Direct: vs v1.3 Mesh route | Indirect: vs v1.2 | Indirect: vs v1.3 Mesh route |
+|---|---|---|---|---|
+| 256 vertices | 213 vs 401 us (1.88x) | 213 vs 380 us (1.78x) | 216 vs 396 us (1.83x) | 216 vs 377 us (1.74x) |
+| 128 vertices | 190 vs 337 us (1.77x) | 190 vs 304 us (1.60x) | 198 vs 335 us (1.69x) | 198 vs 293 us (1.48x) |
+| 96 vertices | 200 vs 338 us (1.69x) | 200 vs 327 us (1.64x) | 212 vs 326 us (1.54x) | 212 vs 315 us (1.48x) |
+| 64 vertices | 194 vs 208 us (1.07x) | 194 vs 200 us (1.03x) | 204 vs 210 us (1.03x) | 204 vs 201 us (0.98x) |
+| 32 vertices | 158 vs 158 us | stays on Mesh | 158 vs 158 us | stays on Mesh |
+
+  64-vertex meshlets are 3-7% faster than with v1.2, mostly from the Mesh-route additions; the indexed draws add
+  little at that size. Mixed Mesh and vertex-shader draws gain like direct draws (1.60-1.79x over the v1.3 Mesh route).
 
 Game frame rates depend on how much of a frame is Mesh drawing and on meshlet size; they were not measured for this
 release. Compare a game with `RADV_BC250_MESH_IDXPASS=0` to see what the indexed draws change there.
