@@ -2571,6 +2571,12 @@ radv_bc250_link_bary_rotation(const struct radv_compiler_info *compiler_info, st
    return VK_SUCCESS;
 }
 
+/* Multiview Mesh pipelines normally keep to the routes proven for them. One that every such route refused is
+ * compiled once more (the refused-pipeline retry, radv_bc250_split_refused_retry) with this flag set, which lets the
+ * owned and AMD routes take it: their view-index SGPR and per-vertex layer export are the ones the multiview draw
+ * loop already provides. */
+static __thread bool radv_bc250_multiview_fast_retry;
+
 static enum radv_bc250_mesh_route_reason
 radv_bc250_mesh_no_split_reason(const struct radv_compiler_info *compiler_info,
                                  struct radv_shader_stage *stages,
@@ -2722,7 +2728,7 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
        !owned_ms->bc250_imported_nir && !owned_ms->bc250_split_mesh &&
        !owned_ms->bc250_ordered_export && !owned_ms->bc250_safe_fast && !owned_ms->bc250_safe_owned &&
        stages[MESA_SHADER_TASK].stage == MESA_SHADER_NONE &&
-       !gfx_state->has_multiview_view_index && !gfx_state->vrs_may_be_enabled &&
+       (!gfx_state->has_multiview_view_index || radv_bc250_multiview_fast_retry) && !gfx_state->vrs_may_be_enabled &&
        !compiler_info->key.bc250_mesh_amd_size && !compiler_info->key.bc250_mesh_min2waves)
       radv_bc250_prepare_bary_affine(compiler_info, owned_ms, stages[MESA_SHADER_FRAGMENT].nir);
    const bool private_bary = radv_bc250_mesh_private_bary(compiler_info, stages[MESA_SHADER_FRAGMENT].nir);
@@ -2769,7 +2775,7 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
          owned_ms->bc250_task_replay && owned_ms->bc250_split_pieces == 1)) &&
        !owned_ms->bc250_ordered_export &&
        !owned_ms->bc250_imported_nir && !owned_ms->bc250_safe_fast && !owned_ms->bc250_safe_owned &&
-       !gfx_state->has_multiview_view_index && !gfx_state->vrs_may_be_enabled &&
+       (!gfx_state->has_multiview_view_index || radv_bc250_multiview_fast_retry) && !gfx_state->vrs_may_be_enabled &&
        (private_bary || tiny_bary || (!gfx_state->dynamic_provoking_vtx_mode && !gfx_state->rs.provoking_vtx_last)) &&
        !compiler_info->key.bc250_mesh_amd_size && !compiler_info->key.bc250_mesh_min2waves) {
       for (unsigned attempt = 0; attempt < 2; attempt++) {
@@ -2897,7 +2903,7 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
                                 stages[MESA_SHADER_TASK].stage != MESA_SHADER_NONE ||
                                    stages[MESA_SHADER_MESH].key.has_task_shader ||
                                    stages[MESA_SHADER_MESH].bc250_task_replay,
-                                gfx_state->has_multiview_view_index,
+                                gfx_state->has_multiview_view_index && !radv_bc250_multiview_fast_retry,
                                 compiler_info->hw.bc250_mesh_allow_pos1 || compiler_info->hw.bc250_mesh_reference_keep_cd));
 
    if (compiler_info->key.bc250_expand_primitives && stages[MESA_SHADER_MESH].nir &&
@@ -4289,13 +4295,19 @@ radv_graphics_pipeline_init(struct radv_graphics_pipeline *pipeline, struct radv
                radv_graphics_pipeline_compile(pipeline, pCreateInfo, &gfx_state, device, cache, fast_linking_enabled);
          }
          /* RADV_BC250_MESH_SPLIT_ANY: one last attempt for a Mesh pipeline every route refused,
-          * letting Mesh-only lines/points split. Pipelines that already compile never get here. */
-         if (result == VK_ERROR_FEATURE_NOT_PRESENT && (active_stages & VK_SHADER_STAGE_MESH_BIT_EXT) &&
-             debug_get_bool_option("RADV_BC250_MESH_SPLIT_ANY", false) &&
-             radv_device_physical(device)->bc250_native_mesh && pipeline->base.type == RADV_PIPELINE_GRAPHICS &&
-             !vk_find_struct_const(pCreateInfo->pNext, PIPELINE_LIBRARY_CREATE_INFO_KHR) &&
-             radv_bc250_fit_reset(device, pipeline, pCreateInfo, &gfx_state, active_stages, false, 0)) {
+          * letting Mesh-only lines/points split. Pipelines that already compile never get here.
+          * A multiview pipeline that is still refused gets a second pass that also lets the owned and AMD
+          * routes take it (radv_bc250_multiview_fast_retry), so the routes proven for it stay first. */
+         const bool multiview_pipeline = gfx_state.vk.mv && gfx_state.vk.mv->view_mask;
+         for (unsigned pass = 0; pass < (multiview_pipeline ? 2u : 1u); pass++) {
+            if (!(result == VK_ERROR_FEATURE_NOT_PRESENT && (active_stages & VK_SHADER_STAGE_MESH_BIT_EXT) &&
+                  debug_get_bool_option("RADV_BC250_MESH_SPLIT_ANY", false) &&
+                  radv_device_physical(device)->bc250_native_mesh && pipeline->base.type == RADV_PIPELINE_GRAPHICS &&
+                  !vk_find_struct_const(pCreateInfo->pNext, PIPELINE_LIBRARY_CREATE_INFO_KHR) &&
+                  radv_bc250_fit_reset(device, pipeline, pCreateInfo, &gfx_state, active_stages, false, 0)))
+               break;
             radv_bc250_split_refused_retry = true;
+            radv_bc250_multiview_fast_retry = pass == 1;
             result =
                radv_graphics_pipeline_compile(pipeline, pCreateInfo, &gfx_state, device, cache, fast_linking_enabled);
             /* The same LDS fit steps (more, smaller pieces) for the retried form. */
@@ -4305,9 +4317,10 @@ radv_graphics_pipeline_init(struct radv_graphics_pipeline *pipeline, struct radv
                result =
                   radv_graphics_pipeline_compile(pipeline, pCreateInfo, &gfx_state, device, cache, fast_linking_enabled);
             radv_bc250_split_refused_retry = false;
+            radv_bc250_multiview_fast_retry = false;
             if (getenv("BC250_TRACE_COMPILE"))
-               fprintf(stderr, "BC250 Mesh refused retry (split any topology): %s\n",
-                       result == VK_SUCCESS ? "admitted" : "refused");
+               fprintf(stderr, "BC250 Mesh refused retry (split any topology%s): %s\n",
+                       pass ? ", multiview owned/AMD routes" : "", result == VK_SUCCESS ? "admitted" : "refused");
          }
          if (retries && getenv("BC250_TRACE_COMPILE"))
             fprintf(stderr, "BC250 Mesh LDS fit: %s after %u retries (pieces=%u reclaim=%u)\n",
