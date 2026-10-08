@@ -7851,11 +7851,39 @@ radv_bc250_draw_merge_indirect(struct radv_cmd_buffer *cmd_buffer, unsigned merg
  * additions require their own release validation. The switches themselves only act on GFX1013. */
 bool radv_bc250_directmesh_hybrid;
 
+/* True when the system has a BC-250 (Cyan Skillfish, GFX1013) GPU. Runs before any device is opened, so it
+ * reads the PCI ids from sysfs. */
+static bool
+radv_bc250_present(void)
+{
+   for (unsigned i = 0; i < 16; i++) {
+      char path[64];
+      unsigned vendor = 0, device = 0;
+      snprintf(path, sizeof(path), "/sys/class/drm/card%u/device/vendor", i);
+      FILE *f = fopen(path, "r");
+      if (!f)
+         continue;
+      bool ok = fscanf(f, "%x", &vendor) == 1;
+      fclose(f);
+      snprintf(path, sizeof(path), "/sys/class/drm/card%u/device/device", i);
+      f = fopen(path, "r");
+      if (!f)
+         continue;
+      ok = ok && fscanf(f, "%x", &device) == 1;
+      fclose(f);
+      if (ok && vendor == 0x1002 && (device == 0x13fe || device == 0x143f))
+         return true;
+   }
+   return false;
+}
+
 void
 radv_bc250_directmesh_env(void)
 {
+   /* On by default when a BC-250 is present; RADV_DIRECTMESH=0 (any value but 1) turns it off. Without a
+    * BC-250 and without RADV_DIRECTMESH=1 nothing is set, so other GPUs keep the stock driver. */
    const char *on = getenv("RADV_DIRECTMESH");
-   if (!on || strcmp(on, "1"))
+   if (on ? strcmp(on, "1") != 0 : !radv_bc250_present())
       return;
    /* Hybrid Task hides GPL, shader objects and pipeline binaries. Remember whether the preset (and not
     * the user) turned it on, so DXVK (no Mesh shaders in D3D9-11) keeps GPL (radv_physical_device.c).

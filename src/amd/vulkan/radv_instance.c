@@ -298,7 +298,8 @@ radv_CreateInstance(const VkInstanceCreateInfo *pCreateInfo, const VkAllocationC
    if (!pAllocator)
       pAllocator = vk_default_allocator();
 
-   /* RADV_DIRECTMESH=1: BC-250 direct Mesh settings, before any option is read. */
+   /* DirectMesh (on with a BC-250 unless RADV_DIRECTMESH=0, or RADV_DIRECTMESH=1): BC-250 direct Mesh settings,
+    * before any option is read. */
    radv_bc250_directmesh_env();
 
    instance = vk_zalloc(pAllocator, sizeof(*instance), 8, VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
