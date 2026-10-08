@@ -8302,8 +8302,11 @@ bc250_idx_alloc(struct radv_cmd_buffer *cmd_buffer, uint64_t bytes, uint64_t *ad
    if (!bo) {
       if (!bc250_idx_reserve(device, size))
          return false;
-      VkResult result = radv_bo_create(device, NULL, size, 4096, RADEON_DOMAIN_VRAM,
-                                       RADEON_FLAG_NO_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING,
+      /* GTT, not VRAM: the BC-250's VRAM carveout is 512 MiB and the desktop alone nearly fills it; VRAM-only
+       * index storage evicted the game's and the display's buffers at 4K. GTT is the same memory on this APU. */
+      VkResult result = radv_bo_create(device, NULL, size, 4096, RADEON_DOMAIN_GTT,
+                                       RADEON_FLAG_NO_CPU_ACCESS | RADEON_FLAG_GTT_WC |
+                                          RADEON_FLAG_NO_INTERPROCESS_SHARING,
                                        RADV_BO_PRIORITY_SCRATCH, 0, true, &bo);
       if (result != VK_SUCCESS) {
          p_atomic_add(&device->bc250_idx_storage_bytes, -(int32_t)size);
@@ -8693,8 +8696,9 @@ radv_bc250_draw_idx_indirect(struct radv_cmd_buffer *cmd_buffer, struct radv_gra
                fprintf(stderr, "BC250 IDX: indirect Mesh fallback (storage unavailable)\n");
             return false;
          }
-         if (radv_bo_create(device, NULL, pool_bytes, 4096, dbg ? RADEON_DOMAIN_GTT : RADEON_DOMAIN_VRAM,
-                            (dbg ? RADEON_FLAG_CPU_ACCESS : RADEON_FLAG_NO_CPU_ACCESS) |
+         /* GTT like the index pages (the VRAM carveout is too small to hold it). */
+         if (radv_bo_create(device, NULL, pool_bytes, 4096, RADEON_DOMAIN_GTT,
+                            (dbg ? RADEON_FLAG_CPU_ACCESS : RADEON_FLAG_NO_CPU_ACCESS | RADEON_FLAG_GTT_WC) |
                                RADEON_FLAG_NO_INTERPROCESS_SHARING,
                             RADV_BO_PRIORITY_SCRATCH, 0, true, &cmd_buffer->bc250_idx_pool_bo) != VK_SUCCESS) {
             cmd_buffer->bc250_idx_pool_bo = NULL;
