@@ -14227,7 +14227,9 @@ radv_bind_graphics_shaders(struct radv_cmd_buffer *cmd_buffer)
 ALWAYS_INLINE static bool
 radv_before_draw(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info, uint32_t drawCount, bool dgc)
 {
-   radv_bc250_idx_restore(cmd_buffer);
+   /* Hot path: test the field inline; the call happens only with an index route to restore. */
+   if (unlikely(cmd_buffer->bc250_idx_restore))
+      radv_bc250_idx_restore(cmd_buffer);
    const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
    const bool has_prefetch = pdev->info.gfx_level >= GFX7;
@@ -14347,7 +14349,9 @@ ALWAYS_INLINE static bool
 radv_before_taskmesh_draw(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info, uint32_t drawCount,
                           bool dgc)
 {
-   radv_bc250_idx_restore(cmd_buffer);
+   /* Hot path: test the field inline; the call happens only with an index route to restore. */
+   if (unlikely(cmd_buffer->bc250_idx_restore))
+      radv_bc250_idx_restore(cmd_buffer);
    const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
    struct radv_cmd_stream *cs = cmd_buffer->cs;
