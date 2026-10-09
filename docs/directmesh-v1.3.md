@@ -87,3 +87,19 @@ speed.
 
 Game frame rates depend on how much of a frame is Mesh drawing and on meshlet size; they were not measured for this
 release. Compare a game with `RADV_BC250_MESH_IDXPASS=0` to see what the indexed draws change there.
+
+## v1.3.1
+
+- **GPU hang at 4K fixed.** The index route kept its storage (index pages and indirect pools, up to 128 MiB per
+  device) in VRAM only. The BC-250's VRAM carveout is 512 MiB and the desktop alone nearly fills it, so at 4K output
+  that storage pushed the game's and the display's buffers out of VRAM (the kernel logged `Failed to pin framebuffer:
+  -ENOMEM`) and a game could hang the GPU after a few minutes. The storage is now allocated in GTT (write-combined),
+  which is the same memory on this APU. Until you update, `RADV_BC250_MESH_IDXPASS=0` avoids it on v1.3.
+- **On by default on a BC-250.** Without `RADV_DIRECTMESH`, the driver applies the DirectMesh preset when it finds a
+  Cyan Skillfish GPU (PCI `1002:13fe` or `1002:143f`). `RADV_DIRECTMESH=0` keeps it off; other GPUs are unaffected
+  unless `RADV_DIRECTMESH=1` is set.
+- **Draw path:** `radv_before_draw()` and `radv_before_taskmesh_draw()` test for a pending index-route restore inline
+  instead of calling out on every draw (from issue #2). The index route's comment no longer calls it a prototype.
+
+Hardware results for v1.3.1 (BC-250, 2000 MHz): Mesh CTS 1,902 passed, 0 failed; all image checks pass; the
+index-route bench with the storage in GTT is within about 1% of VRAM in all 44 cases.

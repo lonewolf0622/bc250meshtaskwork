@@ -4,15 +4,19 @@ Mesh shader support for the AMD BC-250 (GFX1013, RDNA1-based) in Mesa's RADV Vul
 a **safe direct path**: no split/replay, one launch per Mesh workgroup, and built-in protection against the index
 patterns that hang this chip.
 
-**Download:** [patch against stock Mesa 26.2.1](https://github.com/lonewolf0622/bc250meshtaskwork/releases/download/directmesh-v1.3/bc250-directmesh-mesa-26.2.1.patch)
-(also in [`patches/`](patches/) and on the [release page](https://github.com/lonewolf0622/bc250meshtaskwork/releases/tag/directmesh-v1.3)),
+**Download:** [patch against stock Mesa 26.2.1](https://github.com/lonewolf0622/bc250meshtaskwork/releases/download/directmesh-v1.3.1/bc250-directmesh-mesa-26.2.1.patch)
+(also in [`patches/`](patches/) and on the [release page](https://github.com/lonewolf0622/bc250meshtaskwork/releases/tag/directmesh-v1.3.1)),
 or build this repository directly (see Build).
 
-Turn it on with one switch:
+On a BC-250 it is on by default (since v1.3.1): no launch option is needed. `RADV_DIRECTMESH=0` turns it off, for
+example for one game:
 
 ```
-RADV_DIRECTMESH=1 %command%
+RADV_DIRECTMESH=0 %command%
 ```
+
+**v1.3.1:** fixes GPU hangs at 4K output (the index route's storage no longer competes for the BC-250's 512 MiB of
+VRAM) and turns DirectMesh on by default on a BC-250.
 
 **v1.3:** adds indexed draws for eligible Mesh-only shaders (about 1.5-1.8x faster Mesh drawing for meshlets of
 96 vertices and more), multiview Mesh pipelines on the protected routes, plus LDS planning, LDS coverage, merged
@@ -108,20 +112,17 @@ work; a patch against stock Mesa 26.2.1 is provided with the releases.
 launch options:
 
 ```
-VK_DRIVER_FILES=/path/to/bc250meshtaskwork/build/src/amd/vulkan/radeon_devenv_icd.x86_64.json RADV_DIRECTMESH=1 %command%
+VK_DRIVER_FILES=/path/to/bc250meshtaskwork/build/src/amd/vulkan/radeon_devenv_icd.x86_64.json %command%
 ```
 
 Keep the build folder in place: the ICD file points at the library inside it.
 
-**As your system driver** (after `meson install`, or through your distribution's packaging):
+**As your system driver** (after `meson install`, or through your distribution's packaging): nothing to set.
 
-```
-RADV_DIRECTMESH=1 %command%
-```
-
-`RADV_DIRECTMESH=1` enables Mesh shaders and every direct-path setting. Any `RADV_BC250_*` / `BC250_*` variable you
-set yourself still takes priority, which is useful for testing. Without the switch the driver behaves as its base BC-250
-configuration. The switch only affects the BC-250 (GFX1013).
+On a BC-250 (PCI `1002:13fe` or `1002:143f`) the driver enables Mesh shaders and every direct-path setting by itself.
+`RADV_DIRECTMESH=0` turns that off (the driver then behaves as its base BC-250 configuration); `RADV_DIRECTMESH=1`
+turns it on explicitly. Any `RADV_BC250_*` / `BC250_*` variable you set yourself still takes priority, which is useful
+for testing. Other GPUs are unaffected unless `RADV_DIRECTMESH=1` is set.
 
 Useful extras:
 
@@ -132,11 +133,17 @@ Useful extras:
 
 ## Changes
 
+- **v1.3.1:** the index route's storage (index pages and indirect pools, up to 128 MiB per device) is allocated in
+  GTT instead of VRAM. The BC-250's VRAM carveout is 512 MiB and the desktop alone nearly fills it, so at 4K the
+  VRAM-only storage pushed the game's and the display's buffers out and the GPU could hang. GTT is the same memory on
+  this APU: the index-route speed is unchanged (all bench cases within about 1%). DirectMesh is now on by default on a
+  BC-250 (`RADV_DIRECTMESH=0` turns it off). The per-draw check for a pending index-route restore is done inline in
+  the draw path (from issue #2). Mesh CTS: 1,902 passed, 0 failed.
 - **v1.3:** eligible Mesh-only triangle pipelines can run their index work as compute and render with
   ordinary indexed draws. Primitive attributes use private provoking corners and flat fragment inputs. Vertex
   work that still requires another invocation, small meshlets (at most 32 vertices), single-record indirect calls,
   externally visible memory writes and simultaneous command buffers keep the protected Mesh route. Persistent
-  index storage shares a 128 MiB device budget, with automatic Mesh fallback on allocation or indirect-pool overflow.
+  index storage shares a 128 MiB device budget (in GTT since v1.3.1), with automatic Mesh fallback on allocation or indirect-pool overflow.
   The preset also enables LDS planning and coverage, merged checks, direct primitive attributes and 65-primitive
   pieces, and admits multiview Mesh pipelines (per-vertex view layer; Task once, Mesh once per view). All additions
   can be switched off individually; see [release notes](docs/directmesh-v1.3.md).

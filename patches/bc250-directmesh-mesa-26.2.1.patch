@@ -4464,7 +4464,7 @@ diff --git a/src/amd/vulkan/radv_bc250.c b/src/amd/vulkan/radv_bc250.c
 new file mode 100644
 --- /dev/null
 +++ b/src/amd/vulkan/radv_bc250.c
-@@ -0,0 +1,8807 @@
+@@ -0,0 +1,8839 @@
 +/* SPDX-License-Identifier: MIT
 + * Experimental BC250 TASK scheduling on the graphics queue.
 + * No ACE queue, task rings, native TASK packets, or device-generation spoofing.
@@ -12318,11 +12318,39 @@ new file mode 100644
 + * additions require their own release validation. The switches themselves only act on GFX1013. */
 +bool radv_bc250_directmesh_hybrid;
 +
++/* True when the system has a BC-250 (Cyan Skillfish, GFX1013) GPU. Runs before any device is opened, so it
++ * reads the PCI ids from sysfs. */
++static bool
++radv_bc250_present(void)
++{
++   for (unsigned i = 0; i < 16; i++) {
++      char path[64];
++      unsigned vendor = 0, device = 0;
++      snprintf(path, sizeof(path), "/sys/class/drm/card%u/device/vendor", i);
++      FILE *f = fopen(path, "r");
++      if (!f)
++         continue;
++      bool ok = fscanf(f, "%x", &vendor) == 1;
++      fclose(f);
++      snprintf(path, sizeof(path), "/sys/class/drm/card%u/device/device", i);
++      f = fopen(path, "r");
++      if (!f)
++         continue;
++      ok = ok && fscanf(f, "%x", &device) == 1;
++      fclose(f);
++      if (ok && vendor == 0x1002 && (device == 0x13fe || device == 0x143f))
++         return true;
++   }
++   return false;
++}
++
 +void
 +radv_bc250_directmesh_env(void)
 +{
++   /* On by default when a BC-250 is present; RADV_DIRECTMESH=0 (any value but 1) turns it off. Without a
++    * BC-250 and without RADV_DIRECTMESH=1 nothing is set, so other GPUs keep the stock driver. */
 +   const char *on = getenv("RADV_DIRECTMESH");
-+   if (!on || strcmp(on, "1"))
++   if (on ? strcmp(on, "1") != 0 : !radv_bc250_present())
 +      return;
 +   /* Hybrid Task hides GPL, shader objects and pipeline binaries. Remember whether the preset (and not
 +    * the user) turned it on, so DXVK (no Mesh shaders in D3D9-11) keeps GPL (radv_physical_device.c).
@@ -12739,8 +12767,11 @@ new file mode 100644
 +   if (!bo) {
 +      if (!bc250_idx_reserve(device, size))
 +         return false;
-+      VkResult result = radv_bo_create(device, NULL, size, 4096, RADEON_DOMAIN_VRAM,
-+                                       RADEON_FLAG_NO_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING,
++      /* GTT, not VRAM: the BC-250's VRAM carveout is 512 MiB and the desktop alone nearly fills it; VRAM-only
++       * index storage evicted the game's and the display's buffers at 4K. GTT is the same memory on this APU. */
++      VkResult result = radv_bo_create(device, NULL, size, 4096, RADEON_DOMAIN_GTT,
++                                       RADEON_FLAG_NO_CPU_ACCESS | RADEON_FLAG_GTT_WC |
++                                          RADEON_FLAG_NO_INTERPROCESS_SHARING,
 +                                       RADV_BO_PRIORITY_SCRATCH, 0, true, &bo);
 +      if (result != VK_SUCCESS) {
 +         p_atomic_add(&device->bc250_idx_storage_bytes, -(int32_t)size);
@@ -13130,8 +13161,9 @@ new file mode 100644
 +               fprintf(stderr, "BC250 IDX: indirect Mesh fallback (storage unavailable)\n");
 +            return false;
 +         }
-+         if (radv_bo_create(device, NULL, pool_bytes, 4096, dbg ? RADEON_DOMAIN_GTT : RADEON_DOMAIN_VRAM,
-+                            (dbg ? RADEON_FLAG_CPU_ACCESS : RADEON_FLAG_NO_CPU_ACCESS) |
++         /* GTT like the index pages (the VRAM carveout is too small to hold it). */
++         if (radv_bo_create(device, NULL, pool_bytes, 4096, RADEON_DOMAIN_GTT,
++                            (dbg ? RADEON_FLAG_CPU_ACCESS : RADEON_FLAG_NO_CPU_ACCESS | RADEON_FLAG_GTT_WC) |
 +                               RADEON_FLAG_NO_INTERPROCESS_SHARING,
 +                            RADV_BO_PRIORITY_SCRATCH, 0, true, &cmd_buffer->bc250_idx_pool_bo) != VK_SUCCESS) {
 +            cmd_buffer->bc250_idx_pool_bo = NULL;
@@ -17016,11 +17048,13 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
     struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
     const struct radv_physical_device *pdev = radv_device_physical(device);
  
-@@ -13760,10 +14227,14 @@
+@@ -13760,10 +14227,16 @@
  ALWAYS_INLINE static bool
  radv_before_draw(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info, uint32_t drawCount, bool dgc)
  {
-+   radv_bc250_idx_restore(cmd_buffer);
++   /* Hot path: test the field inline; the call happens only with an index route to restore. */
++   if (unlikely(cmd_buffer->bc250_idx_restore))
++      radv_bc250_idx_restore(cmd_buffer);
     const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
     const struct radv_physical_device *pdev = radv_device_physical(device);
     const bool has_prefetch = pdev->info.gfx_level >= GFX7;
@@ -17031,7 +17065,7 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
  
     ASSERTED const unsigned cdw_max = radeon_check_space(device->ws, cs->b, 4096 + 128 * (drawCount - 1));
  
-@@ -13836,10 +14307,47 @@
+@@ -13836,10 +14309,49 @@
     return true;
  }
  
@@ -17075,11 +17109,13 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
  radv_before_taskmesh_draw(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info, uint32_t drawCount,
                            bool dgc)
  {
-+   radv_bc250_idx_restore(cmd_buffer);
++   /* Hot path: test the field inline; the call happens only with an index route to restore. */
++   if (unlikely(cmd_buffer->bc250_idx_restore))
++      radv_bc250_idx_restore(cmd_buffer);
     const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
     const struct radv_physical_device *pdev = radv_device_physical(device);
     struct radv_cmd_stream *cs = cmd_buffer->cs;
-@@ -13848,6 +14356,9 @@
+@@ -13848,6 +14360,9 @@
      * For indirect draws, this is necessary to prevent a GPU hang (on MEC version < 100).
      */
     if (unlikely(!info->count))
@@ -17089,7 +17125,7 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
        return false;
  
     if (cmd_buffer->state.dirty & RADV_CMD_DIRTY_GRAPHICS_SHADERS) {
-@@ -14218,13 +14729,90 @@
+@@ -14218,13 +14733,90 @@
     radv_after_draw(cmd_buffer);
  }
  
@@ -17184,7 +17220,7 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
  
     info.count = x * y * z;
     info.instance_count = 1;
-@@ -14244,7 +14832,26 @@
+@@ -14244,7 +14836,26 @@
        radv_emit_direct_mesh_draw_packet(cmd_buffer, x, y, z);
     }
  
@@ -17212,7 +17248,7 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
  }
  
  VKAPI_ATTR void VKAPI_CALL
-@@ -14254,6 +14861,8 @@
+@@ -14254,6 +14865,8 @@
     VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
     VK_FROM_HANDLE(radv_buffer, buffer, _buffer);
     struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
@@ -17221,7 +17257,7 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
     struct radv_cmd_stream *cs = cmd_buffer->cs;
  
     radv_cs_add_buffer(device->ws, cs->b, buffer->bo);
-@@ -14268,14 +14877,59 @@
+@@ -14268,14 +14881,59 @@
     radv_CmdDrawMeshTasksIndirect2EXT(commandBuffer, &info);
  }
  
@@ -17285,7 +17321,7 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
  
     info.indirect_va = pInfo->addressRange.address;
     info.stride = pInfo->addressRange.stride;
-@@ -14285,7 +14939,9 @@
+@@ -14285,7 +14943,9 @@
     info.indexed = false;
     info.instance_count = 0;
  
@@ -17296,7 +17332,7 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
        return;
  
     if (radv_cmdbuf_has_stage(cmd_buffer, MESA_SHADER_TASK)) {
-@@ -14294,7 +14950,23 @@
+@@ -14294,7 +14954,23 @@
        radv_emit_indirect_mesh_draw_packets(pdev, cmd_buffer, &info);
     }
  
@@ -17321,7 +17357,7 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
  }
  
  VKAPI_ATTR void VKAPI_CALL
-@@ -14306,6 +14978,8 @@
+@@ -14306,6 +14982,8 @@
     VK_FROM_HANDLE(radv_buffer, buffer, _buffer);
     VK_FROM_HANDLE(radv_buffer, count_buffer, _countBuffer);
     struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
@@ -17330,7 +17366,7 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
     struct radv_cmd_stream *cs = cmd_buffer->cs;
  
     radv_cs_add_buffer(device->ws, cs->b, buffer->bo);
-@@ -14323,14 +14997,60 @@
+@@ -14323,14 +15001,60 @@
     radv_CmdDrawMeshTasksIndirectCount2EXT(commandBuffer, &info);
  }
  
@@ -17395,7 +17431,7 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
  
     info.indirect_va = pInfo->addressRange.address;
     info.stride = pInfo->addressRange.stride;
-@@ -14340,7 +15060,9 @@
+@@ -14340,7 +15064,9 @@
     info.indexed = false;
     info.instance_count = 0;
  
@@ -17406,7 +17442,7 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
        return;
  
     if (radv_cmdbuf_has_stage(cmd_buffer, MESA_SHADER_TASK)) {
-@@ -14356,7 +15078,7 @@
+@@ -14356,7 +15082,7 @@
              return;
           }
  
@@ -17415,7 +17451,7 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
        }
  
        radv_emit_indirect_taskmesh_draw_packets(device, &cmd_buffer->state, cs, cmd_buffer->gang.cs, &info,
-@@ -14365,7 +15087,23 @@
+@@ -14365,7 +15091,23 @@
        radv_emit_indirect_mesh_draw_packets(pdev, cmd_buffer, &info);
     }
  
@@ -17440,7 +17476,7 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
  }
  
  static void radv_before_dispatch(struct radv_cmd_buffer *cmd_buffer, struct radv_compute_pipeline *pipeline);
-@@ -14373,6 +15111,13 @@
+@@ -14373,6 +15115,13 @@
  
  static void radv_before_trace_rays(struct radv_cmd_buffer *cmd_buffer, struct radv_ray_tracing_pipeline *pipeline);
  static void radv_after_trace_rays(struct radv_cmd_buffer *cmd_buffer);
@@ -17454,7 +17490,7 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
  
  /* VK_EXT_device_generated_commands */
  static void
-@@ -14413,8 +15158,13 @@
+@@ -14413,8 +15162,13 @@
     VK_FROM_HANDLE(radv_indirect_command_layout, layout, pGeneratedCommandsInfo->indirectCommandsLayout);
     VK_FROM_HANDLE(radv_indirect_execution_set, ies, pGeneratedCommandsInfo->indirectExecutionSet);
     VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
@@ -17468,7 +17504,7 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
     const bool use_predication = radv_use_dgc_predication(cmd_buffer, pGeneratedCommandsInfo);
     const bool compute = !!(layout->vk.dgc_info & BITFIELD_BIT(MESA_VK_DGC_DISPATCH));
     const bool rt = !!(layout->vk.dgc_info & BITFIELD_BIT(MESA_VK_DGC_RT));
-@@ -14502,6 +15252,18 @@
+@@ -14502,6 +15256,18 @@
        if (layout->vk.dgc_info & BITFIELD_BIT(MESA_VK_DGC_DRAW_MESH)) {
           if (!radv_before_taskmesh_draw(cmd_buffer, &info, 1, true))
              return;
@@ -17487,7 +17523,7 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
        } else {
           if (!radv_before_draw(cmd_buffer, &info, 1, true))
              return;
-@@ -14617,7 +15379,7 @@
+@@ -14617,7 +15383,7 @@
           radeon_begin(cs);
  
           if (pdev->load_grid_size_from_user_sgpr) {
@@ -17496,7 +17532,7 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
  
              radeon_emit(PKT3(PKT3_LOAD_SH_REG_INDEX, 3, 0));
              radeon_emit(info->indirect_va);
-@@ -14649,7 +15411,7 @@
+@@ -14649,7 +15415,7 @@
              if (!radv_cmd_buffer_upload_alloc_aligned(cmd_buffer, sizeof(VkDispatchIndirectCommand), 32, &offset, NULL))
                 return;
  
@@ -17505,7 +17541,7 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
  
              for (uint32_t i = 0; i < 3; i++) {
                 const uint64_t src_va = unaligned_va + i * 4;
-@@ -14733,7 +15495,7 @@
+@@ -14733,7 +15499,7 @@
              if (!radv_cmd_buffer_upload_data(cmd_buffer, 12, blocks, &offset))
                 return;
  
@@ -17514,7 +17550,7 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
  
              radeon_begin(cs);
              radeon_emit_64bit_pointer(grid_size_offset, va);
-@@ -15110,7 +15872,7 @@
+@@ -15110,7 +15876,7 @@
     if (!radv_cmd_buffer_upload_data(cmd_buffer, upload_size, tables, &offset))
        return;
  
@@ -17523,7 +17559,7 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
  
     if (mode == radv_rt_mode_direct)
        *launch_size_va = upload_va + offsetof(VkTraceRaysIndirectCommand2KHR, width);
-@@ -15769,6 +16531,11 @@
+@@ -15769,6 +16535,11 @@
     VkPipelineStageFlags2 dst_stage_mask = 0;
     bool has_image_transitions = false;
  
@@ -17535,7 +17571,7 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
     if (cmd_buffer->state.render.active)
        radv_mark_noncoherent_rb(cmd_buffer);
  
-@@ -16083,6 +16850,8 @@
+@@ -16083,6 +16854,8 @@
     unsigned pred_op = PREDICATION_OP_BOOL32;
     uint64_t emulated_va = 0;
  
@@ -17544,7 +17580,7 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
     radv_emit_cache_flush(cmd_buffer);
  
     if (cmd_buffer->qf == RADV_QUEUE_GENERAL) {
-@@ -16123,7 +16892,7 @@
+@@ -16123,7 +16896,7 @@
              return;
           }
  
@@ -17553,7 +17589,7 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
  
           radeon_check_space(device->ws, cs->b, 8);
  
-@@ -16153,6 +16922,9 @@
+@@ -16153,6 +16926,9 @@
  radv_end_conditional_rendering(struct radv_cmd_buffer *cmd_buffer)
  {
     struct radv_cond_render_state *cond_render = &cmd_buffer->state.cond_render;
@@ -17563,7 +17599,7 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
  
     if (cmd_buffer->qf == RADV_QUEUE_GENERAL) {
        radv_emit_set_predication_state(cmd_buffer, false, 0, 0);
-@@ -16336,7 +17108,7 @@
+@@ -16336,7 +17112,7 @@
     if (!radv_cmd_buffer_upload_alloc_aligned(cmd_buffer, MAX_SO_BUFFERS * 8, 64, &offset, NULL))
        return;
  
@@ -17572,7 +17608,7 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
     so->state_va += offset;
  
     /* GE must be idle when GE_GS_ORDERED_ID is written. */
-@@ -16893,10 +17665,14 @@
+@@ -16893,10 +17669,14 @@
                         const VkShaderEXT *pShaders)
  {
     VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
@@ -17587,7 +17623,7 @@ diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
  
        if (!pShaders) {
           cmd_buffer->state.shader_objs[stage] = NULL;
-@@ -16924,7 +17700,9 @@
+@@ -16924,7 +17704,9 @@
        /* Graphics shaders are handled at draw time because of shader variants. */
     }
  
@@ -18551,11 +18587,12 @@ diff --git a/src/amd/vulkan/radv_instance.c b/src/amd/vulkan/radv_instance.c
  #include "radv_wsi.h"
  
  #include "vk_instance.h"
-@@ -297,6 +298,9 @@
+@@ -297,6 +298,10 @@
     if (!pAllocator)
        pAllocator = vk_default_allocator();
  
-+   /* RADV_DIRECTMESH=1: BC-250 direct Mesh settings, before any option is read. */
++   /* DirectMesh (on with a BC-250 unless RADV_DIRECTMESH=0, or RADV_DIRECTMESH=1): BC-250 direct Mesh settings,
++    * before any option is read. */
 +   radv_bc250_directmesh_env();
 +
     instance = vk_zalloc(pAllocator, sizeof(*instance), 8, VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
@@ -22507,7 +22544,7 @@ diff --git a/src/amd/vulkan/radv_shader.h b/src/amd/vulkan/radv_shader.h
 +      uint32_t lds_cover : 1;
 +      /* RADV_BC250_MESH_MERGED_CHECK: one ranked check gives the adaptive shared and renumbered results. */
 +      uint32_t merged_check : 1;
-+      /* RADV_BC250_MESH_IDXPASS (prototype): eligible Mesh draws become an index pass plus an indexed draw. */
++      /* RADV_BC250_MESH_IDXPASS: eligible Mesh draws become an index pass plus an indexed draw. */
 +      uint32_t idxpass : 1;
 +      uint32_t padding : 18;
 +   } bc250x;
