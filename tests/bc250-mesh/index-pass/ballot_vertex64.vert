@@ -7,6 +7,6 @@ void main() {
  vec2 tile=vec2(float(w&7u),float(w>>3))/4.0-1.0;
  vec2 g=vec2(float(j&7u),float(j>>3))/8.0;
  gl_Position=vec4(tile+g*0.25+vec2(0.01),0.5,1.0);
- vtx=vec4(float(j)/64.0,float(w)/64.0,0.75,1.0);
+ vtx=vec4(float(j+64u)/64.0,float(w)/64.0,0.75,1.0);
  
 }

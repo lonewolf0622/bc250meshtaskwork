@@ -22,7 +22,9 @@
 #include <vector>
 
 class bc250_dgc_nir_interpreter {
+public:
    using value = std::array<uint64_t, 16>;
+private:
    std::vector<value> values;
    nir_block *previous = nullptr;
    uint64_t steps = 0;
@@ -162,6 +164,58 @@ class bc250_dgc_nir_interpreter {
          global_stores++;
          break;
       }
+      case nir_intrinsic_read_first_invocation:
+      case nir_intrinsic_read_invocation:
+      case nir_intrinsic_inclusive_scan:
+      case nir_intrinsic_exclusive_scan:
+      case nir_intrinsic_reduce: {
+         check(bool(collective), "collective interpreter required");
+         value inputs = {};
+         inputs[0] = src(i->src[0]);
+         if (i->intrinsic == nir_intrinsic_read_invocation) inputs[1] = src(i->src[1]);
+         out = collective(i, local_id, inputs);
+         break;
+      }
+      case nir_intrinsic_load_subgroup_invocation: out[0] = local_id % subgroup_size; break;
+      case nir_intrinsic_load_shared: {
+         const unsigned bytes = i->def.bit_size / 8;
+         const uint64_t off = src(i->src[0]) + nir_intrinsic_base(i);
+         check(off + bytes * i->def.num_components <= shared_memory.size(), "shared read out of bounds");
+         for (unsigned c = 0; c < i->def.num_components; c++) {
+            out[c] = 0;
+            memcpy(&out[c], shared_memory.data() + off + c * bytes, bytes);
+         }
+         break;
+      }
+      case nir_intrinsic_store_shared: {
+         const unsigned bytes = i->src[0].ssa->bit_size / 8;
+         const uint64_t off = src(i->src[1]) + nir_intrinsic_base(i);
+         check(off + bytes * i->src[0].ssa->num_components <= shared_memory.size(), "shared write out of bounds");
+         for (unsigned c = 0; c < i->src[0].ssa->num_components; c++) {
+            if (nir_intrinsic_write_mask(i) & (1u << c)) {
+               uint64_t v = src(i->src[0], c);
+               memcpy(shared_memory.data() + off + c * bytes, &v, bytes);
+            }
+         }
+         break;
+      }
+      case nir_intrinsic_store_output: {
+         const unsigned off = (nir_intrinsic_base(i) + src(i->src[1])) * 4 + nir_intrinsic_component(i);
+         check(i->src[0].ssa->bit_size == 32 && off + i->src[0].ssa->num_components <= outputs.size(), "output write out of bounds");
+         for (unsigned c = 0; c < i->src[0].ssa->num_components; c++)
+            if (nir_intrinsic_write_mask(i) & (1u << c)) outputs[off + c] = src(i->src[0], c);
+         break;
+      }
+      case nir_intrinsic_ballot:
+         /* Only an unconditional full wave is supported by the sequential
+          * interpreter. Arbitrary predicates need a collective interpreter. */
+         check(src(i->src[0]) != 0 && subgroup_size == 64, "unsupported ballot predicate or wave");
+         out[0] = i->def.bit_size == 64 ? UINT64_MAX : UINT32_MAX;
+         if (i->def.bit_size == 32) out[1] = UINT32_MAX;
+         break;
+      case nir_intrinsic_load_vertex_id: out[0] = vertex_id; break;
+      case nir_intrinsic_load_draw_id: out[0] = draw_id; break;
+      case nir_intrinsic_load_subgroup_size: out[0] = subgroup_size; break;
       case nir_intrinsic_load_workgroup_id: out[0] = workgroup_id; out[1] = 0; out[2] = 0; break;
       case nir_intrinsic_load_local_invocation_id: out[0] = local_id; out[1] = 0; out[2] = 0; break;
       case nir_intrinsic_load_local_invocation_index: out[0] = local_id; break;
@@ -252,6 +306,10 @@ public:
    std::vector<uint8_t> push_constants;
    unsigned workgroup_id = 0, local_id = 0, num_workgroups = 1;
    uint64_t global_loads = 0, global_stores = 0;
+   unsigned vertex_id = 0, draw_id = 0, subgroup_size = 64;
+   std::function<value(nir_intrinsic_instr *, unsigned, const value &)> collective;
+   std::vector<uint8_t> shared_memory;
+   std::array<uint32_t, 256> outputs = {};
 
    explicit bc250_dgc_nir_interpreter(nir_shader *s) : values(nir_shader_get_entrypoint(s)->ssa_alloc) {}
 

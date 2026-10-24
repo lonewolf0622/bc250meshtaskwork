@@ -8,7 +8,8 @@ icd = Path(os.environ['ICD']).resolve()
 shim = Path(os.environ['SHIM']).resolve()
 out = Path(os.environ.get('OUT', str(here / 'results'))).resolve()
 out.mkdir(parents=True, exist_ok=True)
-for name in ('l32', 's64', 'h64', 'j64', 'm124', 'l128', 'n256', 'pp64', 'pp128', 'ballot64', 'ballot_vertex64'):
+for name in ('l32', 's64', 'h64', 'j64', 'm124', 'l128', 'n256', 'pp64', 'pp128', 'ballot64', 'ballot_vertex64',
+             'branch64', 'nested64', 'dynamic64', 'empty64'):
     for mode in ('off', 'on', 'reference'):
         if name == 'ballot_vertex64' and mode == 'reference':
             continue

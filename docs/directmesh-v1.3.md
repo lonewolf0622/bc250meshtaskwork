@@ -7,7 +7,10 @@ The vertex and primitive slices retain their original invocation ownership. Ball
 operations can remain in index work; a live cross-invocation dependency in vertex or primitive attribute work
 keeps the protected Mesh route. Task pipelines keep their existing routes.
 
-`RADV_DIRECTMESH=1` enables these additions. An explicit value, including `0`, always wins:
+Current builds enable these additions automatically on BC-250 and RDNA 1.
+`RADV_DIRECTMESH=0` disables DirectMesh; individual explicit options also win.
+See [default activation and RDNA 1 status](directmesh-defaults.md).
+The results below describe the earlier BC-250 v1.3 release, which required `RADV_DIRECTMESH=1`:
 
 | Variable | Addition |
 |---|---|
@@ -27,7 +30,7 @@ fragment inputs, task payloads, external memory side effects, multiview render p
 recordings keep Mesh, as do draws recorded while a pipeline-statistics or primitive-count query is active.
 Declining this optional route never refuses the application pipeline.
 
-Multiview: `RADV_DIRECTMESH=1` also sets `RADV_BC250_MESH_MULTIVIEW_VTX=1` (the view layer is a per-vertex export, as
+Multiview: the DirectMesh defaults also set `RADV_BC250_MESH_MULTIVIEW_VTX=1` (the view layer is a per-vertex export, as
 GFX10.1 has no layer field in the primitive export) and `RADV_BC250_TASK_MULTIVIEW=1` (Task+Mesh draws run the Task
 stage once and the Mesh stage once per view). Mesh pipelines with a view mask are then admitted on the protected
 routes instead of being refused. A multiview pipeline that every protected route still refuses is compiled once more

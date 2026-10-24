@@ -57,6 +57,11 @@ bc250_dgc_shape(const struct radv_indirect_command_layout *layout, const void *n
       return false;
    struct radv_graphics_pipeline *p = radv_pipeline_to_graphics(base);
    const struct radv_shader *ms = base->shaders[MESA_SHADER_MESH];
+   /* The pipeline's direct/merge/split admission used the logical Mesh
+    * contract before rewriting NIR. DGC consumes that compiled decision,
+    * including cached plans; it must not infer eligibility from transformed
+    * shader outputs or reanalyze a different logical program at execution.
+    */
    if (!ms || ms->info.ms.has_task ||
        !radv_bc250_mesh_protected_route(ms->info.ms.bc250_safe_direct, p->bc250_ordered,
           p->bc250_direct_split_pieces || (p->bc250_plan.flags & RADV_BC250_PLAN_SPLIT),

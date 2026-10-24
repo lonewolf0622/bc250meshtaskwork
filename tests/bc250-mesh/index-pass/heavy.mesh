@@ -1,0 +1,90 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#ifndef VERTICES
+#define VERTICES 64
+#endif
+#ifndef PER_PRIMITIVE
+#define PER_PRIMITIVE 0
+#endif
+#ifndef USE_BALLOT
+#define USE_BALLOT 0
+#endif
+#ifndef FLAT_ORACLE
+#define FLAT_ORACLE 0
+#endif
+#ifndef DEAD_VERTEX_OUTPUTS
+#define DEAD_VERTEX_OUTPUTS 0
+#endif
+#ifndef DEAD_PRIMITIVE_OUTPUTS
+#define DEAD_PRIMITIVE_OUTPUTS 0
+#endif
+layout(local_size_x=64) in;
+layout(triangles,max_vertices=VERTICES,max_primitives=VERTICES) out;
+#if FLAT_ORACLE
+layout(location=1) flat out vec4 vtx[];
+#else
+layout(location=1) out vec4 vtx[];
+#endif
+#if PER_PRIMITIVE
+layout(location=0) perprimitiveEXT flat out vec4 color[];
+#endif
+#if DEAD_VERTEX_OUTPUTS
+layout(location=2) out vec4 dead_vertex[][DEAD_VERTEX_OUTPUTS];
+#endif
+#if DEAD_PRIMITIVE_OUTPUTS
+layout(location=2+DEAD_VERTEX_OUTPUTS) perprimitiveEXT flat out vec4 dead_primitive[][DEAD_PRIMITIVE_OUTPUTS];
+#endif
+layout(push_constant) uniform Dispatch {
+ uint tag; uint indirect; uint steps;
+#if FLAT_ORACLE
+ uint oracle_corner;
+#endif
+} dispatch;
+void main() {
+ uint w=gl_WorkGroupID.x;
+ SetMeshOutputsEXT(VERTICES,VERTICES);
+ uint population=0u;
+#if USE_BALLOT
+ population=subgroupBallotBitCount(subgroupBallot(true))*(64u/gl_SubgroupSize);
+#endif
+ vec2 tile=vec2(float(w&7u),float(w>>3))/4.0-1.0;
+ for(uint i=gl_LocalInvocationIndex;i<VERTICES;i+=64u) {
+  // Output-dependent, bounded runtime work: it cannot be folded away or cancelled.
+  uint h=(i+1u)*747796405u ^ (w+dispatch.tag)*2891336453u ^ population*277803737u;
+  for(uint step=0u;step<dispatch.steps;step++) {
+   h ^= h>>16u; h *= 2246822519u;
+   h ^= h>>13u; h *= 3266489917u;
+   h ^= h>>16u; h += step*668265263u+374761393u;
+  }
+  vec2 g=VERTICES==64 ? vec2(float(i&7u),float(i>>3))/8.0 :
+                      vec2(float(i%16u),float(i/16u))/vec2(16.0,8.0);
+  gl_MeshVerticesEXT[i].gl_Position=vec4(tile+g*0.25+vec2(0.01),0.5,1.0);
+  vtx[i]=vec4(float(h&255u),float((h>>8u)&255u),float((h>>16u)&255u),255.0)/255.0;
+#if DEAD_VERTEX_OUTPUTS
+  for(uint a=0u;a<DEAD_VERTEX_OUTPUTS;a++)
+   dead_vertex[i][a]=vec4(float(h+a),float(i+a),float(w+a),1.0);
+#endif
+ }
+ for(uint i=gl_LocalInvocationIndex;i<VERTICES;i+=64u) {
+  uint M=VERTICES-1u;
+  uint a=((i&3u)==3u) ? i%2u : (i*5u+w)%M;
+  uint ob=1u+(i*7u)%(M-1u);
+  uint oc=1u+((ob-1u)+1u+(i*3u)%(M-2u))%(M-1u);
+#if FLAT_ORACLE
+  uvec3 triangle=uvec3(a,(a+ob)%M,(a+oc)%M);
+  uint c=dispatch.oracle_corner;
+  triangle=uvec3(triangle[c%3u],triangle[(c+1u)%3u],triangle[(c+2u)%3u]);
+  gl_PrimitiveTriangleIndicesEXT[i]=triangle;
+#else
+  gl_PrimitiveTriangleIndicesEXT[i]=uvec3(a,(a+ob)%M,(a+oc)%M);
+#endif
+#if PER_PRIMITIVE
+  color[i]=vec4(float((i*37u+w*11u)&255u)/255.0,float((i*13u+w*7u)&255u)/255.0,float(i&7u)/7.0,1.0);
+#endif
+#if DEAD_PRIMITIVE_OUTPUTS
+  for(uint a=0u;a<DEAD_PRIMITIVE_OUTPUTS;a++)
+   dead_primitive[i][a]=vec4(float(i+a),float(w+a),float((i*37u+w*11u)&255u)/255.0,1.0);
+#endif
+ }
+}

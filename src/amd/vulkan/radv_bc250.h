@@ -79,6 +79,10 @@ bool radv_bc250_autocull_size_policy(const struct radv_compiler_info *compiler_i
                                    unsigned prims, unsigned wave, unsigned lanes);
 bool radv_bc250_mesh_safe_direct_candidate(struct nir_shader *mesh, bool parallel);
 bool radv_bc250_mesh_safe_direct_candidate_slots(struct nir_shader *mesh, bool parallel, unsigned max_slots);
+struct radv_bc250_mesh_contract;
+bool radv_bc250_mesh_safe_direct_contract_slots(struct nir_shader *mesh,
+                                                const struct radv_bc250_mesh_contract *contract,
+                                                bool parallel, unsigned max_slots);
 /* RADV_BC250_MESH_CLIPCULL_CONST: removes the constant non-negative clip/cull distance stores
  * of a Mesh shader (variables, before the BC250 rewrites). fs: the linked fragment shader
  * (NULL: none); fs_known false: not known (nothing is removed). */
@@ -156,7 +160,7 @@ extern __thread bool radv_bc250_owned_lds_direct;
 /* RADV_BC250_TASK_GRID_FOLD: set only around the Task-route split. */
 extern __thread bool radv_bc250_split_task_grid_fold;
 void radv_bc250_directmesh_env(void);
-/* Set when RADV_DIRECTMESH=1 (and not the user) enabled RADV_BC250_HYBRID_TASK. */
+/* Set when the DirectMesh preset supplies the implicit hybrid Task default. */
 extern bool radv_bc250_directmesh_hybrid;
 bool radv_bc250_bary_cid_slot(const struct nir_shader *producer, const struct nir_shader *fs, int *slot);
 bool radv_bc250_split_mesh(struct nir_shader *mesh, struct nir_shader *task, struct nir_shader *fs, bool direct_split,

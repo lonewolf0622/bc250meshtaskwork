@@ -180,6 +180,8 @@ typedef struct
     * flag (published flag bit 1): referenced vertices renumbered in order, survivors from indices. */
    bool safe_compact;
    nir_def *fast_compact;
+   bool corner_alias;
+   nir_def *fast_corner_alias;
    /* RADV_BC250_MESH_PP_SHARE: shared-vertex plan for the owned private-corner route. */
    bool pp_share;
    /* RADV_BC250_MESH_PP_DIRECT: provoking corner (0 or 2) + 1, 0 when off; the per-primitive generic
@@ -1065,6 +1067,18 @@ ms_emit_attribute_ring_output_stores(nir_builder *b, const uint64_t outputs_mask
 }
 
 static nir_def *
+ms_safe_load_corner_map(nir_builder *b, lower_ngg_ms_state *s, nir_def *index, unsigned components)
+{
+   if (!s->corner_alias)
+      return nir_u2u32(b, nir_load_shared(b, components, 8, index, .base = s->safe_direct_map_addr));
+
+   nir_def *base = nir_bcsel(b, s->fast_corner_alias,
+                             nir_imm_int(b, s->layout.lds.indices_addr),
+                             nir_imm_int(b, s->safe_direct_map_addr));
+   return nir_u2u32(b, nir_load_shared(b, components, 8, nir_iadd(b, base, index)));
+}
+
+static nir_def *
 ms_prim_exp_arg_ch1(nir_builder *b, nir_def *invocation_index, nir_def *num_vtx, lower_ngg_ms_state *s)
 {
    if (s->safe_direct) {
@@ -1082,7 +1096,7 @@ ms_prim_exp_arg_ch1(nir_builder *b, nir_def *invocation_index, nir_def *num_vtx,
          /* RADV_BC250_MESH_SAFE_ADAPTIVE: a clean workgroup exports surviving triangle r with the
           * API indices the checker published at map[3r..3r+2] (readable by every wave). */
          if (s->options->bc250_safe_adaptive && s->fast_clean) {
-            nir_def *mapped = nir_u2u32(b, nir_load_shared(b, 3, 8, first, .base = s->safe_direct_map_addr));
+            nir_def *mapped = ms_safe_load_corner_map(b, s, first, 3);
             nir_def *api[3] = {nir_channel(b, mapped, 0), nir_channel(b, mapped, 1), nir_channel(b, mapped, 2)};
             nir_def *arg = nir_bcsel(b, s->fast_clean, ac_nir_pack_ngg_prim_exp_arg(b, 3, api, NULL, s->ac->gfx_level),
                                      corners);
@@ -1249,12 +1263,12 @@ emit_ms_vertex(nir_builder *b, nir_def *index, nir_def *row, bool exports, bool 
       if (s->fast_clean) {
          nir_def *raw = index;
          nir_if *repair = nir_push_if(b, nir_inot(b, s->fast_clean));
-         nir_def *mapped = nir_u2u32(b, nir_load_shared(b, 1, 8, index, .base = s->safe_direct_map_addr));
+         nir_def *mapped = ms_safe_load_corner_map(b, s, index, 1);
          nir_push_else(b, repair);
          nir_pop_if(b, repair);
          index = nir_if_phi(b, mapped, raw);
       } else {
-         index = nir_u2u32(b, nir_load_shared(b, 1, 8, index, .base = s->safe_direct_map_addr));
+         index = ms_safe_load_corner_map(b, s, index, 1);
       }
    } else if (s->compact_active) {
       /* RADV_BC250_MESH_COMPACT: slot `index` exports the expanded vertex that created it. */
@@ -2802,6 +2816,23 @@ ms_safe_fast_check_wave(nir_builder *b, lower_ngg_ms_state *s, nir_def *vc, nir_
          nir_push_else(b, compact);
       }
       nir_def *sel = nir_bcsel(b, use_all, live_all, live);
+      nir_if *alias = NULL;
+      nir_def *alias_result = NULL;
+      if (s->corner_alias) {
+         /* With the full original primitive stream, slot 3p+c already names
+          * corner c in the API connectivity buffer. Range validation preserves
+          * the old map's clamping for malformed indices: those take the copy
+          * path. Renumbered vertices and removed triangles also keep their map.
+          * The decision is wave-uniform; the publication barrier is unchanged. */
+         nir_def *hi = nir_umax(b, nir_channel(b, idx, 0),
+                                nir_umax(b, nir_channel(b, idx, 1), nir_channel(b, idx, 2)));
+         nir_def *removed = nir_iand(b, live_all, nir_inot(b, sel));
+         nir_def *invalid = nir_iand(b, sel, nir_uge(b, hi, vc));
+         alias = nir_push_if(b, nir_inot(b, nir_vote_any(b, 1, nir_ior(b, removed, invalid))));
+         alias_result = nir_vec3(b, nir_bcsel(b, shared, vc, nir_imul_imm(b, pc, 3)), pc,
+                                   nir_ior_imm(b, nir_b2i32(b, shared), 4));
+         nir_push_else(b, alias);
+      }
       nir_def *mask = nir_ballot(b, 1, 64, sel);
       nir_def *first = nir_imul_imm(b, nir_mbcnt_amd(b, mask, zero), 3);
       nir_def *limit = nir_iadd_imm(b, vc, -1);
@@ -2811,9 +2842,12 @@ ms_safe_fast_check_wave(nir_builder *b, lower_ngg_ms_state *s, nir_def *vc, nir_
       nir_pop_if(b, store);
       nir_def *prims = nir_u2u32(b, nir_bit_count(b, mask));
       nir_def *corner_result = nir_vec3(b, nir_imul_imm(b, prims, 3), prims, zero);
-      if (!s->options->bc250_safe_adaptive)
-         return corner_result;
-      nir_def *result = nir_bcsel(b, shared, nir_vec3(b, vc, prims, nir_imm_int(b, 1)), corner_result);
+      nir_def *result = s->options->bc250_safe_adaptive ?
+         nir_bcsel(b, shared, nir_vec3(b, vc, prims, nir_imm_int(b, 1)), corner_result) : corner_result;
+      if (alias) {
+         nir_pop_if(b, alias);
+         result = nir_if_phi(b, alias_result, result);
+      }
       if (compact) {
          nir_pop_if(b, compact);
          result = nir_if_phi(b, compact_result, result);
@@ -2933,7 +2967,7 @@ ms_safe_check(nir_builder *b, lower_ngg_ms_state *s)
       nir_if *leader = nir_push_if(b, nir_ieq_imm(b, lane, 0));
       nir_store_shared(b, nir_trim_vector(b, result, 2), zero,
                        .base = s->safe_direct_counts_addr, .align_mul = 4);
-      if (!s->options->bc250_safe_corners || s->options->bc250_safe_adaptive)
+      if (!s->options->bc250_safe_corners || s->options->bc250_safe_adaptive || s->corner_alias)
          nir_store_shared(b, nir_channel(b, result, 2), zero,
                           .base = s->safe_direct_latest_addr, .align_mul = 4);
       nir_pop_if(b, leader);
@@ -2950,7 +2984,7 @@ ms_safe_check(nir_builder *b, lower_ngg_ms_state *s)
    if (s->hw_workgroup_size > s->wave_size) {
       nir_if *other = nir_push_if(b, nir_inot(b, is_checker));
       nir_def *counts = nir_load_shared(b, 2, 32, zero, .base = s->safe_direct_counts_addr, .align_mul = 4);
-      nir_def *flags = s->options->bc250_safe_corners && !s->options->bc250_safe_adaptive ? zero :
+      nir_def *flags = s->options->bc250_safe_corners && !s->options->bc250_safe_adaptive && !s->corner_alias ? zero :
          nir_load_shared(b, 1, 32, zero, .base = s->safe_direct_latest_addr, .align_mul = 4);
       nir_def *loaded = nir_vec3(b, nir_channel(b, counts, 0), nir_channel(b, counts, 1), flags);
       nir_pop_if(b, other);
@@ -2966,6 +3000,8 @@ ms_safe_check(nir_builder *b, lower_ngg_ms_state *s)
                    s->options->bc250_safe_corners ? NULL : nir_ine_imm(b, nir_channel(b, result, 2), 0);
    if (s->safe_compact)
       s->fast_compact = nir_ine_imm(b, nir_iand_imm(b, nir_channel(b, result, 2), 2), 0);
+   if (s->corner_alias)
+      s->fast_corner_alias = nir_ine_imm(b, nir_iand_imm(b, nir_channel(b, result, 2), 4), 0);
    s->counts_in_all_lanes = true;
 }
 
@@ -4218,6 +4254,9 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
    uint32_t safe_direct_indices_addr = 0, safe_direct_counts_addr = 0;
    bool safe_compact = false;
    bool pp_share = false;
+   const bool corner_alias = safe_direct && options->bc250_safe_corners &&
+                             options->bc250_safe_check && options->bc250_corner_alias &&
+                             !options->bc250_pp_share && !options->bc250_pp_direct;
    if (safe_direct) {
       assert(!layout.scratch_ring.vtx_attr.mask && !layout.scratch_ring.prm_attr.mask);
       /* Direct-read removes LDS copies by cloning the original per-vertex
@@ -4232,10 +4271,10 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
                                         4 * max_vertices);
       safe_direct_counts_addr = align(safe_direct_indices_addr + 3 * max_primitives, 4);
       if (options->bc250_safe_corners) {
-         /* No remapped connectivity. Plain corners have no flags either, so the counts reuse
-          * that word; RADV_BC250_MESH_SAFE_ADAPTIVE publishes its per-workgroup flag there,
+         /* No remapped connectivity. Plain corners without flags reuse that word
+          * for counts; adaptive exports and corner aliasing publish their flags there,
           * so the counts follow it (other waves read both after the publication barrier). */
-         safe_direct_counts_addr = options->bc250_safe_adaptive ? safe_direct_latest_addr + 4 :
+         safe_direct_counts_addr = options->bc250_safe_adaptive || corner_alias ? safe_direct_latest_addr + 4 :
                                                                   safe_direct_latest_addr;
       }
       layout.lds.total_size = safe_direct_counts_addr + 8 +
@@ -4321,6 +4360,8 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
                  max_vertices, max_primitives, options->max_workgroup_size, options->wave_size, layout.lds.total_size);
    }
    shader->info.shared_size = layout.lds.total_size;
+   if (corner_alias && getenv("BC250_TRACE_COMPILE"))
+      fprintf(stderr, "BC250 MESH CORNER ALIAS: applied V=%u P=%u\n", max_vertices, max_primitives);
    *out_needs_scratch_ring = layout.scratch_ring.vtx_attr.mask || layout.scratch_ring.prm_attr.mask;
 
    /* The workgroup size that is specified by the API shader may be different
@@ -4338,6 +4379,7 @@ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *option
 
    unsigned hw_workgroup_size = options->max_workgroup_size;
    lower_ngg_ms_state state = {
+      .corner_alias = corner_alias,
       .options = options,
       .layout = layout,
       .wave_size = options->wave_size,

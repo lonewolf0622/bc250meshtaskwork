@@ -1,14 +1,19 @@
-# bc250meshtaskwork: DirectMesh for the AMD BC-250
+# bc250meshtaskwork: DirectMesh for BC-250 and RDNA 1
 
 Mesh shader support for the AMD BC-250 (GFX1013, RDNA1-based) in Mesa's RADV Vulkan driver, with Mesh shaders drawn on
 a **safe direct path**: no split/replay, one launch per Mesh workgroup, and built-in protection against the index
 patterns that hang this chip.
 
-**Download:** [patch against stock Mesa 26.2.1](https://github.com/lonewolf0622/bc250meshtaskwork/releases/download/directmesh-v1.3.1/bc250-directmesh-mesa-26.2.1.patch)
-(also in [`patches/`](patches/) and on the [release page](https://github.com/lonewolf0622/bc250meshtaskwork/releases/tag/directmesh-v1.3.1)),
-or build this repository directly (see Build).
+**Development update:** this tree combines v1.3.1's GTT storage fix and inline restore check with the
+shared Mesh contract, automatic stored-output IDX routing and the RDNA 1 port. DirectMesh activates automatically
+on BC-250 and Navi 10/12/14. RDNA 1 has CPU compiler/recording validation only; rendering and performance still
+need testing on those cards. See [current status](docs/directmesh-defaults.md).
 
-On a BC-250 it is on by default (since v1.3.1): no launch option is needed. `RADV_DIRECTMESH=0` turns it off, for
+**Stable v1.3.1 download:** [patch against stock Mesa 26.2.1](https://github.com/lonewolf0622/bc250meshtaskwork/releases/download/directmesh-v1.3.1/bc250-directmesh-mesa-26.2.1.patch)
+(also in [`patches/`](patches/) and on the [release page](https://github.com/lonewolf0622/bc250meshtaskwork/releases/tag/directmesh-v1.3.1)),
+or build this development tree directly (see Build). The stable patch does not contain the newer changes.
+
+On BC-250 and Navi 10/12/14 it is on by default: no launch option is needed. `RADV_DIRECTMESH=0` turns it off, for
 example for one game:
 
 ```
@@ -119,10 +124,10 @@ Keep the build folder in place: the ICD file points at the library inside it.
 
 **As your system driver** (after `meson install`, or through your distribution's packaging): nothing to set.
 
-On a BC-250 (PCI `1002:13fe` or `1002:143f`) the driver enables Mesh shaders and every direct-path setting by itself.
-`RADV_DIRECTMESH=0` turns that off (the driver then behaves as its base BC-250 configuration); `RADV_DIRECTMESH=1`
-turns it on explicitly. Any `RADV_BC250_*` / `BC250_*` variable you set yourself still takes priority, which is useful
-for testing. Other GPUs are unaffected unless `RADV_DIRECTMESH=1` is set.
+On BC-250 and RDNA 1, the driver enables DirectMesh automatically. `RADV_DIRECTMESH=0` disables it;
+`RADV_DIRECTMESH=1` remains an explicit override. Individual `RADV_BC250_*` / `BC250_*` options still take priority.
+BC-250's indexed storage stays in write-combined GTT, preserving v1.3.1's 4K fix. Discrete RDNA 1 keeps that storage
+in local VRAM. Installed drivers are not changed by building this tree.
 
 Useful extras:
 

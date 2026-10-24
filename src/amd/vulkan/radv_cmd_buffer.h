@@ -597,12 +597,20 @@ struct radv_cmd_buffer {
    /* RADV_BC250_MESH_IDXPASS batch: the index passes of consecutive draws are recorded into this side stream; one
     * call reserved before the first of those draws runs them (copied into body at close) followed by one wait. */
    struct radv_cmd_stream *bc250_idx_batch;
+   bool bc250_idx_batch_stored;
    /* The side stream, kept across batches and resets (reset when a batch opens). */
    struct radv_cmd_stream *bc250_idx_side;
    uint32_t *bc250_idx_batch_body;
    uint32_t *bc250_idx_batch_buf;
+   /* Size word in the reserved IB2 call, patched at close. Chained main-stream BOs stay mapped. */
+   uint32_t *bc250_idx_batch_size;
    uint32_t bc250_idx_batch_capacity;
    uint32_t bc250_idx_batch_upload_bytes;
+   /* Optional shared indirect setup: keep the ordinary first setup until a second
+    * call joins. Its replacement scan and wait precede all indirect producers. */
+   uint32_t *bc250_idx_setup_list;
+   uint64_t bc250_idx_setup_list_va;
+   uint32_t bc250_idx_setup_begin_dw, bc250_idx_setup_end_dw;
    /* RADV_BC250_IDX_DEBUG: CPU-visible tables of the first indirect calls, printed when the buffer is reset. */
    uint32_t *bc250_idx_dbg_map[8];
    uint32_t bc250_idx_dbg_max[8];

@@ -18,6 +18,7 @@
 #include "radv_pipeline_layout.h"
 #include "radv_shader.h"
 #include "radv_bc250_pipeline_plan.h"
+#include "radv_bc250_idx_cost.h"
 
 #include "vk_graphics_state.h"
 
@@ -147,10 +148,14 @@ struct radv_graphics_pipeline {
    VkPipelineLayout bc250_idx_layout;
    /* Indirect draws: the setup pass (+ its layout) and the indirect index pass. */
    VkPipeline bc250_idx_setup;
+   VkPipeline bc250_idx_setup_batch;
    VkPipelineLayout bc250_idx_setup_layout;
    VkPipeline bc250_idx_cs_ind;
    uint16_t bc250_idx_vertices, bc250_idx_primitives;
    uint32_t bc250_idx_vertex_stride;
+   uint32_t bc250_idx_output_bytes; /* Experimental stored outputs, bytes per logical group. */
+   bool bc250_idx_automatic;
+   struct radv_bc250_idx_cost bc250_idx_cost;
    uint32_t bc250_payload_stride;
    bool bc250_ordered;
    uint32_t bc250_direct_split_pieces;

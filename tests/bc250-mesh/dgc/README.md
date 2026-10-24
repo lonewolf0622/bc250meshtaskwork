@@ -20,6 +20,7 @@ checks inactive NOP programs and output sentinels. Sixteen count combinations
 per direct/count pair give 576 cases across 18 routes. This proves command
 construction and token resolution; the noop shim cannot prove rendered pixels.
 
-Extension and feature queries check the DGC switch unset, zero, and one, plus
+Extension and feature queries check DGC disabled without DirectMesh, enabled by the DirectMesh profile,
+explicit zero and one overrides, plus
 native Task refusal. Hardware gates are maintained separately in the evidence
 packet and must not be launched as part of this suite.

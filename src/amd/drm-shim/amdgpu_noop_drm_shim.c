@@ -237,5 +237,5 @@ drm_shim_driver_init(void)
    shim_device.version_patchlevel = 0;
 
    /* make drmGetDevices2 and drmProcessPciDevice happy */
-   drm_shim_pci_device_setup(0x1002, 0x15E7, "0000:04:00.0", "amdgpu");
+   drm_shim_pci_device_setup(0x1002, amdgpu_dev->dev.device_id, "0000:04:00.0", "amdgpu");
 }

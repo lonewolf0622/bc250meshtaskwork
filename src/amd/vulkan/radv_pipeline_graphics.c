@@ -20,6 +20,7 @@
 #include "util/u_atomic.h"
 #include "radv_device.h"
 #include "radv_bc250.h"
+#include "radv_bc250_mesh_contract.h"
 #include "radv_entrypoints.h"
 #include "radv_formats.h"
 #include "radv_physical_device.h"
@@ -1769,7 +1770,8 @@ radv_generate_graphics_state_key(const struct radv_compiler_info *compiler_info,
    key.ps.mrt0_alpha_is_dead = !alpha_to_one_unknown && !alpha_to_coverage_unknown && state->ms->alpha_to_one_enable &&
                                !state->ms->alpha_to_coverage_enable;
 
-   if (compiler_info->key.use_ngg) {
+   if (compiler_info->key.use_ngg ||
+       (compiler_info->key.bc250_native_mesh && (state->shader_stages & VK_SHADER_STAGE_MESH_BIT_EXT))) {
       VkShaderStageFlags ngg_stage;
 
       if (state->shader_stages & VK_SHADER_STAGE_GEOMETRY_BIT) {
@@ -1858,6 +1860,10 @@ static void
 radv_fill_shader_info_ngg(const struct radv_compiler_info *compiler_info, struct radv_shader_stage *stages,
                           VkShaderStageFlagBits active_nir_stages)
 {
+   /* Navi14's ordinary graphics stages keep their legacy path. */
+   if (compiler_info->key.bc250_native_mesh && stages[MESA_SHADER_MESH].nir)
+      stages[MESA_SHADER_MESH].info.is_ngg = true;
+
    if (!compiler_info->key.use_ngg)
       return;
 
@@ -2585,6 +2591,9 @@ radv_bc250_mesh_no_split_reason(const struct radv_compiler_info *compiler_info,
    struct radv_shader_stage *ms = &stages[MESA_SHADER_MESH];
    nir_shader *mesh = ms->nir;
    nir_shader *fs = stages[MESA_SHADER_FRAGMENT].nir;
+   struct radv_bc250_mesh_contract contract = {0};
+   if (mesh)
+      radv_bc250_mesh_contract_init(mesh, &contract);
    if (ms->bc250_safe_direct)
       return RADV_BC250_ROUTE_REASON_UNKNOWN;
    if (!compiler_info->key.bc250_mesh_safe_fast && !compiler_info->key.bc250_mesh_safe_pieces &&
@@ -2603,40 +2612,40 @@ radv_bc250_mesh_no_split_reason(const struct radv_compiler_info *compiler_info,
       if (compiler_info->hw.bc250_bary_no_ref || !mesh ||
           !radv_bc250_bary_ref_slots(mesh, fs, &raw_slot, &flat_slot))
          return RADV_BC250_ROUTE_REASON_BARY_REFERENCE;
-      if (mesh->info.mesh.primitive_type == MESA_PRIM_TRIANGLES && mesh->info.mesh.max_primitives_out < 24)
+      if (contract.primitive_type == MESA_PRIM_TRIANGLES && contract.max_primitives < 24)
          return RADV_BC250_ROUTE_REASON_BARY_COST;
       return RADV_BC250_ROUTE_REASON_BARY_PRIVATE;
    }
    if (radv_bc250_merge_fs_refusal(fs))
       return RADV_BC250_ROUTE_REASON_FRAGMENT_ABI;
-   if (mesh && mesh->info.shared_size > 16 * 1024)
+   if (mesh && contract.shared_size > 16 * 1024)
       return RADV_BC250_ROUTE_REASON_SHARED_MEMORY;
    if (ms->bc250_pp_locations || (mesh && radv_bc250_mesh_needs_expansion(mesh)))
       return RADV_BC250_ROUTE_REASON_PER_PRIMITIVE_OUTPUT;
-   if (mesh && (mesh->info.outputs_written & RADV_BC250_CLIPCULL_OUTPUTS))
+   if (mesh && (contract.outputs_written & RADV_BC250_CLIPCULL_OUTPUTS))
       return RADV_BC250_ROUTE_REASON_CLIPCULL_EXPORT;
-   if (!mesh || mesh->info.mesh.primitive_type != MESA_PRIM_TRIANGLES)
+   if (!mesh || contract.primitive_type != MESA_PRIM_TRIANGLES)
       return RADV_BC250_ROUTE_REASON_TOPOLOGY;
-   if (!mesh->info.mesh.max_vertices_out || mesh->info.mesh.max_vertices_out > 256 ||
-       !mesh->info.mesh.max_primitives_out || mesh->info.mesh.max_primitives_out > 256)
+   if (!contract.max_vertices || contract.max_vertices > 256 ||
+       !contract.max_primitives || contract.max_primitives > 256)
       return RADV_BC250_ROUTE_REASON_API_BOUND;
-   if (mesh->info.workgroup_size_variable ||
-       mesh->info.workgroup_size[0] * mesh->info.workgroup_size[1] * mesh->info.workgroup_size[2] > 256)
+   if (contract.workgroup_size_variable ||
+       contract.workgroup_invocations > 256)
       return RADV_BC250_ROUTE_REASON_WORKGROUP_BOUND;
-   const unsigned v = mesh->info.mesh.max_vertices_out;
-   const unsigned p = mesh->info.mesh.max_primitives_out;
+   const unsigned v = contract.max_vertices;
+   const unsigned p = contract.max_primitives;
    const unsigned bound = v <= 32 ? MIN2(v, 3 * p) : 3 * p;
    if (bound > 256)
       return RADV_BC250_ROUTE_REASON_LAUNCH_BOUND;
-   if (mesh->info.outputs_read || mesh->info.outputs_written_16bit)
+   if (contract.outputs_read || contract.outputs_written_16bit)
       return RADV_BC250_ROUTE_REASON_MESH_IO;
-   if (mesh->info.shared_size > 16 * 1024)
+   if (contract.shared_size > 16 * 1024)
       return RADV_BC250_ROUTE_REASON_SHARED_MEMORY;
    const uint64_t special = VARYING_BIT_PRIMITIVE_INDICES | VARYING_BIT_PRIMITIVE_COUNT;
    const uint64_t primitive_id_vertex =
-      (mesh->info.outputs_written & VARYING_BIT_PRIMITIVE_ID) &&
-      !(mesh->info.per_primitive_outputs & VARYING_BIT_PRIMITIVE_ID) ? VARYING_BIT_PRIMITIVE_ID : 0;
-   const uint64_t vertex = mesh->info.outputs_written & ~(special | primitive_id_vertex);
+      (contract.outputs_written & VARYING_BIT_PRIMITIVE_ID) &&
+      !(contract.per_primitive_outputs & VARYING_BIT_PRIMITIVE_ID) ? VARYING_BIT_PRIMITIVE_ID : 0;
+   const uint64_t vertex = contract.outputs_written & ~(special | primitive_id_vertex);
    const uint64_t allowed = VARYING_BIT_POS | primitive_id_vertex | (UINT64_C(0xffffffff) << VARYING_SLOT_VAR0);
    if (!(vertex & VARYING_BIT_POS) || (vertex & ~allowed))
       return RADV_BC250_ROUTE_REASON_MESH_IO;
@@ -2644,21 +2653,15 @@ radv_bc250_mesh_no_split_reason(const struct radv_compiler_info *compiler_info,
                               compiler_info->key.bc250_mesh_safe_pieces ? 16 : 8;
    if (util_bitcount64(vertex) > max_slots)
       return RADV_BC250_ROUTE_REASON_VARYING_LAYOUT;
-   nir_foreach_variable_with_modes(var, mesh, nir_var_shader_out) {
-      if (var->data.location < VARYING_SLOT_VAR0)
-         continue;
-      const struct glsl_type *type = glsl_without_array(var->type);
-      if (!(glsl_type_is_scalar(type) || glsl_type_is_vector(type) || glsl_type_is_matrix(type)) ||
-          glsl_get_bit_size(type) != 32)
-         return RADV_BC250_ROUTE_REASON_VARYING_LAYOUT;
-   }
+   if (contract.non_32bit_generic_output)
+      return RADV_BC250_ROUTE_REASON_VARYING_LAYOUT;
    const bool parallel = p <= 85;
-   const unsigned lds_bound = align(mesh->info.shared_size, 16) + 128 +
+   const unsigned lds_bound = align(contract.shared_size, 16) + 128 +
       16 * util_bitcount64(vertex) * v + 6 * p +
       (parallel ? MAX2(4 * v, align(3 * p, 4) + 32) : 4 * v) + bound;
    if (lds_bound >= 30 * 1024)
       return RADV_BC250_ROUTE_REASON_SHARED_MEMORY;
-   if (!radv_bc250_mesh_safe_direct_candidate_slots(mesh, true, max_slots))
+   if (!radv_bc250_mesh_safe_direct_contract_slots(mesh, &contract, true, max_slots))
       return RADV_BC250_ROUTE_REASON_VARYING_LAYOUT;
    return RADV_BC250_ROUTE_REASON_CANDIDATE_UNPROVEN;
 }
@@ -4433,6 +4436,8 @@ radv_destroy_graphics_pipeline(struct radv_device *device, struct radv_graphics_
       radv_DestroyPipelineLayout(radv_device_to_handle(device), pipeline->bc250_idx_layout, NULL);
    if (pipeline->bc250_idx_setup)
       radv_DestroyPipeline(radv_device_to_handle(device), pipeline->bc250_idx_setup, NULL);
+   if (pipeline->bc250_idx_setup_batch)
+      radv_DestroyPipeline(radv_device_to_handle(device), pipeline->bc250_idx_setup_batch, NULL);
    if (pipeline->bc250_idx_setup_layout)
       radv_DestroyPipelineLayout(radv_device_to_handle(device), pipeline->bc250_idx_setup_layout, NULL);
    if (pipeline->bc250_idx_cs_ind)

@@ -3,6 +3,13 @@
  * No ACE queue, task rings, native TASK packets, or device-generation spoofing.
  */
 #include "radv_bc250.h"
+#include "radv_directmesh.h"
+#ifndef _WIN32
+#include <xf86drm.h>
+#endif
+#include "radv_bc250_idx.h"
+#include "radv_bc250_mesh_contract.h"
+#include "radv_bc250_dispatch.h"
 #include "radv_descriptor_set.h"
 #include "meta/radv_meta.h"
 #include "nir/nir_builder.h"
@@ -342,29 +349,25 @@ radv_bc250_mesh_needs_expansion(nir_shader *mesh)
  * ring. Task, multiview, split and linked-FS exclusions are checked by the caller.
  */
 static bool
-bc250_safe_direct_candidate_pp(nir_shader *mesh, bool parallel, unsigned max_slots, bool private_bary, bool pp_direct)
+bc250_safe_direct_contract(nir_shader *mesh, const struct radv_bc250_mesh_contract *contract,
+                           bool parallel, unsigned max_slots, bool private_bary, bool pp_direct)
 {
-   if (!mesh || mesh->info.stage != MESA_SHADER_MESH || mesh->info.mesh.nv ||
-       mesh->info.mesh.primitive_type != MESA_PRIM_TRIANGLES || mesh->info.task_payload_size ||
-       !mesh->info.mesh.max_vertices_out || mesh->info.mesh.max_vertices_out > 256 ||
-       !mesh->info.mesh.max_primitives_out || mesh->info.mesh.max_primitives_out > 256 ||
-       mesh->info.workgroup_size_variable || mesh->info.outputs_read || mesh->info.outputs_written_16bit ||
-       mesh->info.workgroup_size[0] * mesh->info.workgroup_size[1] * mesh->info.workgroup_size[2] > 256 ||
-       (!private_bary && mesh->info.shared_size > 16 * 1024))
+   if (!mesh)
+      return false;
+   if (contract->stage != MESA_SHADER_MESH || contract->nv ||
+       contract->primitive_type != MESA_PRIM_TRIANGLES || contract->task_payload_size ||
+       !contract->max_vertices || contract->max_vertices > 256 ||
+       !contract->max_primitives || contract->max_primitives > 256 ||
+       contract->workgroup_size_variable || contract->outputs_read || contract->outputs_written_16bit ||
+       contract->workgroup_invocations > 256 ||
+       (!private_bary && contract->shared_size > 16 * 1024))
       return false;
 
-   /* The first gate uses ordinary 32-bit scalar/vector/matrix varyings. Reject
-    * narrow/wide and aggregate generic I/O until separately covered by the oracle. */
-   nir_foreach_variable_with_modes(var, mesh, nir_var_shader_out) {
-      if (var->data.location < VARYING_SLOT_VAR0)
-         continue;
-      const struct glsl_type *type = glsl_without_array(var->type);
-      if (!(glsl_type_is_scalar(type) || glsl_type_is_vector(type) || glsl_type_is_matrix(type)) ||
-          glsl_get_bit_size(type) != 32)
-         return false;
-   }
+   /* Scalar/vector/matrix 32-bit generic I/O is the qualified layout. */
+   if (contract->non_32bit_generic_output)
+      return false;
 
-   const unsigned v = mesh->info.mesh.max_vertices_out, p = mesh->info.mesh.max_primitives_out;
+   const unsigned v = contract->max_vertices, p = contract->max_primitives;
    parallel &= p <= 85; /* Larger small-V classes retain the serial specialization. */
    const unsigned bound = v <= 32 ? MIN2(v, 3 * p) : 3 * p;
    if (bound > 256)
@@ -375,9 +378,9 @@ bc250_safe_direct_candidate_pp(nir_shader *mesh, bool parallel, unsigned max_slo
     * per-primitive value to flat per-vertex data. A raw per-primitive export is
     * still rejected by the check below. */
    const uint64_t primitive_id_vertex =
-      (mesh->info.outputs_written & VARYING_BIT_PRIMITIVE_ID) &&
-      !(mesh->info.per_primitive_outputs & VARYING_BIT_PRIMITIVE_ID) ? VARYING_BIT_PRIMITIVE_ID : 0;
-   const uint64_t vertex = mesh->info.outputs_written & ~(special | primitive_id_vertex);
+      (contract->outputs_written & VARYING_BIT_PRIMITIVE_ID) &&
+      !(contract->per_primitive_outputs & VARYING_BIT_PRIMITIVE_ID) ? VARYING_BIT_PRIMITIVE_ID : 0;
+   const uint64_t vertex = contract->outputs_written & ~(special | primitive_id_vertex);
    const uint64_t allowed = VARYING_BIT_POS | primitive_id_vertex | (private_bary ? VARYING_BIT_PSIZ : 0) |
                             (UINT64_C(0xffffffff) << VARYING_SLOT_VAR0);
    /* Conservative LDS bound includes alignment, original outputs/indices,
@@ -407,11 +410,11 @@ bc250_safe_direct_candidate_pp(nir_shader *mesh, bool parallel, unsigned max_slo
    /* Private corners need only the inverse map and two published counts, not
     * latest[V] or remapped connectivity. 128 + 6P + bound also covers every
     * alignment, workgroup info and original index byte. */
-   const unsigned lds_bound = align(mesh->info.shared_size, 16) + 128 + vertex_stride * v + 6 * p + bound +
+   const unsigned lds_bound = align(contract->shared_size, 16) + 128 + vertex_stride * v + 6 * p + bound +
       (private_bary ? 0 : parallel ? MAX2(4 * v, align(3 * p, 4) + 32) : 4 * v);
    if (private_bary && getenv("BC250_TRACE_COMPILE"))
       fprintf(stderr, "BC250 MESH SAFE BARY: LDS bound=%u shared=%u slots=%u V=%u P=%u\n",
-              lds_bound, mesh->info.shared_size, util_bitcount64(vertex), v, p);
+              lds_bound, contract->shared_size, util_bitcount64(vertex), v, p);
    if (lds_bound >= (private_bary ? 32 : 30) * 1024)
       return false;
    /* RADV_BC250_MESH_PP_DIRECT: per-primitive generic outputs are exported as flat attributes of the
@@ -419,7 +422,24 @@ bc250_safe_direct_candidate_pp(nir_shader *mesh, bool parallel, unsigned max_slo
     * locations: Layer, Viewport, PrimitiveId and CullPrimitive per primitive keep the other routes. */
    const uint64_t pp_allowed = pp_direct ? (UINT64_C(0xffffffff) << VARYING_SLOT_VAR0) : 0;
    return (vertex & VARYING_BIT_POS) && !(vertex & ~allowed) &&
-          !(mesh->info.per_primitive_outputs & ~(special | pp_allowed)) && util_bitcount64(vertex) <= max_slots;
+          !(contract->per_primitive_outputs & ~(special | pp_allowed)) && util_bitcount64(vertex) <= max_slots;
+}
+
+static bool
+bc250_safe_direct_candidate_pp(nir_shader *mesh, bool parallel, unsigned max_slots, bool private_bary, bool pp_direct)
+{
+   if (!mesh)
+      return false;
+   struct radv_bc250_mesh_contract contract;
+   radv_bc250_mesh_contract_init(mesh, &contract);
+   return bc250_safe_direct_contract(mesh, &contract, parallel, max_slots, private_bary, pp_direct);
+}
+
+bool
+radv_bc250_mesh_safe_direct_contract_slots(nir_shader *mesh, const struct radv_bc250_mesh_contract *contract,
+                                         bool parallel, unsigned max_slots)
+{
+   return bc250_safe_direct_contract(mesh, contract, parallel, max_slots, false, false);
 }
 
 static bool
@@ -837,24 +857,6 @@ bc250_merge_refuse(struct radv_bc250_merge_plan *plan, const char *reason)
    return false;
 }
 
-static bool
-bc250_merge_is_subgroup_op(const nir_intrinsic_instr *in)
-{
-   if (in->intrinsic == nir_intrinsic_load_subgroup_id || in->intrinsic == nir_intrinsic_load_num_subgroups)
-      return false;
-   static const char *const keys[] = {
-      "subgroup", "ballot", "vote", "reduce", "scan", "shuffle", "quad", "elect", "read_invocation",
-      "read_first_invocation", "rotate", "swizzle", "first_invocation", "last_invocation", "as_uniform",
-      "dpp", "permlane", "mbcnt", "write_invocation",
-   };
-   const char *name = nir_intrinsic_infos[in->intrinsic].name;
-   for (unsigned i = 0; i < ARRAY_SIZE(keys); i++) {
-      if (strstr(name, keys[i]))
-         return true;
-   }
-   return false;
-}
-
 /* RADV_BC250_MESH_SAFE_PIECES_EXT: a wave32 Mesh shader can run in wave64 unchanged when no subgroup size
  * was required and nothing observes the subgroup: no subgroup operation, subgroup id, subgroup count,
  * subgroup size or invocation. */
@@ -865,19 +867,9 @@ radv_bc250_mesh_wave64_promotable(const struct radv_shader_stage *stage)
    if (!nir || nir->info.stage != MESA_SHADER_MESH || nir->info.min_subgroup_size != 32 ||
        nir->info.max_subgroup_size != 32 || stage->key.subgroup_required_size)
       return false;
-   nir_foreach_function_impl(impl, nir) {
-      nir_foreach_block(block, impl) {
-         nir_foreach_instr(instr, block) {
-            if (instr->type != nir_instr_type_intrinsic)
-               continue;
-            const nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
-            if (in->intrinsic == nir_intrinsic_load_subgroup_id || in->intrinsic == nir_intrinsic_load_num_subgroups ||
-                bc250_merge_is_subgroup_op(in))
-               return false;
-         }
-      }
-   }
-   return true;
+   struct radv_bc250_mesh_contract contract;
+   radv_bc250_mesh_contract_init(nir, &contract);
+   return !contract.observes_subgroup;
 }
 
 void
@@ -909,11 +901,9 @@ bc250_merge_output_array(nir_deref_instr *deref, nir_variable **var)
 bool
 radv_bc250_mesh_has_per_primitive_data(nir_shader *mesh)
 {
-   nir_foreach_variable_with_modes(var, mesh, nir_var_shader_out) {
-      if (var->data.per_primitive && var->data.location != VARYING_SLOT_PRIMITIVE_INDICES)
-         return true;
-   }
-   return false;
+   struct radv_bc250_mesh_contract contract;
+   radv_bc250_mesh_contract_init(mesh, &contract);
+   return contract.has_per_primitive_data || contract.has_per_primitive_cull;
 }
 
 /* Stage 2 moves per-primitive data onto the primitive's provoking vertex and
@@ -952,38 +942,37 @@ bool
 radv_bc250_mesh_merge_plan(nir_shader *mesh, const char *pp_refusal, bool provoking_last,
                            struct radv_bc250_merge_plan *plan)
 {
-   memset(plan, 0, sizeof(*plan));
-   if (!mesh || mesh->info.stage != MESA_SHADER_MESH || mesh->info.mesh.nv)
+   if (!mesh) {
+      memset(plan, 0, sizeof(*plan));
       return bc250_merge_refuse(plan, "not an EXT Mesh shader");
-   if (mesh->info.mesh.primitive_type != MESA_PRIM_TRIANGLES)
+   }
+   struct radv_bc250_mesh_contract contract;
+   radv_bc250_mesh_contract_init(mesh, &contract);
+   memset(plan, 0, sizeof(*plan));
+   if (contract.stage != MESA_SHADER_MESH || contract.nv)
+      return bc250_merge_refuse(plan, "not an EXT Mesh shader");
+   if (contract.primitive_type != MESA_PRIM_TRIANGLES)
       return bc250_merge_refuse(plan, "not triangles");
-   const unsigned V = mesh->info.mesh.max_vertices_out, P = mesh->info.mesh.max_primitives_out;
+   const unsigned V = contract.max_vertices, P = contract.max_primitives;
    if (!V || !P || P > 64)
       return bc250_merge_refuse(plan, "P > 64 (or empty)");
-   if (mesh->info.task_payload_size)
+   if (contract.task_payload_size)
       return bc250_merge_refuse(plan, "task payload");
-   if (mesh->info.workgroup_size_variable)
+   if (contract.workgroup_size_variable)
       return bc250_merge_refuse(plan, "variable workgroup size");
-   const unsigned L = mesh->info.workgroup_size[0] * mesh->info.workgroup_size[1] * mesh->info.workgroup_size[2];
+   const unsigned L = contract.workgroup_invocations;
    if (!L || L > 64)
       return bc250_merge_refuse(plan, "API workgroup larger than a wave64 (case B)");
    /* Stage 2: per-primitive data and CullPrimitive are staged and re-emitted
     * (radv_bc250_merge_mesh). Data needs a pipeline that allows it
     * (pp_refusal == NULL); CullPrimitive alone does not. */
-   bool pp_data = false, pp_cull = false;
-   nir_foreach_variable_with_modes(var, mesh, nir_var_shader_out) {
-      if (!var->data.per_primitive || var->data.location == VARYING_SLOT_PRIMITIVE_INDICES)
-         continue;
-      if (var->data.location == VARYING_SLOT_CULL_PRIMITIVE)
-         pp_cull = true;
-      else
-         pp_data = true;
-   }
+   const bool pp_data = contract.has_per_primitive_data;
+   const bool pp_cull = contract.has_per_primitive_cull;
    const bool pp = pp_data || pp_cull;
-   if (!pp && (mesh->info.outputs_written & VARYING_BIT_CULL_PRIMITIVE))
+   if (!pp && (contract.outputs_written & VARYING_BIT_CULL_PRIMITIVE))
       return bc250_merge_refuse(plan, "CullPrimitive");
    if (!pp && (radv_bc250_mesh_needs_expansion(mesh) ||
-               (mesh->info.per_primitive_outputs & mesh->info.outputs_written & ~VARYING_BIT_PRIMITIVE_INDICES)))
+               (contract.per_primitive_outputs & contract.outputs_written & ~VARYING_BIT_PRIMITIVE_INDICES)))
       return bc250_merge_refuse(plan, "per-primitive output");
    if (pp_data && pp_refusal)
       return bc250_merge_refuse(plan, pp_refusal);
@@ -991,19 +980,16 @@ radv_bc250_mesh_merge_plan(nir_shader *mesh, const char *pp_refusal, bool provok
     * which cannot mix them with an explicit (block) shared layout. */
    if (pp_data && V < 2)
       return bc250_merge_refuse(plan, "per-primitive data with a single vertex");
-   if (pp && mesh->info.shared_memory_explicit_layout)
+   if (pp && contract.shared_memory_explicit_layout)
       return bc250_merge_refuse(plan, "explicit shared memory layout (stage-2 staging)");
-   if (mesh->info.derivative_group != DERIVATIVE_GROUP_NONE)
+   if (contract.derivative_group != DERIVATIVE_GROUP_NONE)
       return bc250_merge_refuse(plan, "derivative groups");
-   if (mesh->info.zero_initialize_shared_memory)
+   if (contract.zero_initialize_shared_memory)
       return bc250_merge_refuse(plan, "zero-initialized shared memory");
-   if (mesh->info.outputs_read)
+   if (contract.outputs_read)
       return bc250_merge_refuse(plan, "reads its outputs");
 
-   unsigned impls = 0;
-   nir_foreach_function_impl(impl, mesh)
-      impls++;
-   if (impls != 1)
+   if (contract.function_count != 1)
       return bc250_merge_refuse(plan, "more than one function");
 
    nir_variable *pos = NULL, *indices = NULL;
@@ -1051,7 +1037,7 @@ radv_bc250_mesh_merge_plan(nir_shader *mesh, const char *pp_refusal, bool provok
    if (!pos || !indices)
       return bc250_merge_refuse(plan, "no position or primitive index output");
 
-   bool subgroup_ops = false;
+   const bool subgroup_ops = contract.subgroup_ops;
    nir_function_impl *impl = nir_shader_get_entrypoint(mesh);
    nir_foreach_block(block, impl) {
       nir_foreach_instr(instr, block) {
@@ -1095,10 +1081,8 @@ radv_bc250_mesh_merge_plan(nir_shader *mesh, const char *pp_refusal, bool provok
          default:
             break;
          }
-         if (bc250_merge_is_subgroup_op(in)) {
-            subgroup_ops = true;
+         if (radv_bc250_mesh_intrinsic_subgroup_op(in))
             continue;
-         }
          for (unsigned i = 0; i < nir_intrinsic_infos[in->intrinsic].num_srcs; i++) {
             nir_deref_instr *deref = nir_src_as_deref(in->src[i]);
             if (deref && nir_deref_mode_may_be(deref, nir_var_shader_out))
@@ -1119,10 +1103,10 @@ radv_bc250_mesh_merge_plan(nir_shader *mesh, const char *pp_refusal, bool provok
     * API workgroups) is overridden. */
    unsigned S, wave = 64;
    if (subgroup_ops) {
-      const bool wave64 = mesh->info.min_subgroup_size == 64 && mesh->info.max_subgroup_size == 64 &&
-                          (!mesh->info.api_subgroup_size || mesh->info.api_subgroup_size == 64);
-      const bool wave32 = mesh->info.min_subgroup_size == 32 && mesh->info.max_subgroup_size == 32 &&
-                          (!mesh->info.api_subgroup_size || mesh->info.api_subgroup_size == 32);
+      const bool wave64 = contract.min_subgroup_size == 64 && contract.max_subgroup_size == 64 &&
+                          (!contract.api_subgroup_size || contract.api_subgroup_size == 64);
+      const bool wave32 = contract.min_subgroup_size == 32 && contract.max_subgroup_size == 32 &&
+                          (!contract.api_subgroup_size || contract.api_subgroup_size == 32);
       /* Wave32 shaders with subgroup operations (typically L <= 32 with
        * wave intrinsics, which RADV runs as one wave32) merge with one
        * instance per wave32 (S = 32): every subgroup operation still sees
@@ -1147,7 +1131,7 @@ radv_bc250_mesh_merge_plan(nir_shader *mesh, const char *pp_refusal, bool provok
    const unsigned C = pp_data ? V - 1 + P : V;
    const unsigned vm = pp ? K * C + 3 : K * V + 3;
    const unsigned lanes = MAX3(K * S, vm, K * P);
-   const unsigned slice = ALIGN_POT(mesh->info.shared_size, 16);
+   const unsigned slice = ALIGN_POT(contract.shared_size, 16);
    /* Worst case of ms_calculate_output_layout: every per-vertex output in LDS,
     * workgroup info and 8-bit primitive indices. Staying under 30 KiB keeps
     * all output storage out of the (hardware-unvalidated) Mesh scratch ring.
@@ -1303,7 +1287,7 @@ bc250_merge_pp_epilogue(nir_builder *b, nir_shader *mesh, nir_function_impl *imp
 #define BC250_PROV_SLOT(j) \
    nir_iadd(b, j, nir_umin(b, nir_iadd_imm(b, nir_udiv_imm(b, nir_imul_imm(b, j, R), P), 1), nir_imm_int(b, R)))
 #define BC250_CORNER(tuple, c, kk) \
-   nir_umin(b, nir_isub(b, nir_channel(b, tuple, c), nir_imul_imm(b, kk, V)), nir_imm_int(b, V - 1))
+   radv_bc250_primitive_local_corner(b, radv_bc250_primitive_make(tuple, NULL, NULL), c, kk, V)
    nir_def *sink = nir_imm_vec4(b, 2.0, 2.0, 2.0, 1.0);
 
    /* Physical vertex h. */
@@ -1379,10 +1363,13 @@ bc250_merge_pp_epilogue(nir_builder *b, nir_shader *mesh, nir_function_impl *imp
       nir_def *base = nir_imul_imm(b, kk, C);
       nir_def *ic = nir_load_deref(b, nir_build_deref_array(b, nir_build_deref_var(b, inst_counts), kk));
       nir_def *keep = nir_ult(b, j, nir_channel(b, ic, 1));
-      if (cull)
-         keep = nir_iand(b, keep, nir_inot(b, nir_load_deref(b,
-            nir_build_deref_array(b, nir_build_deref_var(b, cull), h))));
-      nir_def *tuple = nir_load_deref(b, nir_build_deref_array(b, nir_build_deref_var(b, indices), h));
+      struct radv_bc250_primitive logical = radv_bc250_primitive_make(NULL, NULL, h);
+      if (cull) {
+         logical.culled = nir_load_deref(b, nir_build_deref_array(b, nir_build_deref_var(b, cull), h));
+         keep = radv_bc250_primitive_keep(b, logical, keep);
+      }
+      logical.indices = nir_load_deref(b, nir_build_deref_array(b, nir_build_deref_var(b, indices), h));
+      nir_def *tuple = logical.indices;
       nir_def *corners[3];
       if (plan->provoking) {
          nir_def *first_tuple = nir_load_deref(b, nir_build_deref_array(b, nir_build_deref_var(b, indices),
@@ -1480,8 +1467,8 @@ radv_bc250_merge_mesh(nir_shader *mesh, nir_shader *fs, const struct radv_bc250_
       grid = nir_load_num_workgroups(&b);
    }
    nir_def *nx = nir_channel(&b, grid, 0), *ny = nir_channel(&b, grid, 1);
-   nir_def *n = nir_imul(&b, nir_imul(&b, nx, ny), nir_channel(&b, grid, 2));
-   nir_def *linear = nir_iadd(&b, nir_imul_imm(&b, g, K), k);
+   nir_def *n = radv_bc250_dispatch_count(&b, nx, ny, nir_channel(&b, grid, 2));
+   nir_def *linear = radv_bc250_dispatch_interleave(&b, g, K, k);
    nir_def *instance_valid = nir_iand(&b, nir_ult_imm(&b, k, K), nir_ult(&b, linear, n));
    nir_def *lane_valid = nir_iand(&b, instance_valid, nir_ult_imm(&b, a, L));
    nir_variable *counts = nir_local_variable_create(impl, glsl_uvec_type(2), "bc250_merge_counts");
@@ -1510,8 +1497,7 @@ radv_bc250_merge_mesh(nir_shader *mesh, nir_shader *fs, const struct radv_bc250_
                          nir_udiv_imm(&b, a, lx * ly));
          break;
       case nir_intrinsic_load_workgroup_id:
-         repl = nir_vec3(&b, nir_umod(&b, linear, nx), nir_umod(&b, nir_udiv(&b, linear, nx), ny),
-                         nir_udiv(&b, linear, nir_imul(&b, nx, ny)));
+         repl = radv_bc250_dispatch_unflatten_modulo(&b, linear, nx, ny);
          break;
       case nir_intrinsic_load_workgroup_index:
          repl = linear;
@@ -1941,37 +1927,6 @@ bc250_narrow_index_staging(nir_shader *mesh, nir_function_impl *impl, nir_variab
    return narrow;
 }
 
-/* The staged index tuple of primitive p (32-bit), and its corner c. */
-static nir_def *
-bc250_index_tuple(nir_builder *b, nir_variable *indices, nir_variable *narrow, unsigned corners, nir_def *p)
-{
-   if (!narrow)
-      return nir_load_deref(b, nir_build_deref_array(b, nir_build_deref_var(b, indices), p));
-   nir_def *comps[NIR_MAX_VEC_COMPONENTS];
-   nir_def *first = nir_imul_imm(b, p, corners);
-   for (unsigned c = 0; c < corners; c++)
-      comps[c] = nir_u2u32(b, nir_load_deref(b, nir_build_deref_array(b, nir_build_deref_var(b, narrow),
-                                                                      nir_iadd_imm(b, first, c))));
-   return nir_vec(b, comps, corners);
-}
-
-/* Corner part: load only the selected corner (one LDS load) instead of the
- * tuple and a select. */
-static nir_def *
-bc250_index_corner(nir_builder *b, nir_variable *indices, nir_variable *narrow, unsigned corners, nir_def *p,
-                   nir_def *corner, bool corner_load)
-{
-   if (corners == 1)
-      return bc250_index_tuple(b, indices, narrow, corners, p);
-   if (!corner_load)
-      return nir_vector_extract(b, bc250_index_tuple(b, indices, narrow, corners, p), corner);
-   if (narrow)
-      return nir_u2u32(b, nir_load_deref(b, nir_build_deref_array(b, nir_build_deref_var(b, narrow),
-                                                                 nir_iadd(b, nir_imul_imm(b, p, corners), corner))));
-   return nir_load_deref(b, nir_build_deref_array(b, nir_build_deref_array(b, nir_build_deref_var(b, indices), p),
-                                                  corner));
-}
-
 static bool
 bc250_is_replaced_staging(nir_variable *var, void *data)
 {
@@ -2288,7 +2243,7 @@ radv_bc250_expand_primitive_attributes(nir_shader *mesh, nir_shader *fs, bool co
       i = nir_load_var(&b, it);
       nir_push_if(&b, nir_uge(&b, i, primitives));
       nir_jump(&b, nir_jump_break); nir_pop_if(&b, NULL);
-      nir_def *tuple = bc250_index_tuple(&b, indices, narrow_indices, corners, i);
+      nir_def *tuple = radv_bc250_primitive_load(&b, indices, narrow_indices, corners, i).indices;
       nir_def *first = nir_channel(&b, tuple, 0);
       nir_store_deref(&b, nir_build_deref_array(&b, nir_build_deref_var(&b, representatives), first), i, 1);
       nir_store_deref(&b, nir_build_deref_array(&b, nir_build_deref_var(&b, vertex_map), i), first, 1);
@@ -2299,7 +2254,7 @@ radv_bc250_expand_primitive_attributes(nir_shader *mesh, nir_shader *fs, bool co
       i = nir_load_var(&b, it);
       nir_push_if(&b, nir_uge(&b, i, primitives));
       nir_jump(&b, nir_jump_break); nir_pop_if(&b, NULL);
-      tuple = bc250_index_tuple(&b, indices, narrow_indices, corners, i);
+      tuple = radv_bc250_primitive_load(&b, indices, narrow_indices, corners, i).indices;
       nir_def *mapped_corners[3] = {i, NULL, NULL};
       for (unsigned c = 1; c < 3; c++) {
          nir_def *logical = nir_channel(&b, tuple, c);
@@ -2337,7 +2292,7 @@ radv_bc250_expand_primitive_attributes(nir_shader *mesh, nir_shader *fs, bool co
    nir_def *corner = nir_umod_imm(&b, v, corners);
    nir_def *old_vertex = compact ? nir_load_deref(&b,
       nir_build_deref_array(&b, nir_build_deref_var(&b, vertex_map), v)) :
-      bc250_index_corner(&b, indices, narrow_indices, corners, primitive, corner, corner_load);
+      radv_bc250_primitive_load_corner(&b, indices, narrow_indices, corners, primitive, corner, corner_load);
    for (unsigned i = 0; i < count; i++) {
       if (source[i] == indices)
          continue;
@@ -2681,19 +2636,23 @@ radv_bc250_mesh_safe_owned(nir_shader **mesh_ptr, nir_shader **fs_ptr, bool corn
       fragment = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, original->options, "bc250_empty_fs").shader;
       ralloc_steal(original, fragment);
    }
-   if (!original || !fragment || original->info.mesh.nv ||
-       (original->info.task_payload_size && !(tiny && last)) ||
-       (original->info.mesh.primitive_type != MESA_PRIM_TRIANGLES &&
-        (!tiny || (original->info.mesh.primitive_type != MESA_PRIM_LINES &&
-                   original->info.mesh.primitive_type != MESA_PRIM_POINTS))) ||
-       !original->info.mesh.max_vertices_out || original->info.mesh.max_vertices_out > 256 ||
-       !original->info.mesh.max_primitives_out || original->info.mesh.max_primitives_out > 256 ||
-       (!tiny && 3 * original->info.mesh.max_primitives_out > 192) ||
-       (original->info.outputs_read && !(tiny && last)) || (!tiny && original->info.outputs_written_16bit) ||
-       original->info.shared_memory_explicit_layout || original->info.workgroup_size_variable ||
+   if (!original || !fragment)
+      return false;
+   struct radv_bc250_mesh_contract contract;
+   radv_bc250_mesh_contract_init(original, &contract);
+   if (contract.nv ||
+       (contract.task_payload_size && !(tiny && last)) ||
+       (contract.primitive_type != MESA_PRIM_TRIANGLES &&
+        (!tiny || (contract.primitive_type != MESA_PRIM_LINES &&
+                   contract.primitive_type != MESA_PRIM_POINTS))) ||
+       !contract.max_vertices || contract.max_vertices > 256 ||
+       !contract.max_primitives || contract.max_primitives > 256 ||
+       (!tiny && 3 * contract.max_primitives > 192) ||
+       (contract.outputs_read && !(tiny && last)) || (!tiny && contract.outputs_written_16bit) ||
+       contract.shared_memory_explicit_layout || contract.workgroup_size_variable ||
        (!bary && radv_bc250_merge_fs_refusal(fragment)) ||
-       (bary && (!corners || (!tiny && original->info.mesh.max_primitives_out < 24) ||
-                 (!tiny && original->info.mesh.max_primitives_out > original->info.min_subgroup_size))))
+       (bary && (!corners || (!tiny && contract.max_primitives < 24) ||
+                 (!tiny && contract.max_primitives > contract.min_subgroup_size))))
       return false;
    if (tiny && bc250_mesh_has_16bit_outputs(original) && !(last && io16))
       return false;
@@ -2701,7 +2660,7 @@ radv_bc250_mesh_safe_owned(nir_shader **mesh_ptr, nir_shader **fs_ptr, bool corn
                             VARYING_BIT_PRIMITIVE_COUNT | VARYING_BIT_PRIMITIVE_ID |
                             ((bary || tiny) ? VARYING_BIT_PSIZ : 0) |
                             ((tiny && last) ? (VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT | VARYING_BIT_CULL_PRIMITIVE | RADV_BC250_CLIPCULL_OUTPUTS) : 0) | (UINT64_C(0xffffffff) << VARYING_SLOT_VAR0);
-   if (original->info.outputs_written & ~allowed)
+   if (contract.outputs_written & ~allowed)
       return false;
    nir_shader *mesh = nir_shader_clone(NULL, original);
    nir_shader *fs = nir_shader_clone(NULL, fragment);
@@ -2942,37 +2901,11 @@ bc250_split_flat_index(nir_builder *b, unsigned pieces, bool piece_select)
       return index;
    nir_def *select = nir_load_push_constant(b, 1, 32, nir_imm_int(b, BC250_SPLIT_PIECE_OFFSET), .range = 4);
    return nir_bcsel(b, nir_ieq_imm(b, select, 0), index,
-                    nir_iadd(b, nir_imul_imm(b, index, pieces), nir_iadd_imm(b, select, -1)));
+                    radv_bc250_dispatch_interleave(b, index, pieces, nir_iadd_imm(b, select, -1)));
 }
 
 /* Conservative: any intrinsic that may read buffer, global or image memory
  * (tex instructions are checked by the caller). */
-static bool
-bc250_reads_external_memory(const nir_intrinsic_instr *in)
-{
-   const char *name = nir_intrinsic_infos[in->intrinsic].name;
-   if (in->intrinsic == nir_intrinsic_load_deref)
-      return nir_deref_mode_may_be(nir_src_as_deref(in->src[0]),
-                                   nir_var_mem_ssbo | nir_var_mem_global | nir_var_mem_ubo | nir_var_image);
-   return !strncmp(name, "load_ssbo", 9) || !strncmp(name, "load_ubo", 8) ||
-          !strncmp(name, "load_global", 11) || !strncmp(name, "load_buffer", 11) ||
-          (strstr(name, "image") && strstr(name, "load"));
-}
-
-/* External memory a shader can also write: image loads, and SSBO or global
- * loads not marked non-writeable. UBO loads and tex instructions are not. */
-static bool
-bc250_reads_storage_memory(const nir_intrinsic_instr *in)
-{
-   if (!bc250_reads_external_memory(in))
-      return false;
-   const bool ubo = in->intrinsic == nir_intrinsic_load_deref ?
-      !nir_deref_mode_may_be(nir_src_as_deref(in->src[0]), nir_var_mem_ssbo | nir_var_mem_global | nir_var_image) :
-      !strncmp(nir_intrinsic_infos[in->intrinsic].name, "load_ubo", 8);
-   const bool readonly = nir_intrinsic_has_access(in) && (nir_intrinsic_access(in) & ACCESS_NON_WRITEABLE);
-   return !ubo && !readonly;
-}
-
 static bool
 bc250_split_image_store(const nir_intrinsic_instr *in)
 {
@@ -3092,6 +3025,8 @@ bool
 radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool direct_split, bool piece_select,
                       bool balanced_slices, bool parallel_cull, bool output_regions, bool compact_lds, unsigned piece_ceiling, unsigned min_pieces, unsigned *pieces_out)
 {
+   struct radv_bc250_mesh_contract contract;
+   radv_bc250_mesh_contract_init(mesh, &contract);
    /* piece_ceiling: the per-piece primitive ceiling, RADV_BC250_PERF_PIECE_PRIMS
     * (compiler key, default 63). Performance A/B: up to 85, the size the base
     * driver already runs unsplit with full expansion (3 x 85 = 255 vertices).
@@ -3100,7 +3035,7 @@ radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool d
     * min_pieces: BC250 Mesh LDS fit retry (radv_graphics_pipeline_init): the
     * previous attempt's expanded pieces did not fit in LDS, lower the ceiling
     * until the proven bound needs at least this many (smaller) pieces. */
-   const unsigned declared = mesh->info.mesh.max_primitives_out;
+   const unsigned declared = contract.max_primitives;
    const unsigned bound = bc250_primitive_count_bound(mesh);
    unsigned old_limit = MIN2(CLAMP(piece_ceiling, 1, 85), MAX2(1, declared));
    if (min_pieces > 1 && DIV_ROUND_UP(MAX2(1, bound), old_limit) < min_pieces)
@@ -3120,11 +3055,11 @@ radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool d
     * shapes keep their existing direct routes, which the split would otherwise pre-empt. */
    const bool split_any = (task || radv_bc250_split_refused_retry) &&
                           debug_get_bool_option("RADV_BC250_MESH_SPLIT_ANY", false);
-   const bool topo_ok = mesh->info.mesh.primitive_type == MESA_PRIM_TRIANGLES ||
-      (split_any && (mesh->info.mesh.primitive_type == MESA_PRIM_LINES ||
-                     mesh->info.mesh.primitive_type == MESA_PRIM_POINTS));
-   if (!topo_ok || mesh->info.mesh.nv ||
-       mesh->info.mesh.max_primitives_out > 256 || pieces < 1 || pieces > 5 || (!fs && !split_any))
+   const bool topo_ok = contract.primitive_type == MESA_PRIM_TRIANGLES ||
+      (split_any && (contract.primitive_type == MESA_PRIM_LINES ||
+                     contract.primitive_type == MESA_PRIM_POINTS));
+   if (!topo_ok || contract.nv ||
+       contract.max_primitives > 256 || pieces < 1 || pieces > 5 || (!fs && !split_any))
       return bc250_split_reject("topology/capacity/stage");
    uint64_t primitive_inputs = VARYING_BIT_PRIMITIVE_ID | VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT;
    if (radv_bc250_split_piece_primid && direct_split && !task && fs &&
@@ -3187,7 +3122,7 @@ radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool d
     * through nir_assign_shared_var_locations, which only handles interface
     * blocks and cannot place the split's variables: refuse it.
     */
-   if (mesh->info.shared_memory_explicit_layout)
+   if (contract.shared_memory_explicit_layout)
       return bc250_split_reject("explicit shared memory layout");
 
    /* Check before rewriting. Reject external writes/atomics, non-repeatable
@@ -3216,20 +3151,18 @@ radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool d
     * read-only bindings.
     */
    const bool split_stores = debug_get_bool_option("RADV_BC250_MESH_SPLIT_STORES", false);
-   bool external_atomics = false, reads_external = false, external_stores = false, reads_storage = false;
+   bool external_atomics = false, external_stores = false;
+   const bool reads_external = contract.memory_effects & RADV_BC250_EXTERNAL_READ;
+   const bool reads_storage = contract.memory_effects & RADV_BC250_STORAGE_READ;
    nir_foreach_function_impl(impl, mesh) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
             if (instr->type == nir_instr_type_call)
                return bc250_split_reject("uninlined call");
-            if (instr->type == nir_instr_type_tex)
-               reads_external = true;
             if (instr->type != nir_instr_type_intrinsic)
                continue;
             nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
             const char *name = nir_intrinsic_infos[in->intrinsic].name;
-            reads_external |= bc250_reads_external_memory(in);
-            reads_storage |= bc250_reads_storage_memory(in);
             if (split_stores && bc250_split_image_store(in)) {
                if (nir_intrinsic_access(in) & ACCESS_VOLATILE)
                   return bc250_split_reject("volatile access");
@@ -3394,10 +3327,7 @@ radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool d
             nir_def *dims = nir_load_global(&b, 3, 32, nir_iadd(&b, input, offset), .align_mul = 4);
             nir_def *x = nir_channel(&b, dims, 0), *y = nir_channel(&b, dims, 1);
             nir_def *xy = nir_imul(&b, x, y);
-            nir_def *zid = nir_udiv(&b, linear, xy);
-            nir_def *rest = nir_isub(&b, linear, nir_imul(&b, zid, xy));
-            nir_def *yid = nir_udiv(&b, rest, x);
-            id = nir_vec3(&b, nir_isub(&b, rest, nir_imul(&b, yid, x)), yid, zid);
+            id = radv_bc250_dispatch_unflatten(&b, linear, x, xy);
          } else if (fold) {
             /* Record (pieces, X, Y): flat index L = piece + pieces * (x + X * y). */
             nir_def *a = nir_udiv_imm(&b, nir_load_workgroup_index(&b), pieces);
@@ -3603,7 +3533,8 @@ radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool d
          nir_push_if(&b, nir_ult(&b, lane, pc));
          nir_def *flag = nir_load_deref(&b, nir_build_deref_array(&b, nir_build_deref_var(&b, old_cull),
                                                                nir_iadd(&b, base, lane)));
-         nir_def *live = nir_b2i32(&b, nir_ieq_imm(&b, flag, 0));
+         nir_def *live = nir_b2i32(&b, radv_bc250_primitive_survives(&b,
+            radv_bc250_primitive_make(NULL, flag, NULL)));
          nir_push_else(&b, NULL);
          nir_def *zero = nir_imm_int(&b, 0);
          nir_pop_if(&b, NULL);
@@ -3638,14 +3569,15 @@ radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool d
          nir_push_if(&b, nir_ult(&b, lane, pc));
          nir_def *original = nir_iadd(&b, base, lane);
          flag = nir_load_deref(&b, nir_build_deref_array(&b, nir_build_deref_var(&b, old_cull), original));
-         nir_push_if(&b, nir_ieq_imm(&b, flag, 0));
+         struct radv_bc250_primitive primitive = radv_bc250_primitive_make(NULL, flag, original);
+         nir_push_if(&b, radv_bc250_primitive_survives(&b, primitive));
          nir_def *dst = nir_iadd_imm(&b, nir_load_deref(&b,
             nir_build_deref_array(&b, nir_build_deref_var(&b, ranks), lane)), -1);
          nir_copy_deref(&b, nir_build_deref_array(&b, nir_build_deref_var(&b, indices), dst),
                        nir_build_deref_array(&b, nir_build_deref_var(&b, old_indices), original));
          for (unsigned i = 0; i < attr_count; i++)
             nir_copy_deref(&b, nir_build_deref_array(&b, nir_build_deref_var(&b, new_attrs[i]), dst),
-                          nir_build_deref_array(&b, nir_build_deref_var(&b, old_attrs[i]), original));
+                          nir_build_deref_array(&b, nir_build_deref_var(&b, old_attrs[i]), primitive.attributes));
          nir_pop_if(&b, NULL);
          nir_pop_if(&b, NULL);
          nir_push_if(&b, nir_ieq_imm(&b, lane, 0));
@@ -3665,13 +3597,14 @@ radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool d
       nir_pop_if(&b, NULL);
       nir_def *original = nir_iadd(&b, base, p);
       nir_def *culled = nir_load_deref(&b, nir_build_deref_array(&b, nir_build_deref_var(&b, old_cull), original));
-      nir_push_if(&b, nir_ieq_imm(&b, culled, 0));
+      struct radv_bc250_primitive primitive = radv_bc250_primitive_make(NULL, culled, original);
+      nir_push_if(&b, radv_bc250_primitive_survives(&b, primitive));
       nir_def *dst = nir_load_var(&b, dst_cursor);
       nir_copy_deref(&b, nir_build_deref_array(&b, nir_build_deref_var(&b, indices), dst),
                     nir_build_deref_array(&b, nir_build_deref_var(&b, old_indices), original));
       for (unsigned i = 0; i < attr_count; i++) {
          nir_copy_deref(&b, nir_build_deref_array(&b, nir_build_deref_var(&b, new_attrs[i]), dst),
-                       nir_build_deref_array(&b, nir_build_deref_var(&b, old_attrs[i]), original));
+                       nir_build_deref_array(&b, nir_build_deref_var(&b, old_attrs[i]), primitive.attributes));
       }
       nir_store_var(&b, dst_cursor, nir_iadd_imm(&b, dst, 1), 1);
       nir_pop_if(&b, NULL);
@@ -3785,7 +3718,7 @@ struct bc250_constants {
    uint32_t split_piece;
 };
 static_assert(offsetof(struct bc250_constants, split_piece) == BC250_SPLIT_PIECE_OFFSET, "split piece select");
-static_assert(sizeof(struct bc250_constants) == 72, "the constant block size is unchanged");
+static_assert(sizeof(struct bc250_constants) == RADV_BC250_IDX_CONSTANT_SIZE, "the constant block size is unchanged");
 static_assert(offsetof(struct bc250_constants, application_draw_id) == 20, "DGC count patch ABI");
 static_assert(offsetof(struct bc250_constants, application_constants) == 24, "DGC count patch ABI");
 static_assert(offsetof(struct bc250_constants, input) == 32, "DGC count patch ABI");
@@ -3836,10 +3769,7 @@ bc250_task_index(nir_builder *b)
     * builtins. */
    nir_def *id = nir_load_workgroup_id(b);
    nir_def *size = nir_load_num_workgroups(b);
-   return nir_iadd(b, nir_channel(b, id, 0),
-                  nir_imul(b, nir_channel(b, size, 0),
-                           nir_iadd(b, nir_channel(b, id, 1),
-                                    nir_imul(b, nir_channel(b, size, 1), nir_channel(b, id, 2)))));
+   return radv_bc250_dispatch_flatten(b, id, size);
 }
 
 static nir_def *
@@ -3909,12 +3839,11 @@ bc250_lower_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
       /* This NIR generation has no unsigned-remainder opcode; compute
        * r = g - (g/d)*d. All values are non-negative u64. */
       nir_def *gz = nir_u2u64(b, g);
-      nir_def *qz = nir_udiv(b, gz, xy);
-      nir_def *rem = nir_isub(b, gz, nir_imul(b, qz, xy));
       nir_def *fx64 = nir_u2u64(b, nir_channel(b, full, 0));
-      nir_def *qy = nir_udiv(b, rem, fx64);
-      nir_def *tx64 = nir_isub(b, rem, nir_imul(b, qy, fx64));
-      nir_def *tz = nir_u2u32(b, qz), *ty = nir_u2u32(b, qy), *tx = nir_u2u32(b, tx64);
+      nir_def *logical = radv_bc250_dispatch_unflatten(b, gz, fx64, xy);
+      nir_def *tz = nir_u2u32(b, nir_channel(b, logical, 2));
+      nir_def *ty = nir_u2u32(b, nir_channel(b, logical, 1));
+      nir_def *tx = nir_u2u32(b, nir_channel(b, logical, 0));
       if (intrin->def.num_components == 1) {
          nir_def_rewrite_uses(&intrin->def, tx);
       } else if (intrin->def.num_components == 2) {
@@ -4175,7 +4104,7 @@ bc250_fs_order_independent(nir_shader *fs, const char **reason)
                   BC250_ORDER_REFUSE("atomic result used");
                continue;
             }
-            if (bc250_reads_external_memory(in)) {
+            if ((radv_bc250_mesh_intrinsic_memory_effects(in) & RADV_BC250_EXTERNAL_READ)) {
                const bool ubo = in->intrinsic == nir_intrinsic_load_deref ?
                   !nir_deref_mode_may_be(nir_src_as_deref(in->src[0]),
                                          nir_var_mem_ssbo | nir_var_mem_global | nir_var_image) :
@@ -4472,13 +4401,14 @@ bc250_ordered_counts(nir_builder *b, nir_intrinsic_instr *in, void *data)
    return true;
 }
 static bool
-bc250_ordered_eligible(nir_shader *mesh, nir_shader *fs)
+bc250_ordered_eligible_contract(nir_shader *mesh, nir_shader *fs,
+                               const struct radv_bc250_mesh_contract *contract)
 {
    if (!mesh || !fs)
       return false;
-   const unsigned t = mesh->info.workgroup_size[0] * mesh->info.workgroup_size[1] * mesh->info.workgroup_size[2];
-   if (mesh->info.min_subgroup_size != 64 || mesh->info.mesh.max_vertices_out != 128 || mesh->info.mesh.max_primitives_out != 64 ||
-       (t != 64 && t != 128) || !radv_bc250_mesh_safe_direct_candidate(mesh, true) ||
+   const unsigned t = contract->workgroup_invocations;
+   if (contract->min_subgroup_size != 64 || contract->max_vertices != 128 || contract->max_primitives != 64 ||
+       (t != 64 && t != 128) || !bc250_safe_direct_contract(mesh, contract, true, 8, false, false) ||
        !fs || radv_bc250_merge_fs_refusal(fs))
       return false;
    unsigned n = 0;
@@ -4495,8 +4425,18 @@ bc250_ordered_eligible(nir_shader *mesh, nir_shader *fs)
          return false;
       }
    }
-   return ix && n && mesh->info.shared_size + (n * 128 + 64) * 16 + 4096 <= 65536;
+   return ix && n && contract->shared_size + (n * 128 + 64) * 16 + 4096 <= 65536;
 }
+static bool
+bc250_ordered_eligible(nir_shader *mesh, nir_shader *fs)
+{
+   if (!mesh || !fs)
+      return false;
+   struct radv_bc250_mesh_contract contract;
+   radv_bc250_mesh_contract_init(mesh, &contract);
+   return bc250_ordered_eligible_contract(mesh, fs, &contract);
+}
+
 static VkResult
 bc250_prepare_ordered(struct radv_device *device, struct radv_graphics_pipeline *pipeline,
                        const struct radv_graphics_pipeline_state *gfx_state)
@@ -5068,53 +5008,6 @@ struct bc250_idx_scan {
    const char *why;
 };
 
-static bool
-bc250_idx_is_lane(nir_scalar s)
-{
-   s = nir_scalar_chase_movs(s);
-   return nir_scalar_is_intrinsic(s) && nir_scalar_intrinsic_op(s) == nir_intrinsic_load_local_invocation_index;
-}
-
-/* The vertex index is invocation + k * threads (k >= 0): the invocation that stores vertex v is v % threads. */
-static bool
-bc250_idx_owner(nir_scalar s, unsigned threads, unsigned depth)
-{
-   s = nir_scalar_chase_movs(s);
-   if (depth > 6)
-      return false;
-   if (bc250_idx_is_lane(s))
-      return true;
-   if (nir_scalar_is_alu(s) && nir_scalar_alu_op(s) == nir_op_iadd) {
-      for (unsigned i = 0; i < 2; i++) {
-         nir_scalar o = nir_scalar_chase_alu_src(s, !i);
-         if (nir_scalar_is_const(o) && nir_scalar_as_uint(o) % threads == 0 &&
-             bc250_idx_owner(nir_scalar_chase_alu_src(s, i), threads, depth + 1))
-            return true;
-      }
-   }
-   if (nir_def_instr(s.def)->type == nir_instr_type_phi) {
-      nir_phi_instr *phi = nir_instr_as_phi(nir_def_instr(s.def));
-      nir_cf_node *parent = phi->instr.block->cf_node.parent;
-      if (parent->type != nir_cf_node_loop || nir_loop_first_block(nir_cf_node_as_loop(parent)) != phi->instr.block)
-         return false;
-      unsigned inits = 0;
-      nir_foreach_phi_src(src, phi) {
-         nir_scalar v = nir_scalar_chase_movs(nir_get_scalar(src->src.ssa, 0));
-         if (nir_scalar_is_alu(v) && nir_scalar_alu_op(v) == nir_op_iadd) {
-            nir_scalar a = nir_scalar_chase_alu_src(v, 0), c = nir_scalar_chase_alu_src(v, 1);
-            if ((a.def == &phi->def && nir_scalar_is_const(c) && nir_scalar_as_uint(c) % threads == 0) ||
-                (c.def == &phi->def && nir_scalar_is_const(a) && nir_scalar_as_uint(a) % threads == 0))
-               continue;
-         }
-         if (!bc250_idx_owner(v, threads, depth + 1))
-            return false;
-         inits++;
-      }
-      return inits > 0;
-   }
-   return false;
-}
-
 /* A value read with read_first_invocation is the same in every invocation when nothing it is built from depends
  * on the invocation: invocation-independent sources, and for phis the conditions that pick their source (the if
  * before a merge, every break of a loop). Values still being checked count as independent (loop cycles). */
@@ -5248,48 +5141,22 @@ bc250_idx_lane_free(nir_def *def, unsigned depth)
    return r;
 }
 
-/* The deref of a Mesh output array element: the vertex (or primitive) level array deref right below the variable. */
-static nir_deref_instr *
-bc250_idx_element(nir_deref_instr *d)
-{
-   while (d && d->deref_type != nir_deref_type_var) {
-      nir_deref_instr *parent = nir_deref_instr_parent(d);
-      if (parent && parent->deref_type == nir_deref_type_var)
-         return d->deref_type == nir_deref_type_array ? d : NULL;
-      d = parent;
-   }
-   return NULL;
-}
-
-/* Generic primitive attributes use the same flat fragment inputs as the direct Mesh route.
- * Encode a private provoking corner as V * (primitive + 1) + vertex within each workgroup.
- * This preserves the original vertex index while giving each primitive a distinct flat value. */
-static bool
-bc250_idx_has_pp(const nir_shader *mesh)
-{
-   return mesh->info.per_primitive_outputs & (UINT64_C(0xffffffff) << VARYING_SLOT_VAR0);
-}
-
-static unsigned
-bc250_idx_vertex_stride(const nir_shader *mesh)
-{
-   return mesh->info.mesh.max_vertices_out * (bc250_idx_has_pp(mesh) ? mesh->info.mesh.max_primitives_out + 1 : 1);
-}
-
 /* Admission of the Mesh shader itself. The index pass runs the whole body as a compute shader (shared memory,
  * barriers and subgroup operations included); the vertex shader keeps only the per-vertex work and is checked
  * separately after it is built (bc250_idx_build_vs). */
 static bool
 bc250_idx_eligible(nir_shader *mesh, nir_shader *fs, const char **why)
 {
-   const unsigned threads = mesh->info.workgroup_size[0] * mesh->info.workgroup_size[1] * mesh->info.workgroup_size[2];
+   struct radv_bc250_mesh_contract contract;
+   radv_bc250_mesh_contract_init(mesh, &contract);
+   const unsigned threads = contract.workgroup_invocations;
    *why = NULL;
-   if (mesh->info.mesh.primitive_type != MESA_PRIM_TRIANGLES) { *why = "not triangles"; return false; }
-   if (mesh->info.workgroup_size[1] != 1 || mesh->info.workgroup_size[2] != 1) { *why = "2D/3D workgroup"; return false; }
-   if (mesh->info.task_payload_size) { *why = "task payload"; return false; }
-   if (mesh->info.mesh.max_vertices_out > 256 || mesh->info.mesh.max_primitives_out > 256 || !threads) { *why = "size"; return false; }
+   if (contract.primitive_type != MESA_PRIM_TRIANGLES) { *why = "not triangles"; return false; }
+   if (contract.workgroup_size[1] != 1 || contract.workgroup_size[2] != 1) { *why = "2D/3D workgroup"; return false; }
+   if (contract.task_payload_size) { *why = "task payload"; return false; }
+   if (contract.max_vertices > 256 || contract.max_primitives > 256 || !threads) { *why = "size"; return false; }
    /* Measured: at most 32 vertices the Mesh route is faster (no split, one wave). */
-   if (mesh->info.mesh.max_vertices_out <= 32) { *why = "at most 32 vertices"; return false; }
+   if (contract.max_vertices <= 32) { *why = "at most 32 vertices"; return false; }
    nir_foreach_shader_in_variable(v, fs) {
       if (v->data.per_primitive && v->data.location < VARYING_SLOT_VAR0) { *why = "fragment primitive builtin"; return false; }
    }
@@ -5298,17 +5165,10 @@ bc250_idx_eligible(nir_shader *mesh, nir_shader *fs, const char **why)
        fs->info.inputs_read & (VARYING_BIT_PRIMITIVE_ID | VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT)) {
       *why = "fragment reads primitive-level data"; return false;
    }
-   bool indices = false;
-   nir_foreach_shader_out_variable(v, mesh) {
-      if (v->data.location == VARYING_SLOT_PRIMITIVE_INDICES) {
-         indices = glsl_type_is_array(v->type) && glsl_get_vector_elements(glsl_get_array_element(v->type)) == 3;
-         continue;
-      }
-      if (v->data.per_primitive && v->data.location < VARYING_SLOT_VAR0) { *why = "primitive builtin output"; return false; }
-      if (!glsl_type_is_array(v->type)) { *why = "vertex output type"; return false; }
-   }
-   if (!indices) { *why = "no triangle indices"; return false; }
-   unsigned counts = 0;
+   const uint64_t primitive_builtins = BITFIELD64_MASK(VARYING_SLOT_VAR0) & ~VARYING_BIT_PRIMITIVE_INDICES;
+   if (contract.declared_per_primitive_outputs & primitive_builtins) { *why = "primitive builtin output"; return false; }
+   if (contract.non_array_output) { *why = "vertex output type"; return false; }
+   if (!contract.triangle_index_array) { *why = "no triangle indices"; return false; }
    nir_foreach_function_impl(impl, mesh) {
       if (impl != nir_shader_get_entrypoint(mesh)) { *why = "function calls"; return false; }
       nir_foreach_block(block, impl) {
@@ -5318,7 +5178,6 @@ bc250_idx_eligible(nir_shader *mesh, nir_shader *fs, const char **why)
             nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
             switch (in->intrinsic) {
             case nir_intrinsic_set_vertex_and_primitive_count:
-               counts++;
                break;
             case nir_intrinsic_load_deref: {
                nir_variable *var = nir_deref_instr_get_variable(nir_src_as_deref(in->src[0]));
@@ -5334,13 +5193,6 @@ bc250_idx_eligible(nir_shader *mesh, nir_shader *fs, const char **why)
                      *why = "external memory side effect"; return false;
                   }
                   break;
-               }
-               nir_deref_instr *e = bc250_idx_element(d);
-               if (!e) { *why = "output store shape"; return false; }
-               if (var->data.location == VARYING_SLOT_PRIMITIVE_INDICES) {
-                  if (e != d) { *why = "index store shape"; return false; }
-               } else if (!bc250_idx_owner(nir_get_scalar(e->arr.index.ssa, 0), threads, 0)) {
-                  *why = "vertex store not owned by invocation % workgroup size"; return false;
                }
                break;
             }
@@ -5362,187 +5214,30 @@ bc250_idx_eligible(nir_shader *mesh, nir_shader *fs, const char **why)
          }
       }
    }
-   if (counts != 1) { *why = "not one SetMeshOutputs"; return false; }
+   if (contract.output_store_refusal) { *why = contract.output_store_refusal; return false; }
+   if (contract.allocation_static_sites != 1) {
+      radv_bc250_analyze_mesh_allocation(mesh, &contract);
+      if (!radv_bc250_mesh_allocation_is_canonical(&contract)) {
+         if (!contract.allocation_analysis_complete)
+            *why = "mesh allocation analysis unavailable";
+         else if (!contract.allocation_sites)
+            *why = "no SetMeshOutputs";
+         else if (contract.allocation_may_repeat)
+            *why = "mesh allocation may repeat";
+         else if (!contract.allocation_control_uniform)
+            *why = "mesh allocation control is not workgroup-uniform";
+         else if (!contract.allocation_values_uniform)
+            *why = "mesh allocation values need first-invocation handling";
+         else
+            *why = "mesh output before allocation";
+         return false;
+      }
+      /* The compute producer already collects allocation into one shared count
+       * and one epilogue. Preserve each site's original control flow: moving a
+       * SetMeshOutputs past output writes would violate the Mesh API contract.
+       */
+   }
    return true;
-}
-
-/* Indirect index pass (RADV_BC250_MESH_IDXPASS): one dispatch covers every record of an indirect call. The
- * setup pass published, at constants.xyz, {records n, total workgroups} and the exclusive workgroup prefix of
- * each record (n + 1 entries from +32); constants.input holds each record's size (x, y, z) and
- * constants.input_count its indexed-draw command (firstIndex at +8). A workgroup finds its record r by binary
- * search and runs as workgroup "flat - prefix[r]" of record r with DrawID r. */
-static void
-bc250_idx_indirect_prologue(nir_builder *b, unsigned V, unsigned P, nir_variable *wg_var, nir_variable *draw_var,
-                            nir_def **vbase, nir_def **ibase)
-{
-   nir_def *tab = bc250_pointer(b, 0);
-   nir_def *hdr = nir_load_global(b, 2, 32, tab, .align_mul = 4);
-   nir_def *n = nir_channel(b, hdr, 0), *total = nir_channel(b, hdr, 1);
-   nir_def *wid = nir_load_workgroup_id(b);
-   nir_def *flat = nir_iadd(b, nir_channel(b, wid, 0), nir_imul_imm(b, nir_channel(b, wid, 1), 65535));
-   nir_push_if(b, nir_uge(b, flat, total));
-   nir_jump(b, nir_jump_return);
-   nir_pop_if(b, NULL);
-   nir_variable *lo = nir_local_variable_create(b->impl, glsl_uint_type(), "bc250_idx_lo");
-   nir_variable *hi = nir_local_variable_create(b->impl, glsl_uint_type(), "bc250_idx_hi");
-   nir_store_var(b, lo, nir_imm_int(b, 0), 1);
-   nir_store_var(b, hi, n, 1);
-   nir_def *prefix = nir_iadd_imm(b, tab, 32);
-   nir_push_loop(b);
-   {
-      nir_def *l = nir_load_var(b, lo), *h = nir_load_var(b, hi);
-      nir_break_if(b, nir_uge(b, l, h));
-      nir_def *mid = nir_ushr_imm(b, nir_iadd(b, l, h), 1);
-      nir_def *pv = nir_load_global(b, 1, 32, nir_iadd(b, prefix, nir_u2u64(b, nir_imul_imm(b, nir_iadd_imm(b, mid, 1), 4))),
-                                    .align_mul = 4);
-      nir_push_if(b, nir_uge(b, flat, pv));
-      nir_store_var(b, lo, nir_iadd_imm(b, mid, 1), 1);
-      nir_push_else(b, NULL);
-      nir_store_var(b, hi, mid, 1);
-      nir_pop_if(b, NULL);
-   }
-   nir_pop_loop(b, NULL);
-   nir_def *r = nir_load_var(b, lo);
-   nir_def *local = nir_isub(b, flat, nir_load_global(b, 1, 32, nir_iadd(b, prefix, nir_u2u64(b, nir_imul_imm(b, r, 4))),
-                                                      .align_mul = 4));
-   nir_def *dims = nir_load_global(b, 3, 32, nir_iadd(b, bc250_pointer(b, 32), nir_u2u64(b, nir_imul_imm(b, r, 12))),
-                                   .align_mul = 4);
-   nir_def *dx = nir_channel(b, dims, 0), *dxy = nir_imul(b, dx, nir_channel(b, dims, 1));
-   nir_def *z = nir_udiv(b, local, dxy);
-   nir_def *rest = nir_isub(b, local, nir_imul(b, z, dxy));
-   nir_def *y = nir_udiv(b, rest, dx);
-   nir_store_var(b, wg_var, nir_vec3(b, nir_isub(b, rest, nir_imul(b, y, dx)), y, z), 7);
-   nir_store_var(b, draw_var, r, 1);
-   nir_def *first = nir_load_global(b, 1, 32, nir_iadd(b, bc250_pointer(b, 40), nir_u2u64(b, nir_iadd_imm(b, nir_imul_imm(b, r, 20), 8))),
-                                    .align_mul = 4);
-   *vbase = nir_imul_imm(b, local, V);
-   *ibase = nir_iadd(b, bc250_pointer(b, 8),
-                     nir_u2u64(b, nir_iadd(b, nir_imul_imm(b, first, 4), nir_imul_imm(b, local, P * 12))));
-}
-
-static nir_shader *
-bc250_idx_build_cs(struct radv_device *device, const nir_shader *mesh, bool indirect, unsigned provoking)
-{
-   nir_shader *cs = nir_shader_clone(NULL, mesh);
-   NIR_PASS(_, cs, nir_split_var_copies);
-   NIR_PASS(_, cs, nir_lower_var_copies);
-   const unsigned V = cs->info.mesh.max_vertices_out, P = cs->info.mesh.max_primitives_out;
-   const unsigned threads = cs->info.workgroup_size[0];
-   nir_function_impl *impl = nir_shader_get_entrypoint(cs);
-   nir_builder b = nir_builder_create(impl);
-   nir_variable *wg_var = NULL, *draw_var = NULL;
-   if (indirect) {
-      /* The application's WorkGroupID and DrawID are the record's, found in the prologue. */
-      wg_var = nir_local_variable_create(impl, glsl_uvec_type(3), "bc250_idx_wg");
-      draw_var = nir_local_variable_create(impl, glsl_uint_type(), "bc250_idx_draw");
-      nir_foreach_block_safe(block, impl) {
-         nir_foreach_instr_safe(instr, block) {
-            if (instr->type != nir_instr_type_intrinsic)
-               continue;
-            nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
-            if (in->intrinsic != nir_intrinsic_load_workgroup_id && in->intrinsic != nir_intrinsic_load_draw_id)
-               continue;
-            b.cursor = nir_before_instr(instr);
-            nir_def *v = nir_load_var(&b, in->intrinsic == nir_intrinsic_load_draw_id ? draw_var : wg_var);
-            nir_def_rewrite_uses(&in->def, nir_trim_vector(&b, v, in->def.num_components));
-            nir_instr_remove(instr);
-         }
-      }
-   }
-   /* Direct: the whole grid is one dispatch, WorkGroupID and NumWorkGroups stay the hardware values. */
-   NIR_PASS(_, cs, nir_shader_intrinsics_pass, bc250_lower_application_constants, nir_metadata_none, NULL);
-   /* Application returns end the body only: the epilogue below runs in every invocation. The prologue's exit
-    * (whole workgroup) is lowered after the epilogue exists. */
-   NIR_PASS(_, cs, nir_lower_returns);
-   nir_variable *count = nir_variable_create(cs, nir_var_mem_shared, glsl_uint_type(), "bc250_idx_count");
-   b = nir_builder_create(impl);
-   b.cursor = nir_before_impl(impl);
-   nir_def *vbase, *ibase;
-   if (indirect) {
-      bc250_idx_indirect_prologue(&b, bc250_idx_vertex_stride(mesh), P, wg_var, draw_var, &vbase, &ibase);
-   } else {
-      nir_def *flat = nir_iadd(&b, nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 64), .base = 0,
-                                                        .range = sizeof(struct bc250_constants)),
-                               bc250_task_index(&b));
-      vbase = nir_imul_imm(&b, flat, bc250_idx_vertex_stride(mesh));
-      ibase = bc250_payload_address(&b, nir_imm_int(&b, 0), true);
-   }
-   nir_foreach_block_safe(block, impl) {
-      nir_foreach_instr_safe(instr, block) {
-         if (instr->type != nir_instr_type_intrinsic)
-            continue;
-         nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
-         if (in->intrinsic == nir_intrinsic_set_vertex_and_primitive_count) {
-            b.cursor = nir_before_instr(instr);
-            nir_def *pc = nir_bcsel(&b, nir_ieq_imm(&b, in->src[0].ssa, 0), nir_imm_int(&b, 0),
-                                    nir_umin_imm(&b, in->src[1].ssa, P));
-            nir_store_var(&b, count, pc, 1);
-            nir_instr_remove(instr);
-            continue;
-         }
-         if (in->intrinsic != nir_intrinsic_store_deref)
-            continue;
-         nir_deref_instr *d = nir_src_as_deref(in->src[0]);
-         nir_variable *var = nir_deref_instr_get_variable(d);
-         if (!var || var->data.mode != nir_var_shader_out)
-            continue;
-         b.cursor = nir_before_instr(instr);
-         if (var->data.location == VARYING_SLOT_PRIMITIVE_INDICES) {
-            nir_def *t = d->arr.index.ssa;
-            nir_def *indices = nir_u2u32(&b, in->src[1].ssa);
-            if (bc250_idx_has_pp(mesh)) {
-               nir_def *c[3];
-               for (unsigned j = 0; j < 3; j++) {
-                  c[j] = nir_channel(&b, indices, j);
-                  if (j == provoking)
-                     c[j] = nir_iadd(&b, c[j], nir_imul_imm(&b, nir_iadd_imm(&b, t, 1), V));
-               }
-               indices = nir_vec3(&b, c[0], c[1], c[2]);
-            }
-            nir_def *value = nir_iadd(&b, indices, vbase);
-            nir_store_global(&b, value, nir_iadd(&b, ibase, nir_u2u64(&b, nir_imul_imm(&b, t, 12))),
-                             .write_mask = nir_intrinsic_write_mask(in), .align_mul = 4);
-         }
-         nir_instr_remove(instr);
-      }
-   }
-   b.cursor = nir_before_impl(impl);
-   nir_push_if(&b, nir_ieq_imm(&b, nir_load_local_invocation_index(&b), 0));
-   nir_store_var(&b, count, nir_imm_int(&b, 0), 1);
-   nir_pop_if(&b, NULL);
-   bc250_ordered_barrier(&b);
-   /* Unused primitive slots: degenerate triangles on the workgroup's first vertex (no fragments). */
-   b.cursor = nir_after_impl(impl);
-   /* Also orders the application's own index stores (slots at or past its primitive count are allowed) before the
-    * degenerate fill of other waves. */
-   nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP, .memory_scope = SCOPE_WORKGROUP,
-               .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared | nir_var_mem_global);
-   nir_def *pc = nir_load_var(&b, count);
-   nir_def *lane = nir_load_local_invocation_index(&b);
-   for (unsigned first = 0; first < P; first += threads) {
-      nir_def *t = nir_iadd_imm(&b, lane, first);
-      nir_push_if(&b, nir_iand(&b, nir_uge(&b, t, pc), nir_ult_imm(&b, t, P)));
-      nir_store_global(&b, nir_vec3(&b, vbase, vbase, vbase),
-                       nir_iadd(&b, ibase, nir_u2u64(&b, nir_imul_imm(&b, t, 12))), .write_mask = 7, .align_mul = 4);
-      nir_pop_if(&b, NULL);
-   }
-   nir_progress(true, impl, nir_metadata_none);
-   NIR_PASS(_, cs, nir_lower_returns);
-   NIR_PASS(_, cs, nir_lower_vars_to_ssa);
-   NIR_PASS(_, cs, nir_opt_dce);
-   NIR_PASS(_, cs, nir_remove_dead_derefs);
-   nir_foreach_shader_out_variable_safe(v, cs)
-      exec_node_remove(&v->node);
-   cs->info.stage = MESA_SHADER_COMPUTE;
-   cs->info.outputs_written = 0;
-   cs->info.per_primitive_outputs = 0;
-   cs->info.name = ralloc_asprintf(cs, "bc250_idx_cs%s:%u:%u", indirect ? "_ind" : "", V, P);
-   NIR_PASS(_, cs, nir_lower_vars_to_explicit_types, nir_var_mem_shared, bc250_shared_type);
-   NIR_PASS(_, cs, nir_lower_explicit_io, nir_var_mem_shared, nir_address_format_32bit_offset);
-   NIR_PASS(_, cs, nir_opt_dce);
-   nir_shader_gather_info(cs, impl);
-   nir_validate_shader(cs, "BC250 index pass");
-   return cs;
 }
 
 /* Vertex shader: vertex k = gl_VertexIndex of workgroup g = k / V runs the body as invocation (k % V) % threads
@@ -5615,17 +5310,14 @@ bc250_idx_build_vs(struct radv_device *device, const nir_shader *mesh, const cha
       nir_def *g = nir_udiv_imm(&b, k, vertex_stride);
       nir_def *slot = nir_umod_imm(&b, k, vertex_stride);
       nir_def *v = nir_umod_imm(&b, slot, V);
-      nir_def *prim = nir_iadd_imm(&b, nir_udiv_imm(&b, slot, V), -1);
+      nir_def *prim = radv_bc250_primitive_decode_attribute(&b, slot, V, false);
       nir_def *owned = body ? prim : v;
       nir_def *lane = nir_umod_imm(&b, owned, threads);
       /* The draw passes the grid's x and y sizes in firstInstance (x | y << 16). */
       nir_def *dims = nir_load_base_instance(&b);
       nir_def *gx = nir_iand_imm(&b, dims, 0xffff), *gy = nir_ushr_imm(&b, dims, 16);
       nir_def *gxy = nir_imul(&b, gx, gy);
-      nir_def *gz_id = nir_udiv(&b, g, gxy);
-      nir_def *rest = nir_isub(&b, g, nir_imul(&b, gz_id, gxy));
-      nir_def *gy_id = nir_udiv(&b, rest, gx);
-      nir_def *wg = nir_vec3(&b, nir_isub(&b, rest, nir_imul(&b, gy_id, gx)), gy_id, gz_id);
+      nir_def *wg = radv_bc250_dispatch_unflatten(&b, g, gx, gxy);
       nir_def *sg_id = nir_udiv_imm(&b, lane, wave), *sg_lane = nir_umod_imm(&b, lane, wave);
       nir_def *num_sg = nir_imm_int(&b, DIV_ROUND_UP(threads, wave));
       nir_foreach_block_safe(block, impl) {
@@ -5676,7 +5368,7 @@ bc250_idx_build_vs(struct radv_device *device, const nir_shader *mesh, const cha
                   /* Rebuild the deref chain below the vertex element on the per-vertex variable. */
                   nir_deref_instr *path[8];
                   unsigned depth = 0;
-                  nir_deref_instr *elem = bc250_idx_element(d);
+                  nir_deref_instr *elem = radv_bc250_mesh_output_element(d);
                   for (nir_deref_instr *p = d; p != elem && depth < ARRAY_SIZE(path); p = nir_deref_instr_parent(p))
                      path[depth++] = p;
                   nir_push_if(&b, nir_ieq(&b, nir_u2u32(&b, elem->arr.index.ssa), owned));
@@ -5774,141 +5466,6 @@ bc250_idx_build_vs(struct radv_device *device, const nir_shader *mesh, const cha
    return vs;
 }
 
-/* RADV_BC250_MESH_IDXPASS setup pass for one indirect call (one invocation, records in order). */
-struct bc250_idx_setup_args {
-   uint64_t records, count, table, dims, draws, mesh, pool;
-   uint32_t stride, max_count, capacity, prims;
-   /* First setup of the command buffer: the pool is empty. */
-   uint32_t reset, vertex_stride;
-};
-
-static nir_def *
-bc250_idx_arg(nir_builder *b, unsigned offset, unsigned bits)
-{
-   nir_def *v = nir_load_push_constant(b, bits == 64 ? 2 : 1, 32, nir_imm_int(b, offset), .base = 0,
-                                       .range = sizeof(struct bc250_idx_setup_args));
-   return bits == 64 ? nir_pack_64_2x32(b, v) : v;
-}
-
-/* 64 records per step: wave prefix sums of the index counts (each clamped to capacity + 1, capacity <= 2^25, so
- * no 32-bit sum overflows) and of the workgroup counts, plus running carries. The offsets only grow, so a record
- * fits exactly when its inclusive end is within the capacity; every record from the first that does not fit goes
- * to the Mesh fallback. */
-static nir_shader *
-bc250_idx_build_setup(struct radv_device *device)
-{
-   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
-      &device->compiler_info.nir_options[MESA_SHADER_COMPUTE], "bc250_idx_setup");
-   b.shader->info.workgroup_size[0] = 64;
-   b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
-   b.shader->info.min_subgroup_size = b.shader->info.max_subgroup_size = 64;
-   b.shader->info.api_subgroup_size = 64;
-   nir_def *records = bc250_idx_arg(&b, 0, 64), *count = bc250_idx_arg(&b, 8, 64);
-   nir_def *table = bc250_idx_arg(&b, 16, 64), *dims = bc250_idx_arg(&b, 24, 64);
-   nir_def *draws = bc250_idx_arg(&b, 32, 64), *mesh = bc250_idx_arg(&b, 40, 64), *pool = bc250_idx_arg(&b, 48, 64);
-   nir_def *stride = bc250_idx_arg(&b, 56, 32), *max_count = bc250_idx_arg(&b, 60, 32);
-   nir_def *capacity = bc250_idx_arg(&b, 64, 32), *prims = bc250_idx_arg(&b, 68, 32);
-   nir_def *lane = nir_load_subgroup_invocation(&b);
-   nir_def *zero = nir_imm_int(&b, 0);
-   nir_variable *n_var = nir_local_variable_create(b.impl, glsl_uint_type(), "n");
-   nir_store_var(&b, n_var, max_count, 1);
-   nir_push_if(&b, nir_ine_imm(&b, count, 0));
-   nir_store_var(&b, n_var, nir_umin(&b, nir_read_first_invocation(&b, nir_load_global(&b, 1, 32, count, .align_mul = 4)),
-                                     max_count), 1);
-   nir_pop_if(&b, NULL);
-   nir_def *n = nir_load_var(&b, n_var);
-   nir_variable *base_var = nir_local_variable_create(b.impl, glsl_uint_type(), "base");
-   nir_store_var(&b, base_var, zero, 1);
-   nir_push_if(&b, nir_ieq_imm(&b, bc250_idx_arg(&b, 72, 32), 0));
-   nir_store_var(&b, base_var, nir_read_first_invocation(&b, nir_load_global(&b, 1, 32, pool, .align_mul = 4)), 1);
-   nir_pop_if(&b, NULL);
-   nir_def *base = nir_load_var(&b, base_var);
-   nir_def *limit = nir_iadd_imm(&b, capacity, 1);
-   /* carry: index offset (saturated at capacity + 1); gcarry: fitting workgroups; fb: records sent to the fallback. */
-   nir_variable *first_var = nir_local_variable_create(b.impl, glsl_uint_type(), "first");
-   nir_variable *carry_var = nir_local_variable_create(b.impl, glsl_uint_type(), "carry");
-   nir_variable *gcarry_var = nir_local_variable_create(b.impl, glsl_uint_type(), "gcarry");
-   nir_variable *fb_var = nir_local_variable_create(b.impl, glsl_uint_type(), "fallback");
-   nir_store_var(&b, first_var, zero, 1);
-   nir_store_var(&b, carry_var, nir_umin(&b, base, limit), 1);
-   nir_store_var(&b, gcarry_var, zero, 1);
-   nir_store_var(&b, fb_var, zero, 1);
-   nir_def *prefix = nir_iadd_imm(&b, table, 32);
-   nir_push_loop(&b);
-   {
-      nir_def *first = nir_load_var(&b, first_var);
-      nir_break_if(&b, nir_uge(&b, first, max_count));
-      nir_def *r = nir_iadd(&b, first, lane);
-      nir_def *active = nir_ult(&b, r, n);
-      /* Records past the GPU count: zero fallback records (the fallback may read all max_count). */
-      nir_push_if(&b, nir_iand(&b, nir_inot(&b, active), nir_ult(&b, r, max_count)));
-      nir_store_global(&b, nir_imm_ivec3(&b, 0, 0, 0), nir_iadd(&b, mesh, nir_u2u64(&b, nir_imul_imm(&b, r, 12))),
-                       .align_mul = 4);
-      nir_pop_if(&b, NULL);
-      nir_def *rec_zero = nir_imm_ivec3(&b, 0, 0, 0);
-      nir_push_if(&b, active);
-      nir_def *rec = nir_load_global(&b, 3, 32, nir_iadd(&b, records, nir_u2u64(&b, nir_imul(&b, r, stride))), .align_mul = 4);
-      nir_pop_if(&b, NULL);
-      rec = nir_if_phi(&b, rec, rec_zero);
-      nir_def *x = nir_channel(&b, rec, 0), *y = nir_channel(&b, rec, 1), *z = nir_channel(&b, rec, 2);
-      nir_def *total = nir_imul(&b, nir_imul(&b, nir_u2u64(&b, x), nir_u2u64(&b, y)), nir_u2u64(&b, z));
-      nir_def *valid = nir_iand(&b, nir_iand(&b, active, nir_ult_imm(&b, nir_imul(&b, total, nir_u2u64(&b, bc250_idx_arg(&b, 76, 32))), 1ull << 32)),
-                                nir_iand(&b, nir_iand(&b, nir_ult_imm(&b, x, 65536), nir_ult_imm(&b, y, 65536)),
-                                         nir_iand(&b, nir_ult_imm(&b, z, 65536), nir_ult_imm(&b, total, 4194305))));
-      nir_def *g = nir_bcsel(&b, valid, nir_u2u32(&b, total), zero);
-      nir_def *need64 = nir_imul(&b, nir_u2u64(&b, g), nir_u2u64(&b, nir_imul_imm(&b, prims, 3)));
-      /* An unencodable record begins the fallback suffix, just like pool overflow. */
-      nir_def *need = nir_bcsel(&b, nir_iand(&b, active, nir_inot(&b, valid)), limit,
-                                nir_u2u32(&b, nir_umin(&b, need64, nir_u2u64(&b, limit))));
-      nir_def *carry = nir_load_var(&b, carry_var);
-      nir_def *end = nir_iadd(&b, carry, nir_inclusive_scan(&b, need, .reduction_op = nir_op_iadd));
-      nir_def *fits = nir_iand(&b, valid, nir_uge(&b, capacity, end));
-      nir_def *gfit = nir_bcsel(&b, fits, g, zero);
-      nir_def *gstart = nir_iadd(&b, nir_load_var(&b, gcarry_var), nir_exclusive_scan(&b, gfit, .reduction_op = nir_op_iadd));
-      nir_def *start = nir_isub(&b, end, need);
-      nir_push_if(&b, active);
-      {
-         nir_store_global(&b, gstart, nir_iadd(&b, prefix, nir_u2u64(&b, nir_imul_imm(&b, r, 4))), .align_mul = 4);
-         nir_def *dz = nir_imm_ivec3(&b, 0, 0, 0);
-         nir_store_global(&b, nir_bcsel(&b, fits, rec, dz), nir_iadd(&b, dims, nir_u2u64(&b, nir_imul_imm(&b, r, 12))),
-                          .align_mul = 4);
-         nir_def *daddr = nir_iadd(&b, draws, nir_u2u64(&b, nir_imul_imm(&b, r, 20)));
-         nir_def *draw = nir_vec4(&b, nir_bcsel(&b, fits, need, zero),
-                                  nir_b2i32(&b, nir_iand(&b, fits, nir_ine_imm(&b, g, 0))),
-                                  nir_bcsel(&b, fits, start, zero), zero);
-         nir_store_global(&b, draw, daddr, .align_mul = 4);
-         nir_store_global(&b, nir_bcsel(&b, fits, nir_ior(&b, x, nir_ishl_imm(&b, y, 16)), zero), nir_iadd_imm(&b, daddr, 16),
-                          .align_mul = 4);
-         nir_store_global(&b, nir_bcsel(&b, nir_iand(&b, active, nir_inot(&b, fits)), rec, dz),
-                          nir_iadd(&b, mesh, nir_u2u64(&b, nir_imul_imm(&b, r, 12))), .align_mul = 4);
-      }
-      nir_pop_if(&b, NULL);
-      nir_store_var(&b, carry_var, nir_umin(&b, nir_iadd(&b, carry, nir_reduce(&b, need, .reduction_op = nir_op_iadd)), limit), 1);
-      nir_store_var(&b, gcarry_var, nir_iadd(&b, nir_load_var(&b, gcarry_var), nir_reduce(&b, gfit, .reduction_op = nir_op_iadd)), 1);
-      nir_def *nfb = nir_reduce(&b, nir_b2i32(&b, nir_iand(&b, active, nir_inot(&b, fits))), .reduction_op = nir_op_iadd);
-      nir_store_var(&b, fb_var, nir_iadd(&b, nir_load_var(&b, fb_var), nfb), 1);
-      nir_store_var(&b, first_var, nir_iadd_imm(&b, first, 64), 1);
-   }
-   nir_pop_loop(&b, NULL);
-   nir_push_if(&b, nir_ieq_imm(&b, lane, 0));
-   {
-      nir_def *gt = nir_load_var(&b, gcarry_var);
-      nir_store_global(&b, gt, nir_iadd(&b, prefix, nir_u2u64(&b, nir_imul_imm(&b, n, 4))), .align_mul = 4);
-      nir_def *dx = nir_umin_imm(&b, gt, 65535);
-      nir_def *dy = nir_bcsel(&b, nir_ieq_imm(&b, gt, 0), nir_imm_int(&b, 1),
-                              nir_udiv_imm(&b, nir_iadd_imm(&b, gt, 65534), 65535));
-      nir_def *fallback = nir_bcsel(&b, nir_ine_imm(&b, nir_load_var(&b, fb_var), 0), n, zero);
-      nir_store_global(&b, nir_vec4(&b, n, gt, dx, dy), table, .align_mul = 4);
-      nir_store_global(&b, nir_vec2(&b, nir_imm_int(&b, 1), fallback), nir_iadd_imm(&b, table, 16), .align_mul = 4);
-      /* Pool use: the fitting records' end (the carry saturates past the capacity only on overflow). */
-      nir_store_global(&b, nir_umin(&b, nir_load_var(&b, carry_var), capacity), pool, .align_mul = 4);
-   }
-   nir_pop_if(&b, NULL);
-   NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
-   nir_validate_shader(b.shader, "BC250 index setup");
-   return b.shader;
-}
-
 VkResult
 radv_bc250_prepare_task(struct radv_device *device,
                        struct radv_graphics_pipeline *pipeline,
@@ -5990,8 +5547,11 @@ radv_bc250_prepare_task(struct radv_device *device,
       const bool check_wave_fits = fast_mesh &&
          ((fast_mesh->info.min_subgroup_size == 64 && fast_p <= 64) ||
           (fast_mesh->info.min_subgroup_size == 32 && fast_p <= 32 && fast_v <= 32));
+      struct radv_bc250_mesh_contract fast_contract;
+      if (fast_mesh)
+         radv_bc250_mesh_contract_init(fast_mesh, &fast_contract);
       const bool proven_plain = check_wave_fits && fast_launch <= 256 &&
-         bc250_safe_direct_candidate(fast_mesh, true, 16, false) &&
+         bc250_safe_direct_contract(fast_mesh, &fast_contract, true, 16, false, false) &&
          !radv_bc250_mesh_fs_refused(&device->compiler_info, stages[MESA_SHADER_FRAGMENT].nir);
       /* RADV_BC250_MESH_PP_DIRECT: per-primitive generic outputs on the same one-wave route, without
        * private-corner expansion. Needs a static provoking vertex (its corner owns a fresh slot). */
@@ -6001,7 +5561,7 @@ radv_bc250_prepare_task(struct radv_device *device,
          fast_launch <= 256 && fast_mesh->info.mesh.primitive_type == MESA_PRIM_TRIANGLES &&
          (fast_mesh->info.per_primitive_outputs & (UINT64_C(0xffffffff) << VARYING_SLOT_VAR0)) &&
          !gfx_state->key.gfx_state.dynamic_provoking_vtx_mode && 3 * fast_p <= 192 &&
-         bc250_safe_direct_candidate_pp(fast_mesh, true, 16, false, true) &&
+         bc250_safe_direct_contract(fast_mesh, &fast_contract, true, 16, false, true) &&
          !radv_bc250_mesh_fs_refused(&device->compiler_info, stages[MESA_SHADER_FRAGMENT].nir);
       if (pp_direct) {
          struct radv_shader_stage *ms = &stages[MESA_SHADER_MESH];
@@ -6016,7 +5576,7 @@ radv_bc250_prepare_task(struct radv_device *device,
          return VK_SUCCESS;
       }
       if (proven_plain || (!radv_bc250_mesh_fs_refused(&device->compiler_info, stages[MESA_SHADER_FRAGMENT].nir) &&
-                          bc250_ordered_eligible(fast_mesh, stages[MESA_SHADER_FRAGMENT].nir))) {
+                          bc250_ordered_eligible_contract(fast_mesh, stages[MESA_SHADER_FRAGMENT].nir, &fast_contract))) {
          stages[MESA_SHADER_MESH].bc250_safe_fast = true;
          if (getenv("BC250_TRACE_COMPILE"))
             fprintf(stderr, "BC250 MESH SAFE FAST: V=%u P=%u bound=%u launch=%u single-pass lossless\n",
@@ -7845,58 +7405,46 @@ radv_bc250_draw_merge_indirect(struct radv_cmd_buffer *cmd_buffer, unsigned merg
    cmd_buffer->bc250_merge_dims_va = 0;
 }
 
-/* RADV_DIRECTMESH=1: one switch for the BC-250 direct Mesh path. Before the instance reads any option,
- * fill in the BC-250 base settings and every validated direct-path switch that is not already set
- * (explicitly set variables always win). The base configuration passed Mesh CTS 3,558/3,558;
- * additions require their own release validation. The switches themselves only act on GFX1013. */
-bool radv_bc250_directmesh_hybrid;
-
-/* True when the system has a BC-250 (Cyan Skillfish, GFX1013) GPU. Runs before any device is opened, so it
- * reads the PCI ids from sysfs. */
+/* Apply defaults before any cached options are read. Discovery reads DRM PCI
+ * metadata only; GPU submission is not needed. Explicit options always win. */
 static bool
-radv_bc250_present(void)
+radv_directmesh_detect(void)
 {
-   for (unsigned i = 0; i < 16; i++) {
-      char path[64];
-      unsigned vendor = 0, device = 0;
-      snprintf(path, sizeof(path), "/sys/class/drm/card%u/device/vendor", i);
-      FILE *f = fopen(path, "r");
-      if (!f)
-         continue;
-      bool ok = fscanf(f, "%x", &vendor) == 1;
-      fclose(f);
-      snprintf(path, sizeof(path), "/sys/class/drm/card%u/device/device", i);
-      f = fopen(path, "r");
-      if (!f)
-         continue;
-      ok = ok && fscanf(f, "%x", &device) == 1;
-      fclose(f);
-      if (ok && vendor == 0x1002 && (device == 0x13fe || device == 0x143f))
-         return true;
+#ifndef _WIN32
+   drmDevicePtr devices[64];
+   int count = drmGetDevices2(0, devices, ARRAY_SIZE(devices));
+   bool found = false;
+   for (int i = 0; i < count; i++) {
+      if (devices[i]->bustype == DRM_BUS_PCI &&
+          (devices[i]->available_nodes & (1 << DRM_NODE_RENDER)) &&
+          radv_directmesh_pci(devices[i]->deviceinfo.pci->vendor_id,
+                             devices[i]->deviceinfo.pci->device_id))
+         found = true;
    }
+   if (count > 0)
+      drmFreeDevices(devices, count);
+   return found;
+#else
    return false;
+#endif
 }
+
+bool radv_bc250_directmesh_hybrid;
 
 void
 radv_bc250_directmesh_env(void)
 {
-   /* On by default when a BC-250 is present; RADV_DIRECTMESH=0 (any value but 1) turns it off. Without a
-    * BC-250 and without RADV_DIRECTMESH=1 nothing is set, so other GPUs keep the stock driver. */
+   /* Automatic on supported BC-250 / RDNA1 devices; explicit options win. */
    const char *on = getenv("RADV_DIRECTMESH");
-   if (on ? strcmp(on, "1") != 0 : !radv_bc250_present())
+   if (!radv_directmesh_preset(on, on ? false : radv_directmesh_detect()))
       return;
-   /* Hybrid Task hides GPL, shader objects and pipeline binaries. Remember whether the preset (and not
-    * the user) turned it on, so DXVK (no Mesh shaders in D3D9-11) keeps GPL (radv_physical_device.c).
-    * Decided on the first instance only: the preset's setenv below makes the variable visible to every
-    * later vkCreateInstance, and DXVK creates one instance per DXGI factory. */
-   static bool hybrid_decided;
-   if (!hybrid_decided) {
-      radv_bc250_directmesh_hybrid = getenv("RADV_BC250_HYBRID_TASK") == NULL;
-      hybrid_decided = true;
-   }
+   /* Do not inject HYBRID_TASK into the environment: the loader may unload
+    * this DSO between instances while its setenv values survive. Keeping the
+    * default out of getenv preserves explicit-override provenance after reload. */
+   radv_bc250_directmesh_hybrid = getenv("RADV_BC250_HYBRID_TASK") == NULL;
    static const char *const settings[][2] = {
       /* BC-250 base: Mesh through hybrid Task; split/expansion stays the automatic fallback. */
-      {"RADV_BC250_NATIVE_TASK", "0"}, {"RADV_BC250_HYBRID_TASK", "1"},
+      {"RADV_BC250_NATIVE_TASK", "0"},
       {"BC250_EXPERIMENTAL_COMPUTE_CU_MODE", "false"},
       {"BC250_BALANCED_SLICES", "true"}, {"BC250_SINGLE_PIECE", "true"}, {"BC250_CACHE_PLAN", "true"},
       {"BC250_TRANSIENT_ARENA", "true"}, {"BC250_PARALLEL_CULL", "true"}, {"BC250_COMPACT_VERTICES", "false"},
@@ -7928,6 +7476,9 @@ radv_bc250_directmesh_env(void)
       {"RADV_BC250_MESH_LDS_PLAN", "1"}, {"RADV_BC250_MESH_LDS_COVER", "1"},
       {"RADV_BC250_MESH_MERGED_CHECK", "1"}, {"RADV_BC250_MESH_PP_DIRECT", "1"},
       {"RADV_BC250_MESH_PIECES_65", "1"}, {"RADV_BC250_MESH_IDXPASS", "1"},
+      /* Default selection is driver-side. Numeric values remain diagnostic overrides. */
+      {"RADV_BC250_MESH_IDXPASS_STORE", "auto"},
+      {"RADV_BC250_MESH_IDXPASS_SETUP_BATCH", "1"},
       /* Never the raw route: a Mesh pipeline without a protected route is refused. */
       {"RADV_BC250_MESH_FAIL_CLOSED", "1"},
       /* More shapes admitted to the safe routes (gates PP1, TG1, PX1). */
@@ -8003,6 +7554,11 @@ radv_bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline 
    nir_shader *mesh = radv_shader_spirv_to_nir_cached(&device->compiler_info, NULL, &ms, &options, false);
    nir_shader *frag = radv_shader_spirv_to_nir_cached(&device->compiler_info, NULL, &fs, &options, false);
    nir_shader *cs = NULL, *vs = NULL;
+   unsigned output_bytes = 0;
+   const char *storage = debug_get_option("RADV_BC250_MESH_IDXPASS_STORE", NULL);
+   bool automatic = !storage || !strcmp(storage, "auto");
+   bool stored = automatic || debug_get_bool_option("RADV_BC250_MESH_IDXPASS_STORE", false);
+   struct radv_bc250_idx_cost cost = {0};
    const char *why = NULL;
    if (mesh) {
       NIR_PASS(_, mesh, nir_split_var_copies);
@@ -8013,7 +7569,42 @@ radv_bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline 
          fprintf(stderr, "BC250 MESH IDXPASS: declined (%s)\n", why ? why : "no NIR");
       goto out;
    }
-   vs = bc250_idx_build_vs(device, mesh, &why);
+   if (automatic) {
+      /* Analyze a pruned copy. An unclassified shader retains the established
+       * replay route, including its eligibility checks and Mesh fallbacks.
+       * Never turn an existing indexed win into Mesh merely for lacking a model. */
+      nir_shader *cost_mesh = nir_shader_clone(NULL, mesh);
+      radv_bc250_idx_prune_outputs(cost_mesh, frag);
+      bool modeled = radv_bc250_idx_cost_build(cost_mesh, &cost);
+      ralloc_free(cost_mesh);
+      if (!modeled) {
+         automatic = stored = false;
+         if (trace)
+            fprintf(stderr, "BC250 MESH AUTO: legacy replay (unmodeled vertex work)\n");
+      } else if (cost.vertices < 192 || cost.primitives < 96) {
+         if (trace)
+            fprintf(stderr, "BC250 MESH AUTO: Mesh (modeled small outputs)\n");
+         goto out;
+      }
+   }
+   if (stored) {
+      if (debug_get_bool_option("RADV_BC250_MESH_IDXPASS_PRUNE", true) &&
+          radv_bc250_idx_prune_outputs(mesh, frag) && trace)
+         fprintf(stderr, "BC250 MESH IDXPASS: pruned unused outputs\n");
+      output_bytes = radv_bc250_idx_output_layout(mesh);
+      if (!output_bytes) {
+         why = "stored output layout";
+         if (trace)
+            fprintf(stderr, "BC250 MESH IDXPASS: declined (%s)\n", why);
+         goto out;
+      }
+      vs = radv_bc250_idx_build_stored_vs(&device->compiler_info.nir_options[MESA_SHADER_VERTEX], mesh, output_bytes);
+      /* The fetch shader uses the internal constants; preserve application
+       * fragment constants through the same immutable per-draw upload. */
+      NIR_PASS(_, frag, nir_shader_intrinsics_pass, bc250_lower_application_constants, nir_metadata_none, (void *)1);
+   } else {
+      vs = bc250_idx_build_vs(device, mesh, &why);
+   }
    if (!vs) {
       if (trace)
          fprintf(stderr, "BC250 MESH IDXPASS: declined (%s)\n", why);
@@ -8035,13 +7626,14 @@ radv_bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline 
       }
       radv_bc250_pp_direct_fs_inputs(frag);
    }
-   cs = bc250_idx_build_cs(device, mesh, false, provoking);
+   cs = radv_bc250_idx_build_cs(mesh, false, provoking, output_bytes, bc250_lower_application_constants);
    if (getenv("BC250_IDX_PRINT")) {
       nir_print_shader(cs, stderr);
       nir_print_shader(vs, stderr);
    }
 
-   VkPushConstantRange range = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .size = sizeof(struct bc250_constants)};
+   VkPushConstantRange range = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT |
+      (stored ? VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT : 0), .size = sizeof(struct bc250_constants)};
    VkDescriptorSetLayout sets[MAX_SETS];
    for (unsigned i = 0; i < layout->num_sets; i++)
       sets[i] = layout->set[i].layout ? radv_descriptor_set_layout_to_handle(layout->set[i].layout) : VK_NULL_HANDLE;
@@ -8071,7 +7663,7 @@ radv_bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline 
    if (result != VK_SUCCESS)
       goto fail;
    {
-      nir_shader *ind = bc250_idx_build_cs(device, mesh, true, provoking);
+      nir_shader *ind = radv_bc250_idx_build_cs(mesh, true, provoking, output_bytes, bc250_lower_application_constants);
       if (getenv("BC250_IDX_PRINT"))
          nir_print_shader(ind, stderr);
       ci.stage.module = vk_shader_module_handle_from_nir(ind);
@@ -8086,7 +7678,7 @@ radv_bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline 
       result = radv_CreatePipelineLayout(radv_device_to_handle(device), &sli, NULL, &pipeline->bc250_idx_setup_layout);
       if (result != VK_SUCCESS)
          goto fail;
-      nir_shader *setup = bc250_idx_build_setup(device);
+      nir_shader *setup = radv_bc250_idx_build_setup(&device->compiler_info.nir_options[MESA_SHADER_COMPUTE], stored);
       VkComputePipelineCreateInfo sci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
          .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
                    .module = vk_shader_module_handle_from_nir(setup), .pName = "main"},
@@ -8096,6 +7688,17 @@ radv_bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline 
       ralloc_free(setup);
       if (result != VK_SUCCESS)
          goto fail;
+      /* Keep the established setup shader byte-identical unless this experiment
+       * is explicitly enabled. The extra shader also accepts replay entries. */
+      if (debug_get_bool_option("RADV_BC250_MESH_IDXPASS_SETUP_BATCH", false)) {
+         setup = radv_bc250_idx_build_setup_batch(&device->compiler_info.nir_options[MESA_SHADER_COMPUTE]);
+         sci.stage.module = vk_shader_module_handle_from_nir(setup);
+         result = radv_compute_pipeline_create(radv_device_to_handle(device), device->meta_state.cache, &sci, NULL,
+                                               &pipeline->bc250_idx_setup_batch);
+         ralloc_free(setup);
+         if (result != VK_SUCCESS)
+            goto fail;
+      }
    }
 
    /* The application's graphics state with a vertex shader in place of the Mesh shader: triangle lists from an
@@ -8123,6 +7726,8 @@ radv_bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline 
       }
    }
    VkGraphicsPipelineCreateInfo gci = *pCreateInfo;
+   if (stored)
+      gci.layout = pipeline->bc250_idx_layout;
    gci.stageCount = 2;
    gci.pStages = stages;
    gci.pVertexInputState = &vis;
@@ -8141,9 +7746,16 @@ radv_bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline 
    pipeline->bc250_idx_vertices = mesh->info.mesh.max_vertices_out;
    pipeline->bc250_idx_primitives = mesh->info.mesh.max_primitives_out;
    pipeline->bc250_idx_vertex_stride = bc250_idx_vertex_stride(mesh);
+   pipeline->bc250_idx_output_bytes = output_bytes;
+   pipeline->bc250_idx_automatic = automatic;
+   pipeline->bc250_idx_cost = cost;
+   if (trace && automatic)
+      fprintf(stderr, "BC250 MESH AUTO: stored candidate terms=%u nodes=%u\n", cost.term_count, cost.node_count);
    if (trace)
       fprintf(stderr, "BC250 MESH IDXPASS: applied V=%u P=%u threads=%u\n", pipeline->bc250_idx_vertices,
               pipeline->bc250_idx_primitives, mesh->info.workgroup_size[0]);
+   if (trace && stored)
+      fprintf(stderr, "BC250 MESH IDXPASS: stored outputs bytes/group=%u\n", output_bytes);
    goto out;
 fail:
    if (trace)
@@ -8156,9 +7768,12 @@ fail:
       radv_DestroyPipeline(radv_device_to_handle(device), pipeline->bc250_idx_cs_ind, NULL);
    if (pipeline->bc250_idx_setup)
       radv_DestroyPipeline(radv_device_to_handle(device), pipeline->bc250_idx_setup, NULL);
+   if (pipeline->bc250_idx_setup_batch)
+      radv_DestroyPipeline(radv_device_to_handle(device), pipeline->bc250_idx_setup_batch, NULL);
    if (pipeline->bc250_idx_setup_layout)
       radv_DestroyPipelineLayout(radv_device_to_handle(device), pipeline->bc250_idx_setup_layout, NULL);
    pipeline->bc250_idx_cs = pipeline->bc250_idx_cs_ind = pipeline->bc250_idx_setup = VK_NULL_HANDLE;
+   pipeline->bc250_idx_setup_batch = VK_NULL_HANDLE;
    pipeline->bc250_idx_layout = pipeline->bc250_idx_setup_layout = VK_NULL_HANDLE;
 out:
    ralloc_free(cs);
@@ -8269,6 +7884,25 @@ bc250_idx_reserve(struct radv_device *device, uint32_t bytes)
    }
    return true;
 }
+/* v1.3.1: optional index/output storage must not compete with the BC-250
+ * display in its 512 MiB carveout. Discrete Navi boards retain local VRAM;
+ * diagnostic readback always uses CPU-visible GTT. */
+static VkResult
+bc250_idx_create_storage(struct radv_device *device, uint64_t size, bool cpu, const char *kind,
+                         struct radeon_winsys_bo **bo)
+{
+   const bool gtt = cpu || radv_device_physical(device)->info.family == CHIP_GFX1013;
+   const enum radeon_bo_domain domain = gtt ? RADEON_DOMAIN_GTT : RADEON_DOMAIN_VRAM;
+   const enum radeon_bo_flag flags = RADEON_FLAG_NO_INTERPROCESS_SHARING |
+      (cpu ? RADEON_FLAG_CPU_ACCESS : RADEON_FLAG_NO_CPU_ACCESS | (gtt ? RADEON_FLAG_GTT_WC : 0));
+   VkResult result = radv_bo_create(device, NULL, size, 4096, domain, flags,
+                                    RADV_BO_PRIORITY_SCRATCH, 0, true, bo);
+   if (result == VK_SUCCESS && getenv("BC250_IDX_TRACE"))
+      fprintf(stderr, "BC250 IDX STORAGE: %s domain=%s cpu=%u wc=%u bytes=%" PRIu64 "\n",
+              kind, gtt ? "GTT" : "VRAM", cpu, !!(flags & RADEON_FLAG_GTT_WC), size);
+   return result;
+}
+
 static bool
 bc250_idx_alloc(struct radv_cmd_buffer *cmd_buffer, uint64_t bytes, uint64_t *address)
 {
@@ -8293,6 +7927,10 @@ bc250_idx_alloc(struct radv_cmd_buffer *cmd_buffer, uint64_t bytes, uint64_t *ad
    uint64_t used = 0;
    for (unsigned p = 0; p < cmd_buffer->bc250_idx_npages; p++)
       used += cmd_buffer->bc250_idx_page_size[p];
+   /* Check in 64 bits before narrowing. Stored outputs can exceed 4 GiB
+    * even when the index count and encoded vertices fit in 32 bits. */
+   if (bytes > BC250_IDX_PAGE_BYTES - used)
+      return false;
    uint32_t size = MAX2(ALIGN_POT(bytes, 4096), 1ull << 20);
    if (size > BC250_IDX_PAGE_BYTES - used)
       return false;
@@ -8300,12 +7938,7 @@ bc250_idx_alloc(struct radv_cmd_buffer *cmd_buffer, uint64_t bytes, uint64_t *ad
    if (!bo) {
       if (!bc250_idx_reserve(device, size))
          return false;
-      /* GTT, not VRAM: the BC-250's VRAM carveout is 512 MiB and the desktop alone nearly fills it; VRAM-only
-       * index storage evicted the game's and the display's buffers at 4K. GTT is the same memory on this APU. */
-      VkResult result = radv_bo_create(device, NULL, size, 4096, RADEON_DOMAIN_GTT,
-                                       RADEON_FLAG_NO_CPU_ACCESS | RADEON_FLAG_GTT_WC |
-                                          RADEON_FLAG_NO_INTERPROCESS_SHARING,
-                                       RADV_BO_PRIORITY_SCRATCH, 0, true, &bo);
+      VkResult result = bc250_idx_create_storage(device, size, false, "page", &bo);
       if (result != VK_SUCCESS) {
          p_atomic_add(&device->bc250_idx_storage_bytes, -(int32_t)size);
          return false;
@@ -8446,14 +8079,16 @@ bc250_idx_batch_open(struct radv_cmd_buffer *cmd_buffer)
    if (cmd_buffer->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY || cmd_buffer->gang.cs ||
        cmd_buffer->bc250_dgc_upload_va || cmd_buffer->cs->buffered_sh_regs.num || !device->ws->cs_merge_buffers)
       return false;
-   if (cmd_buffer->bc250_idx_batch_upload_bytes >= (8u << 20))
+   const bool setup_batch = debug_get_bool_option("RADV_BC250_MESH_IDXPASS_SETUP_BATCH", false);
+   const unsigned batch_bytes = BC250_IDX_BATCH_DW * 4 + (setup_batch ? RADV_BC250_IDX_SETUP_BATCH_BYTES : 0);
+   if (cmd_buffer->bc250_idx_batch_upload_bytes > (8u << 20) - batch_bytes)
       return false; /* Bounded side-stream bodies; remaining passes run inline. */
    unsigned offset;
    void *map;
    struct radv_cmd_stream *side;
-   if (!radv_cmd_buffer_upload_alloc_aligned(cmd_buffer, BC250_IDX_BATCH_DW * 4, 256, &offset, &map))
+   if (!radv_cmd_buffer_upload_alloc_aligned(cmd_buffer, batch_bytes, 256, &offset, &map))
       return false;
-   cmd_buffer->bc250_idx_batch_upload_bytes += BC250_IDX_BATCH_DW * 4;
+   cmd_buffer->bc250_idx_batch_upload_bytes += batch_bytes;
    const uint64_t va = radv_cmd_buffer_upload_va(cmd_buffer) + offset;
    if (cmd_buffer->bc250_idx_side) {
       side = cmd_buffer->bc250_idx_side;
@@ -8467,14 +8102,26 @@ bc250_idx_batch_open(struct radv_cmd_buffer *cmd_buffer)
    /* Pending flushes belong to earlier commands: before the call. */
    radv_emit_cache_flush(cmd_buffer);
    radeon_check_space(device->ws, cmd_buffer->cs->b, 8);
+   const unsigned call_dw = cmd_buffer->cs->b->cdw;
    device->ws->cs_execute_ib(cmd_buffer->cs->b, NULL, va, BC250_IDX_BATCH_DW, false);
+   if (cmd_buffer->cs->b->cdw != call_dw + 4) {
+      vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return false;
+   }
+   cmd_buffer->bc250_idx_batch_size = cmd_buffer->cs->b->buf + call_dw + 3;
    /* The call changes compute registers: forget what this stream knows. */
    radv_init_cmd_stream(device, cmd_buffer->cs, AMD_IP_GFX);
    bc250_idx_dirty_compute(cmd_buffer);
+   cmd_buffer->bc250_idx_batch_stored = false;
    cmd_buffer->bc250_idx_batch = side;
    cmd_buffer->bc250_idx_batch_body = map;
    cmd_buffer->bc250_idx_batch_buf = side->b->buf;
    cmd_buffer->bc250_idx_batch_capacity = BC250_IDX_BATCH_DW;
+   cmd_buffer->bc250_idx_setup_list = setup_batch ? (uint32_t *)map + BC250_IDX_BATCH_DW : NULL;
+   cmd_buffer->bc250_idx_setup_list_va = setup_batch ? va + BC250_IDX_BATCH_DW * 4 : 0;
+   cmd_buffer->bc250_idx_setup_begin_dw = cmd_buffer->bc250_idx_setup_end_dw = 0;
+   if (cmd_buffer->bc250_idx_setup_list)
+      memset(cmd_buffer->bc250_idx_setup_list, 0, RADV_BC250_IDX_SETUP_BATCH_BYTES);
    return true;
 }
 
@@ -8486,12 +8133,24 @@ radv_bc250_idx_batch_close(struct radv_cmd_buffer *cmd_buffer, bool discard)
    if (!side)
       return;
    cmd_buffer->bc250_idx_batch = NULL;
+   uint32_t *size_word = cmd_buffer->bc250_idx_batch_size;
+   cmd_buffer->bc250_idx_batch_size = NULL;
+   uint32_t *setup_list = cmd_buffer->bc250_idx_setup_list;
+   cmd_buffer->bc250_idx_setup_list = NULL;
+   cmd_buffer->bc250_idx_setup_list_va = 0;
+   cmd_buffer->bc250_idx_setup_begin_dw = cmd_buffer->bc250_idx_setup_end_dw = 0;
    if (!discard) {
+      static int trim = -1;
+      if (trim < 0)
+         trim = debug_get_bool_option("RADV_BC250_MESH_IDXPASS_BATCH_TRIM", true);
       /* One wait for every pass of the batch, still inside the call. */
       struct radv_cmd_stream *main_cs = cmd_buffer->cs;
       const enum radv_cmd_flush_bits saved = cmd_buffer->state.flush_bits;
       cmd_buffer->cs = side;
-      cmd_buffer->state.flush_bits = RADV_CMD_FLAG_CS_PARTIAL_FLUSH;
+      const uint32_t producer_dw = side->b->cdw;
+      cmd_buffer->state.flush_bits = RADV_CMD_FLAG_CS_PARTIAL_FLUSH |
+         (cmd_buffer->bc250_idx_batch_stored ? RADV_CMD_FLAG_INV_VCACHE | RADV_CMD_FLAG_INV_SCACHE : 0);
+      cmd_buffer->bc250_idx_batch_stored = false;
       radv_emit_cache_flush(cmd_buffer);
       /* Indirect draw arguments written by the passes are fetched ahead by the PFP. */
       radeon_check_space(device->ws, side->b, 4);
@@ -8500,15 +8159,45 @@ radv_bc250_idx_batch_close(struct radv_cmd_buffer *cmd_buffer, bool discard)
       cmd_buffer->state.flush_bits = saved;
       uint32_t *body = cmd_buffer->bc250_idx_batch_body;
       const uint32_t cap = cmd_buffer->bc250_idx_batch_capacity;
-      if (getenv("BC250_IDX_TRACE"))
-         fprintf(stderr, "BC250 IDX BATCH: close dw=%u of %u unchained=%u\n", side->b->cdw, cap,
-                 side->b->buf == cmd_buffer->bc250_idx_batch_buf);
-      if (side->b->buf == cmd_buffer->bc250_idx_batch_buf && side->b->cdw <= cap) {
+      const uint32_t pad_dw = radv_device_physical(device)->info.ip[AMD_IP_GFX].ib_pad_dw_mask + 1;
+      const uint32_t exec_dw = align(side->b->cdw, pad_dw);
+      if (side->b->buf == cmd_buffer->bc250_idx_batch_buf && exec_dw <= cap) {
          memcpy(body, side->b->buf, side->b->cdw * 4);
-         bc250_idx_nop_fill(body + side->b->cdw, cap - side->b->cdw);
+         /* Keep the producer wait, shader-cache invalidations and PFP synchronization in the executed body.
+          * Respect the normal GFX IB size alignment, with a complete NOP packet ending at that boundary.
+          * The unused allocation remains initialized but is outside the shortened call. Patch while recording,
+          * so every later submission of this command buffer uses the same length. */
+         if (trim) {
+            bc250_idx_nop_fill(body + side->b->cdw, exec_dw - side->b->cdw);
+            bc250_idx_nop_fill(body + exec_dw, cap - exec_dw);
+            *size_word = (*size_word & C_3F3_IB_SIZE) | S_3F3_IB_SIZE(exec_dw);
+         } else {
+            bc250_idx_nop_fill(body + side->b->cdw, cap - side->b->cdw);
+         }
       } else {
          bc250_idx_nop_fill(body, cap);
          vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      }
+      if (getenv("BC250_IDX_TRACE"))
+         fprintf(stderr, "BC250 IDX BATCH: close dw=%u of %u unchained=%u exec_dw=%u flags=0x%x trim=%u "
+                         "sync_dw=%u tail=0x%08x main_grew=%u pad_dw=%u\n",
+                 side->b->cdw, cap, side->b->buf == cmd_buffer->bc250_idx_batch_buf,
+                 G_3F3_IB_SIZE(*size_word), *size_word & C_3F3_IB_SIZE, trim,
+                 side->b->cdw - producer_dw, side->b->cdw >= 2 ? side->b->buf[side->b->cdw - 2] : 0,
+                 (uintptr_t)size_word < (uintptr_t)main_cs->b->buf ||
+                 (uintptr_t)size_word >= (uintptr_t)(main_cs->b->buf + main_cs->b->max_dw), pad_dw);
+      if (setup_list && getenv("BC250_IDX_TRACE"))
+         fprintf(stderr, "BC250 IDX SETUP: close calls=%u dispatches=%u waits=%u bytes=%zu shared=%u\n",
+                 setup_list[0], setup_list[0] != 0, setup_list[0] != 0,
+                 (size_t)RADV_BC250_IDX_SETUP_BATCH_BYTES, setup_list[0] > 1);
+      if (getenv("BC250_IDX_CAPTURE_BATCH")) {
+         /* CPU packet evidence only; no tracing hardware or clock controls. */
+         for (uint32_t offset = 0; offset < side->b->cdw; offset += 64) {
+            fprintf(stderr, "BC250 IDX WORDS: offset=%u words=", offset);
+            for (uint32_t i = offset; i < MIN2(offset + 64, side->b->cdw); i++)
+               fprintf(stderr, "%08x,", side->b->buf[i]);
+            fprintf(stderr, "\n");
+         }
       }
       device->ws->cs_merge_buffers(main_cs->b, side->b);
    }
@@ -8558,8 +8247,60 @@ bc250_idx_batch_add(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pip
    enum radv_cmd_flush_bits saved;
    if (!bc250_idx_batch_begin(cmd_buffer, &main_cs, &saved))
       return false;
+   cmd_buffer->bc250_idx_batch_stored |= pipeline->bc250_idx_output_bytes != 0;
    bc250_idx_emit_pass(cmd_buffer, pipeline, constants, x, y, z);
    bc250_idx_batch_end(cmd_buffer, main_cs, saved);
+   return true;
+}
+
+/* Promote only when a second indirect call joins the span. The upload body is
+ * scratch until close, so preserve all commands after the ordinary first setup
+ * there while replacing that setup and its wait. No command has been submitted.
+ * Direct producers before or after the first setup retain their order. */
+static bool
+bc250_idx_setup_promote(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pipeline *pipeline)
+{
+   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   struct radv_cmd_stream *side = cmd_buffer->cs;
+   const uint32_t begin = cmd_buffer->bc250_idx_setup_begin_dw;
+   const uint32_t end = cmd_buffer->bc250_idx_setup_end_dw;
+   if (side != cmd_buffer->bc250_idx_batch || side->b->buf != cmd_buffer->bc250_idx_batch_buf ||
+       begin >= end || end > side->b->cdw) {
+      vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return false;
+   }
+   const uint32_t tail_dw = side->b->cdw - end;
+   memcpy(cmd_buffer->bc250_idx_batch_body, side->b->buf + end, tail_dw * 4);
+   side->b->cdw = begin;
+   /* Discard register knowledge from the commands being replaced or copied. */
+   radv_init_cmd_stream(device, side, AMD_IP_GFX);
+   bc250_idx_dirty_compute(cmd_buffer);
+   const struct radv_dispatch_info one = {.blocks = {1, 1, 1}};
+   const uint64_t list_va = cmd_buffer->bc250_idx_setup_list_va;
+   bc250_idx_emit_compute(cmd_buffer, pipeline->bc250_idx_setup_batch, &list_va, sizeof(list_va), &one, false);
+   const uint32_t sync_start = side->b->cdw;
+   cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_INV_SCACHE | RADV_CMD_FLAG_INV_VCACHE;
+   radv_emit_cache_flush(cmd_buffer);
+   radeon_check_space(device->ws, side->b, 4);
+   ac_emit_cp_pfp_sync_me(side->b, false);
+   const uint32_t replacement_end = side->b->cdw;
+   if (side->b->buf != cmd_buffer->bc250_idx_batch_buf ||
+       replacement_end + tail_dw + BC250_IDX_PASS_DW > cmd_buffer->bc250_idx_batch_capacity) {
+      vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return false;
+   }
+   memcpy(side->b->buf + replacement_end, cmd_buffer->bc250_idx_batch_body, tail_dw * 4);
+   side->b->cdw += tail_dw;
+   /* The copied gfx1013 producers emit their compute program, resource registers
+    * and userdata unconditionally, so they do not depend on the replaced shader.
+    * Forget register knowledge again before recording the next producer. */
+   radv_init_cmd_stream(device, side, AMD_IP_GFX);
+   bc250_idx_dirty_compute(cmd_buffer);
+   if (getenv("BC250_IDX_TRACE"))
+      fprintf(stderr, "BC250 IDX SETUP: promote begin=%u end=%u replacement_end=%u preserved_dw=%u "
+                      "sync_dw=%u tail=0x%08x\n",
+              begin, end, replacement_end, tail_dw, replacement_end - sync_start,
+              side->b->buf[replacement_end - 2]);
    return true;
 }
 
@@ -8587,11 +8328,13 @@ struct bc250_idx_saved {
    bool restart;
    struct radv_index_buffer_state ib;
    uint32_t restart_index;
+   bool stored;
+   uint8_t constants[sizeof(struct bc250_constants)];
 };
 
 static void
 bc250_idx_draw_begin(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pipeline *pipeline, uint64_t ib_va,
-                     uint64_t ib_size, struct bc250_idx_saved *saved)
+                     uint64_t ib_size, const struct bc250_constants *constants, struct bc250_idx_saved *saved)
 {
    VkCommandBuffer handle = radv_cmd_buffer_to_handle(cmd_buffer);
    VK_FROM_HANDLE(radv_pipeline, internal, pipeline->bc250_idx_gfx);
@@ -8599,6 +8342,11 @@ bc250_idx_draw_begin(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pi
        cmd_buffer->state.graphics_pipeline != radv_pipeline_to_graphics(internal)) {
       radv_CmdBindPipeline(handle, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->bc250_idx_gfx);
       cmd_buffer->bc250_idx_restore = pipeline;
+   }
+   saved->stored = pipeline->bc250_idx_output_bytes != 0;
+   if (saved->stored) {
+      memcpy(saved->constants, cmd_buffer->push_constants, sizeof(saved->constants));
+      memcpy(cmd_buffer->push_constants, constants, sizeof(*constants));
    }
    /* The application pushes constants for the Mesh stage. */
    cmd_buffer->push_constant_stages |= VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -8620,6 +8368,10 @@ static void
 bc250_idx_draw_end(struct radv_cmd_buffer *cmd_buffer, const struct bc250_idx_saved *saved)
 {
    cmd_buffer->bc250_idx_drawing = false;
+   if (saved->stored) {
+      memcpy(cmd_buffer->push_constants, saved->constants, sizeof(saved->constants));
+      cmd_buffer->push_constant_stages |= VK_SHADER_STAGE_ALL;
+   }
    struct radv_dynamic_state *dyn = &cmd_buffer->state.dynamic;
    dyn->vk.ia.primitive_topology = saved->topology;
    dyn->vk.ia.primitive_restart_enable = saved->restart;
@@ -8631,10 +8383,10 @@ bc250_idx_draw_end(struct radv_cmd_buffer *cmd_buffer, const struct bc250_idx_sa
 
 static void
 bc250_idx_draw_direct(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pipeline *pipeline, uint64_t ib_va,
-                      uint64_t ib_size, uint32_t count, uint32_t first_instance)
+                      uint64_t ib_size, uint32_t count, uint32_t first_instance, const struct bc250_constants *constants)
 {
    struct bc250_idx_saved saved;
-   bc250_idx_draw_begin(cmd_buffer, pipeline, ib_va, ib_size, &saved);
+   bc250_idx_draw_begin(cmd_buffer, pipeline, ib_va, ib_size, constants, &saved);
    radv_CmdDrawIndexed(radv_cmd_buffer_to_handle(cmd_buffer), count, 1, 0, 0, first_instance);
    bc250_idx_draw_end(cmd_buffer, &saved);
 }
@@ -8674,6 +8426,15 @@ radv_bc250_draw_idx_indirect(struct radv_cmd_buffer *cmd_buffer, struct radv_gra
     * Multi-record calls retain the measured index-route benefit. */
    if (max_count == 1)
       return false;
+   if (pipeline->bc250_idx_automatic &&
+       !radv_bc250_idx_cost_use_stored_indirect(&pipeline->bc250_idx_cost, cmd_buffer->push_constants,
+                                      sizeof(cmd_buffer->push_constants))) {
+      if (getenv("BC250_IDX_TRACE"))
+         fprintf(stderr, "BC250 MESH AUTO: indirect Mesh (light or unknown work)\n");
+      return false;
+   }
+   if (pipeline->bc250_idx_automatic && getenv("BC250_IDX_TRACE"))
+      fprintf(stderr, "BC250 MESH AUTO: indirect stored\n");
    cmd_buffer->bc250_diag_idx_indirect++;
    cmd_buffer->bc250_diag_idx_records += max_count;
    /* One pool per recording (from the device spare list when possible); its first setup starts it empty. */
@@ -8694,11 +8455,7 @@ radv_bc250_draw_idx_indirect(struct radv_cmd_buffer *cmd_buffer, struct radv_gra
                fprintf(stderr, "BC250 IDX: indirect Mesh fallback (storage unavailable)\n");
             return false;
          }
-         /* GTT like the index pages (the VRAM carveout is too small to hold it). */
-         if (radv_bo_create(device, NULL, pool_bytes, 4096, RADEON_DOMAIN_GTT,
-                            (dbg ? RADEON_FLAG_CPU_ACCESS : RADEON_FLAG_NO_CPU_ACCESS | RADEON_FLAG_GTT_WC) |
-                               RADEON_FLAG_NO_INTERPROCESS_SHARING,
-                            RADV_BO_PRIORITY_SCRATCH, 0, true, &cmd_buffer->bc250_idx_pool_bo) != VK_SUCCESS) {
+         if (bc250_idx_create_storage(device, pool_bytes, dbg, "pool", &cmd_buffer->bc250_idx_pool_bo) != VK_SUCCESS) {
             cmd_buffer->bc250_idx_pool_bo = NULL;
             p_atomic_add(&device->bc250_idx_storage_bytes, -(int32_t)pool_bytes);
             return false;
@@ -8739,7 +8496,7 @@ radv_bc250_draw_idx_indirect(struct radv_cmd_buffer *cmd_buffer, struct radv_gra
    const struct bc250_idx_setup_args args = {
       .records = records, .count = count_va, .table = table, .dims = dims, .draws = draws, .mesh = mesh, .pool = pool,
       .stride = stride, .max_count = max_count, .capacity = cmd_buffer->bc250_idx_pool_capacity, .prims = P,
-      .reset = reset, .vertex_stride = pipeline->bc250_idx_vertex_stride,
+      .reset = reset, .vertex_stride = pipeline->bc250_idx_vertex_stride, .output_bytes = pipeline->bc250_idx_output_bytes,
    };
    const struct bc250_constants constants = {
       .xyz = table, .payload = pool + 256,
@@ -8750,20 +8507,63 @@ radv_bc250_draw_idx_indirect(struct radv_cmd_buffer *cmd_buffer, struct radv_gra
    cmd_buffer->bc250_idx_pool_used = true;
    struct radv_cmd_stream *main_cs;
    enum radv_cmd_flush_bits saved_flush;
+   /* The list and its count are patched only while recording. End the span
+    * before its fixed list fills, preserving immutable repeated submissions. */
+   if (cmd_buffer->bc250_idx_setup_list &&
+       cmd_buffer->bc250_idx_setup_list[0] == RADV_BC250_IDX_SETUP_BATCH_CALLS)
+      radv_bc250_idx_batch_close(cmd_buffer, false);
    const bool batched = bc250_idx_batch_begin(cmd_buffer, &main_cs, &saved_flush);
    const struct radv_dispatch_info one = {.blocks = {1, 1, 1}};  /* one wave64 */
-   bc250_idx_emit_compute(cmd_buffer, pipeline->bc250_idx_setup, &args, sizeof(args), &one, false);
-   /* The pass reads the tables; the CP reads its dispatch size (ahead, in the PFP). */
-   cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_INV_SCACHE | RADV_CMD_FLAG_INV_VCACHE;
-   radv_emit_cache_flush(cmd_buffer);
-   radeon_check_space(device->ws, cmd_buffer->cs->b, 4);
-   ac_emit_cp_pfp_sync_me(cmd_buffer->cs->b, false);
+   const bool shared_setup = batched && pipeline->bc250_idx_setup_batch && cmd_buffer->bc250_idx_setup_list;
+   bool setup_dispatch = true;
+   const uint32_t setup_begin_dw = cmd_buffer->cs->b->cdw;
+   if (shared_setup) {
+      uint32_t *list = cmd_buffer->bc250_idx_setup_list;
+      unsigned n = list[0];
+      assert(n < RADV_BC250_IDX_SETUP_BATCH_CALLS);
+      struct bc250_idx_setup_args *entries = (void *)((uint8_t *)list + RADV_BC250_IDX_SETUP_BATCH_HEADER_BYTES);
+      entries[n] = args;
+      list[0] = n + 1;
+      setup_dispatch = n == 0;
+      if (setup_dispatch) {
+         /* Single-call spans execute the established shader and wait, avoiding
+          * the measured overhead of scanning a one-entry list. */
+         cmd_buffer->bc250_idx_setup_begin_dw = setup_begin_dw;
+         bc250_idx_emit_compute(cmd_buffer, pipeline->bc250_idx_setup, &args, sizeof(args), &one, false);
+      } else if (n == 1 && !bc250_idx_setup_promote(cmd_buffer, pipeline)) {
+         bc250_idx_batch_end(cmd_buffer, main_cs, saved_flush);
+         return true;
+      }
+   } else {
+      bc250_idx_emit_compute(cmd_buffer, pipeline->bc250_idx_setup, &args, sizeof(args), &one, false);
+   }
+   uint32_t setup_sync_dw = 0, setup_sync_tail = 0;
+   if (setup_dispatch) {
+      /* The pass reads the tables; the CP reads its dispatch size ahead in the PFP.
+       * For a shared setup this wait covers every table in the immutable list. */
+      const uint32_t sync_start = cmd_buffer->cs->b->cdw;
+      cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_INV_SCACHE | RADV_CMD_FLAG_INV_VCACHE;
+      radv_emit_cache_flush(cmd_buffer);
+      radeon_check_space(device->ws, cmd_buffer->cs->b, 4);
+      ac_emit_cp_pfp_sync_me(cmd_buffer->cs->b, false);
+      setup_sync_dw = cmd_buffer->cs->b->cdw - sync_start;
+      setup_sync_tail = cmd_buffer->cs->b->buf[cmd_buffer->cs->b->cdw - 2];
+      if (shared_setup)
+         cmd_buffer->bc250_idx_setup_end_dw = cmd_buffer->cs->b->cdw;
+   }
+   if (getenv("BC250_IDX_TRACE"))
+      fprintf(stderr, "BC250 IDX SETUP: call shared=%u dispatch=%u wait=%u reset=%u sync_dw=%u tail=0x%08x\n",
+              shared_setup, setup_dispatch, setup_dispatch, reset, setup_sync_dw, setup_sync_tail);
+   if (setup_dispatch && getenv("BC250_IDX_TRACE"))
+      fprintf(stderr, "BC250 IDX SETUP: ordinary begin=%u end=%u\n", setup_begin_dw, cmd_buffer->cs->b->cdw);
    const struct radv_dispatch_info pass = {.indirect_va = table + 8};
    bc250_idx_emit_compute(cmd_buffer, pipeline->bc250_idx_cs_ind, &constants, sizeof(constants), &pass, true);
    if (batched) {
+      cmd_buffer->bc250_idx_batch_stored |= pipeline->bc250_idx_output_bytes != 0;
       bc250_idx_batch_end(cmd_buffer, main_cs, saved_flush);
    } else {
-      cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH;
+      cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH |
+         (pipeline->bc250_idx_output_bytes ? RADV_CMD_FLAG_INV_VCACHE | RADV_CMD_FLAG_INV_SCACHE : 0);
       radv_emit_cache_flush(cmd_buffer);
       radeon_check_space(device->ws, cmd_buffer->cs->b, 4);
       ac_emit_cp_pfp_sync_me(cmd_buffer->cs->b, false);
@@ -8771,7 +8571,7 @@ radv_bc250_draw_idx_indirect(struct radv_cmd_buffer *cmd_buffer, struct radv_gra
 
    VkCommandBuffer handle = radv_cmd_buffer_to_handle(cmd_buffer);
    struct bc250_idx_saved saved;
-   bc250_idx_draw_begin(cmd_buffer, pipeline, pool + 256, (uint64_t)cmd_buffer->bc250_idx_pool_capacity * 4, &saved);
+   bc250_idx_draw_begin(cmd_buffer, pipeline, pool + 256, (uint64_t)cmd_buffer->bc250_idx_pool_capacity * 4, &constants, &saved);
    const VkDrawIndirectCount2InfoKHR draw = {.sType = VK_STRUCTURE_TYPE_DRAW_INDIRECT_COUNT_2_INFO_KHR,
       .addressRange = {.address = draws, .size = (uint64_t)max_count * 20, .stride = 20},
       .countAddressRange = {.address = table, .size = 4}, .maxDrawCount = max_count};
@@ -8804,10 +8604,20 @@ radv_bc250_draw_idx(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pip
    if (cmd_buffer->bc250_dgc_upload_va || (cmd_buffer->usage_flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT) ||
        bc250_idx_counting_queries(cmd_buffer))
       return false;
+   if (pipeline->bc250_idx_automatic &&
+       (groups < 8 || !radv_bc250_idx_cost_use_stored(&pipeline->bc250_idx_cost, cmd_buffer->push_constants,
+                                                    sizeof(cmd_buffer->push_constants)))) {
+      if (getenv("BC250_IDX_TRACE"))
+         fprintf(stderr, "BC250 MESH AUTO: direct Mesh (light or unknown work)\n");
+      return false;
+   }
+   if (pipeline->bc250_idx_automatic && getenv("BC250_IDX_TRACE"))
+      fprintf(stderr, "BC250 MESH AUTO: direct stored\n");
    uint64_t ib_va;
    unsigned coffset;
    void *cmap = NULL;
-   if (!bc250_idx_alloc(cmd_buffer, groups * P * 12, &ib_va)) {
+   const uint64_t bytes = groups * (P * 12 + pipeline->bc250_idx_output_bytes);
+   if (!bc250_idx_alloc(cmd_buffer, bytes, &ib_va)) {
       if (getenv("BC250_IDX_TRACE"))
          fprintf(stderr, "BC250 IDX: direct Mesh fallback (storage unavailable)\n");
       return false;
@@ -8821,6 +8631,7 @@ radv_bc250_draw_idx(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pip
    memcpy((char *)cmap + MAX_PUSH_CONSTANTS_SIZE, &slot, sizeof(slot));
    struct bc250_constants constants = {
       .payload = ib_va,
+      .input = pipeline->bc250_idx_output_bytes ? ib_va + groups * P * 12 : 0,
       .stride = P * 12,
       .application_constants = cva,
       .task_slot = cva + MAX_PUSH_CONSTANTS_SIZE,
@@ -8830,10 +8641,11 @@ radv_bc250_draw_idx(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pip
    if (!bc250_idx_batch_add(cmd_buffer, pipeline, &constants, x, y, z)) {
       bc250_idx_emit_pass(cmd_buffer, pipeline, &constants, x, y, z);
       /* The pass's stores reach L2, which the index fetch reads (GFX10): waiting for the dispatch is enough. */
-      cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH;
+      cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH |
+         (pipeline->bc250_idx_output_bytes ? RADV_CMD_FLAG_INV_VCACHE | RADV_CMD_FLAG_INV_SCACHE : 0);
    }
 
    cmd_buffer->bc250_diag_idx_direct++;
-   bc250_idx_draw_direct(cmd_buffer, pipeline, ib_va, groups * P * 12, groups * P * 3, x | (y << 16));
+   bc250_idx_draw_direct(cmd_buffer, pipeline, ib_va, groups * P * 12, groups * P * 3, x | (y << 16), &constants);
    return true;
 }

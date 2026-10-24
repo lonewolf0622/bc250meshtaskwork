@@ -304,6 +304,9 @@ typedef struct {
     * ranks. When the survivors reference every vertex, each rank is the index itself, so the ranked check is the
     * shared check; otherwise the shared check fails and the ranked check is the renumbered check. */
    bool bc250_merged_check;
+   /* Reuse API connectivity as the corner source map when no triangles were
+    * removed and every selected index is in range. */
+   bool bc250_corner_alias;
    bool bc250_safe_check;
    bool bc250_safe_corners;
    /* RADV_BC250_MESH_SAFE_ADAPTIVE (with bc250_safe_corners, no owned per-primitive data): a

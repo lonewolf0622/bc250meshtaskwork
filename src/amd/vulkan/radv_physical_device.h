@@ -111,6 +111,7 @@ struct radv_physical_device {
    bool use_ngg;
 
    /* Private, unsupported direct-mesh experiment for BC-250 (GFX1013). */
+   /* DirectMesh for GFX1013 and Navi10/12/14; name retained for the shared ABI. */
    bool bc250_native_mesh;
    bool bc250_native_task; /* Experimental native TASK capability; submission separately gated. */
    bool bc250_hybrid_task;

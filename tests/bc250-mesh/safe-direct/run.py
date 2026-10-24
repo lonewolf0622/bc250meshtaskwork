@@ -15,8 +15,10 @@ assert 'libamdgpu_noop_drm_shim.so' in os.getenv('LD_PRELOAD','')
 ICD=os.environ['ICD']
 OLD=os.environ.get('OLDICD',ICD)
 variant=os.getenv('VARIANT','serial')
-assert variant in ('serial','parallel','autocull','local','local-cull','check','check-cull','corners','corners-cull')
-cull_args=['--autocull'] if variant in ('autocull','local-cull','check-cull','corners-cull') else []
+assert variant in ('serial','parallel','autocull','local','local-cull','check','check-cull','corners','corners-cull',
+                   'corners-alias','corners-alias-cull','corners-adaptive-alias','corners-adaptive-alias-cull')
+base_variant = variant.replace('-adaptive-alias', '').replace('-alias', '')
+cull_args=['--autocull'] if variant == 'autocull' or variant.endswith('-cull') else []
 base=dict(os.environ)
 base.update(dict(VK_DRIVER_FILES=ICD,VK_ICD_FILENAMES=ICD,NIR_DEBUG='validate',
  ACO_DEBUG='validateir,validatera',BC250_TRACE_COMPILE='1',MESA_SHADER_CACHE_DISABLE='true'))
@@ -104,6 +106,11 @@ for name,extra,admit in cases:
        if variant.startswith(('check','corners')): env['RADV_BC250_MESH_SAFE_CHECK']='0' if mode=='zero' else '1'
        if variant.startswith('corners'): env['RADV_BC250_MESH_SAFE_CORNERS']='0' if mode=='zero' else '1'
        if mode!='zero' and variant.endswith('-cull'): env['RADV_BC250_MESH_SAFE_AUTOCULL']='1'
+       if mode!='zero' and 'alias' in variant:
+          env['RADV_BC250_MESH_CORNER_ALIAS']='1'
+          if 'adaptive' in variant:
+             env['RADV_BC250_MESH_SAFE_ADAPTIVE']='1'
+             env['RADV_BC250_MESH_SAFE_COMPACT']='1'
     if mode.startswith('no'): env['PIPE_NOOPT']='1'
     dump=d/mode; dump.mkdir(exist_ok=True)
     for prior in dump.glob('*.nir'): prior.unlink()
@@ -124,11 +131,12 @@ for name,extra,admit in cases:
 
  applied=({'serial':'MESH SAFE DIRECT: applied','parallel':'MESH SAFE PARALLEL:','autocull':'MESH SAFE AUTOCULL:',
            'local':'MESH SAFE LOCAL:', 'local-cull':'MESH SAFE LOCAL:',
-           'check':'MESH SAFE CHECK:', 'check-cull':'MESH SAFE CHECK:', 'corners':'MESH SAFE CHECK:', 'corners-cull':'MESH SAFE CHECK:'}[variant]) in logs['on']
+           'check':'MESH SAFE CHECK:', 'check-cull':'MESH SAFE CHECK:', 'corners':'MESH SAFE CHECK:', 'corners-cull':'MESH SAFE CHECK:'}[base_variant]) in logs['on']
  assert applied==admit,(name,'admission',applied)
  if variant.startswith('corners'):
     private = name in ('v64p64','v64p16','v64p64t128','counts64','early64','shared64','effects64')
     assert ('MESH SAFE CORNERS:' in logs['on']) == private, (name,'corner admission')
+    assert ('MESH CORNER ALIAS: applied' in logs['on']) == (private and 'alias' in variant), (name,'alias admission')
  if not admit:
     assert signature(logs['ref'])==signature(logs['on']),name+' fallback shader identity'
     assert ibs['ref']==ibs['on'],name+' fallback IB byte identity'

@@ -16,11 +16,11 @@ def run(args,log,env=base):
  return text
 run(['cc','-O1','-Wall','-o',out/'pipe',src/'tests/bc250-mesh/dgc/pipe.c','-lvulkan'],'build.log')
 run(['cc','-O1','-Wall','-o',out/'exposure',src/'tests/bc250-mesh/dgc/exposure.c','-lvulkan'],'exposure-build.log')
-for switch, expected in ((None,0),('0',0),('1',1)):
- e=dict(base)
+for directmesh, switch, expected in (('0',None,0),('1',None,1),('1','0',0),('1','1',1)):
+ e=dict(base,RADV_DIRECTMESH=directmesh)
  if switch is None:e.pop('RADV_BC250_EXPOSE_DGC')
  else:e['RADV_BC250_EXPOSE_DGC']=switch
- run([out/'exposure',expected],'exposure-'+str(switch)+'.log',e)
+ run([out/'exposure',expected],'exposure-'+directmesh+'-'+str(switch)+'.log',e)
 run([out/'exposure',0],'exposure-native-task.log',dict(base,RADV_BC250_NATIVE_TASK='1'))
 run(['python3',src/'tests/bc250-mesh/dgc/build_oracle.py',out/'oracle'],'oracle-build.log')
 fixtures=[('plain',[],False),('pieces',['-DVERTS=128','-DPRIMS=128','-DLANES=128'],False),

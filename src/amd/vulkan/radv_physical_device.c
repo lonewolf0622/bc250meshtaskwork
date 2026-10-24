@@ -30,6 +30,7 @@
 #include "radv_entrypoints.h"
 #include "radv_instance.h"
 #include "radv_physical_device.h"
+#include "radv_directmesh.h"
 #include "radv_bc250.h"
 #include "radv_pipeline_rt.h"
 #include "radv_video.h"
@@ -2769,28 +2770,33 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
                     !(instance->debug_flags & RADV_DEBUG_NO_NGG)) ||
                    pdev->info.gfx_level >= GFX11;
 
-   pdev->bc250_native_mesh = pdev->info.family == CHIP_GFX1013 && pdev->use_ngg &&
+   /* Navi14 retains legacy graphics stages. Mesh alone uses NGG, with its
+    * existing late-allocation hardware workaround in ac_shader_util.c. */
+   pdev->bc250_native_mesh = radv_directmesh_family(pdev->info.family) &&
+                             radv_directmesh_preset(getenv("RADV_DIRECTMESH"), true) &&
+                             !(instance->debug_flags & RADV_DEBUG_NO_NGG) &&
                              !pdev->use_llvm && !(instance->debug_flags & RADV_DEBUG_NO_MESH_SHADER);
    pdev->bc250_native_task = pdev->bc250_native_mesh &&
       radv_compute_queue_enabled(pdev) &&
       (debug_get_bool_option("BC250_NATIVE_TASK_COMPILE", false) ||
        debug_get_bool_option("RADV_BC250_NATIVE_TASK", false));
-   /* RADV_DIRECTMESH=1: DXVK (D3D9-11, no Mesh shaders) keeps GPL, shader objects and pipeline binaries
+   /* DirectMesh defaults: DXVK (D3D9-11, no Mesh shaders) keeps GPL, shader objects and pipeline binaries
     * instead of the preset's hybrid Task. An explicit RADV_BC250_HYBRID_TASK still applies. */
    const bool bc250_dxvk = instance->vk.app_info.engine_name && !strcmp(instance->vk.app_info.engine_name, "DXVK");
    pdev->bc250_hybrid_task = pdev->bc250_native_mesh &&
-      debug_get_bool_option("RADV_BC250_HYBRID_TASK", false) && !(bc250_dxvk && radv_bc250_directmesh_hybrid);
+      debug_get_bool_option("RADV_BC250_HYBRID_TASK", radv_bc250_directmesh_hybrid) &&
+      !(bc250_dxvk && radv_bc250_directmesh_hybrid);
    if (pdev->bc250_native_mesh && bc250_dxvk && radv_bc250_directmesh_hybrid && getenv("BC250_TRACE_COMPILE"))
       fprintf(stderr, "radv/bc250: DXVK: hybrid Task off, GPL/shader objects/pipeline binaries kept\n");
    pdev->bc250_expose_dgc = pdev->bc250_native_mesh && !pdev->bc250_native_task &&
       debug_get_bool_option("RADV_BC250_EXPOSE_DGC", false);
    pdev->bc250_fast_binding = pdev->bc250_native_mesh &&
       debug_get_bool_option("RADV_BC250_EXPOSE_FAST_BINDING", false);
-   /* GFX1013 has no ROTATE_PC_PTR or LOAD_PROVOKING_VTX; the fragment shader
+   /* GFX10.1 has no ROTATE_PC_PTR or LOAD_PROVOKING_VTX; the fragment shader
     * recovers the API vertex order from a position reference exported by the
     * last pre-rasterization stage (radv_nir_bc250_lower_bary_rotation). On by
     * default: without it vkd3d-proton hides mesh shaders (UE5 workaround). */
-   pdev->bc250_barycentrics = pdev->info.family == CHIP_GFX1013 &&
+   pdev->bc250_barycentrics = radv_directmesh_family(pdev->info.family) &&
       !debug_get_bool_option("RADV_BC250_NO_BARYCENTRICS", false);
    /* No VRS hardware on GFX10.1 (the VRS registers and HTILE fields are GFX10.3+), but vkd3d-proton
     * reports DirectX 12 Ultimate (feature level 12_2) only with VRS tier 2: the extension is exposed
@@ -2798,7 +2804,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
    pdev->bc250_vrs_noop = pdev->info.family == CHIP_GFX1013 &&
       debug_get_bool_option("RADV_BC250_VRS_NOOP", true);
    if (pdev->bc250_native_mesh) {
-      assert(pdev->info.family == CHIP_GFX1013);
+      assert(radv_directmesh_family(pdev->info.family));
       assert(pdev->info.gfx_level == GFX10);
       assert(pdev->info.gfx_level < GFX11);
       assert(!pdev->use_llvm);

@@ -1,3 +1,3 @@
-6669d4644d9a00ad8da022dd2716c59e4d235a2c6f0eb4f272c9c8d9fbcc9b77  patches/bc250-directmesh-mesa-26.2.1.patch
-de6345d8e2fe187792a50151ea66f18b735e62cfbf671dcab023fd18bb634106  patches/bc250-directmesh-tests.patch
-96827f8de02355307d4eda95cfcff7d942274e05492824395fef44da2a8af4e5  README.md
+4ca38a46d57aa406646fa2b50dd7b32cdda8060f5000b1f3a5cd502770790c69  patches/bc250-directmesh-mesa-26.2.1.patch
+8ed6f5f23fe4760257b34d324e4267839f10d1e509edb99c9b1636fa5329ecdf  patches/bc250-directmesh-tests.patch
+70cd95bc814c223d937e9409247bab239e8bcc228340212a2d42fd83f35aeb84  README.md

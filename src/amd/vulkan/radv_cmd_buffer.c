@@ -9,6 +9,7 @@
  */
 
 #include "radv_cmd_buffer.h"
+#include "radv_directmesh.h"
 #include "radv_bc250.h"
 #include "meta/radv_meta.h"
 #include "tools/radv_debug_hang.h"
@@ -3198,7 +3199,7 @@ radv_emit_hw_ngg(struct radv_cmd_buffer *cmd_buffer, const struct radv_shader *e
 
    const bool es_enable_prim_id =
       outinfo->export_prim_id ||
-      (pdev->info.family == CHIP_GFX1013 && shader->info.stage == MESA_SHADER_MESH &&
+      (pdev->bc250_native_mesh && shader->info.stage == MESA_SHADER_MESH &&
        outinfo->export_prim_id_per_primitive) ||
       (es && es->info.uses_prim_id);
    bool break_wave_at_eoi = false;
@@ -12658,7 +12659,7 @@ radv_emit_ps_state(struct radv_cmd_buffer *cmd_buffer)
       const unsigned raster_prim = radv_get_raster_prim(cmd_buffer);
       /* BC250 barycentric vertex order (radv_nir_bc250_lower_bary_rotation). */
       const bool provoking_last =
-         pdev->info.family == CHIP_GFX1013 &&
+         pdev->bc250_barycentrics &&
          cmd_buffer->state.dynamic.vk.rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
       const unsigned ps_state = SET_SGPR_FIELD(PS_STATE_NUM_SAMPLES, rasterization_samples) |
                                 SET_SGPR_FIELD(PS_STATE_PS_ITER_MASK, ps_iter_mask) |
@@ -13775,7 +13776,7 @@ radv_validate_dynamic_states(struct radv_cmd_buffer *cmd_buffer, uint64_t dynami
    if (dynamic_states & RADV_DYNAMIC_PROVOKING_VERTEX_MODE) {
       cmd_buffer->state.dirty |= RADV_CMD_DIRTY_NGG_STATE;
       /* BC250 barycentrics read the provoking vertex mode from PS_STATE. */
-      if (pdev->info.family == CHIP_GFX1013)
+      if (pdev->bc250_barycentrics)
          cmd_buffer->state.dirty |= RADV_CMD_DIRTY_PS_STATE;
    }
 
@@ -14805,7 +14806,7 @@ radv_bc250_mesh_draw_direct(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint
    if (radv_device_physical(device)->bc250_native_mesh &&
        !radv_device_physical(device)->bc250_native_task) {
       const struct radv_physical_device *pdev = radv_device_physical(device);
-      assert(pdev->info.family == CHIP_GFX1013);
+      assert(radv_directmesh_family(pdev->info.family));
       assert(pdev->info.gfx_level == GFX10);
       assert(pdev->info.gfx_level < GFX11);
       assert(!radv_cmdbuf_has_stage(cmd_buffer, MESA_SHADER_TASK));

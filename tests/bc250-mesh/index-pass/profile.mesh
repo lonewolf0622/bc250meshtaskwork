@@ -1,0 +1,68 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#ifndef VERTICES
+#define VERTICES 128
+#endif
+#ifndef PRIMITIVES
+#define PRIMITIVES 128
+#endif
+#ifndef THREADS
+#define THREADS 128
+#endif
+#ifndef PER_PRIMITIVE
+#define PER_PRIMITIVE 0
+#endif
+#ifndef CULL_DISTANCE
+#define CULL_DISTANCE 0
+#endif
+#ifndef FLAT_ORACLE
+#define FLAT_ORACLE 0
+#endif
+layout(local_size_x=THREADS) in;
+layout(triangles,max_vertices=VERTICES,max_primitives=PRIMITIVES) out;
+#if CULL_DISTANCE
+out gl_MeshPerVertexEXT { vec4 gl_Position; float gl_CullDistance[1]; } gl_MeshVerticesEXT[];
+#endif
+#if FLAT_ORACLE
+layout(location=1) flat out vec4 vtx[];
+#else
+layout(location=1) out vec4 vtx[];
+#endif
+#if PER_PRIMITIVE
+layout(location=0) perprimitiveEXT flat out vec4 color[];
+#endif
+layout(push_constant) uniform Dispatch { uint tag; uint indirect; uint steps; uint oracle_corner; } dispatch;
+void main() {
+ uint w=gl_WorkGroupID.x;
+ // Uniform runtime counts deliberately differ from declared maxima.
+ uint nv=VERTICES-(dispatch.tag&3u), np=PRIMITIVES-(dispatch.tag&3u);
+ SetMeshOutputsEXT(nv,np);
+ vec2 tile=vec2(float(w&7u),float(w>>3))/4.0-1.0;
+ for(uint i=gl_LocalInvocationIndex;i<nv;i+=THREADS) {
+  uint h=(i+1u)*747796405u ^ (w+dispatch.tag)*2891336453u;
+  for(uint step=0u;step<dispatch.steps;step++) {
+   h^=h>>16u; h*=2246822519u; h^=h>>13u; h*=3266489917u;
+   h^=h>>16u; h+=step*668265263u+374761393u;
+  }
+  vec2 g=vec2(float(i%16u),float(i/16u))/vec2(16.0,float(VERTICES/16));
+  gl_MeshVerticesEXT[i].gl_Position=vec4(tile+g*0.25+vec2(0.01),0.5,1.0);
+#if CULL_DISTANCE
+  gl_MeshVerticesEXT[i].gl_CullDistance[0]=i%7u==0u?-1.0:1.0;
+#endif
+  vtx[i]=vec4(float(h&255u),float((h>>8u)&255u),float((h>>16u)&255u),255.0)/255.0;
+ }
+ for(uint p=gl_LocalInvocationIndex;p<np;p+=THREADS) {
+  uint m=nv-1u, a=(p*5u+w)%m;
+  uint ob=1u+(p*7u)%(m-1u), oc=1u+((ob-1u)+1u+(p*3u)%(m-2u))%(m-1u);
+  // The first triangle is nondegenerate and all-negative in cull fixtures.
+  uvec3 triangle=p==0u?uvec3(0,7,21):uvec3(a,(a+ob)%m,(a+oc)%m);
+#if FLAT_ORACLE
+  uint c=dispatch.oracle_corner;
+  triangle=uvec3(triangle[c%3u],triangle[(c+1u)%3u],triangle[(c+2u)%3u]);
+#endif
+  gl_PrimitiveTriangleIndicesEXT[p]=triangle;
+#if PER_PRIMITIVE
+  color[p]=vec4(float((p*37u+w*11u)&255u)/255.0,float((p*13u+w*7u)&255u)/255.0,float(p&7u)/7.0,1.0);
+#endif
+ }
+}

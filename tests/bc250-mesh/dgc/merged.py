@@ -4,6 +4,7 @@ from pathlib import Path
 src=Path(__file__).resolve().parents[3];o=Path(os.environ['KEEP']);o.mkdir(parents=True,exist_ok=True);os.chdir(o)
 assert not Path('/dev/dri').exists() and os.getenv('AMDGPU_GPU_ID')=='gfx1013'
 e=dict(os.environ,VK_DRIVER_FILES=os.environ['ICD'],RADV_DIRECTMESH='1',RADV_BC250_EXPOSE_DGC='1',RADV_BC250_MESH_MERGE='1',RADV_BC250_MESH_SAFE_FAST='0',RADV_BC250_MESH_SAFE_OWNED='0',RADV_BC250_MESH_SAFE_PIECES='0',BC250_TRACE_COMPILE='1',NIR_DEBUG='validate',ACO_DEBUG='validateir,validatera',DGC_PUSH_CONSTANTS='1',DGC_PREPROCESS='1')
+e['BC250_CAPTURE_POLICY_SHADERS']='1'
 def run(args,name,env=e):
  p=subprocess.run(list(map(str,args)),env=env,capture_output=True,text=True);t=p.stdout+p.stderr;(o/(name+'.log')).write_text(t)
  assert not p.returncode and not re.search(r'Assertion .*failed|validation failed|NIR_VALIDATE|raw_unproven',t),(name,p.returncode,t[-3000:])

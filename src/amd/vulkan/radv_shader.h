@@ -786,7 +786,10 @@ struct radv_compiler_info {
       uint32_t merged_check : 1;
       /* RADV_BC250_MESH_IDXPASS: eligible Mesh draws become an index pass plus an indexed draw. */
       uint32_t idxpass : 1;
-      uint32_t padding : 18;
+      /* RADV_BC250_MESH_CORNER_ALIAS: unchanged, valid primitive streams
+       * reuse the original connectivity buffer as their corner source map. */
+      uint32_t corner_alias : 1;
+      uint32_t padding : 17;
    } bc250x;
 
    /* Debug/tracing */
